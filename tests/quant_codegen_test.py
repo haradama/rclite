@@ -41,9 +41,11 @@ def expect_raises(exc_type, fn, *args, **kwargs):
 
 
 def _build_and_quantize(units=40, topology=Topology.SCR,
-                         state_frac=18, input_frac=12, weight_frac=12):
+                         state_frac=18, input_frac=12, weight_frac=12,
+                         input_offset=0.0, input_scaling=1.0):
     rc = ReservoirComputer(
-        input=InputNode(units=1, input_offset=0.0, input_scaling=1.0,
+        input=InputNode(units=1, input_offset=input_offset,
+                        input_scaling=input_scaling,
                         input_distribution=Distribution.BERNOULLI, name="in"),
         reservoir=ReservoirNode(units=units, topology=topology,
                                  chain_weight=0.9, leak_rate=0.3, seed=42,
@@ -140,11 +142,13 @@ def _parity(qm, X, atol=0):
     Y_py_q = (Y_py * cfg.state_scale).round().astype(np.int32)
 
     # The Python executor returns dequantized float; let's compare on
-    # the int values directly for bit-exact check.
+    # the int values directly for bit-exact check. The manual loop must
+    # mirror the kernel: preprocess raw quantized input → u_pre_q, step,
+    # then readout with the *raw* quantized input.
     qexe.reset()
     for t in range(X.shape[0]):
-        qexe.step_q(X_q[t])
-        # Y_py raw i32:
+        u_pre_q = qexe._preprocess_q(X_q[t])
+        qexe.step_q(u_pre_q)
         y_i = qexe.predict_one_q(X_q[t], qexe.state_q)
         diff = int(Y_jit_q[t, 0]) - int(y_i[0])
         if abs(diff) > atol:
@@ -168,10 +172,44 @@ def test_parity_dlr():
     _parity(qm, sample)
 
 
+def test_parity_dlrb():
+    _, _, qm, sample = _build_and_quantize(topology=Topology.DLRB)
+    _parity(qm, sample)
+
+
 def test_parity_across_frac_widths():
     for sf in (14, 16, 20):
         _, _, qm, sample = _build_and_quantize(state_frac=sf)
         _parity(qm, sample)
+
+
+def test_parity_with_input_offset():
+    """With input_offset != 0, the kernel must internally preprocess and
+    the readout's include_input branch must use the *raw* (pre-preprocess)
+    input — see [[input_preprocess_kernel]]."""
+    for topology in (Topology.SCR, Topology.ESN_STANDARD, Topology.DLRB):
+        _, _, qm, sample = _build_and_quantize(
+            topology=topology, input_offset=0.5,
+        )
+        _parity(qm, sample)
+
+
+def test_parity_with_input_scaling():
+    """With input_scaling != 1, the kernel must internally scale and the
+    readout's include_input branch must still use the *raw* input."""
+    for topology in (Topology.SCR, Topology.ESN_STANDARD, Topology.DLR):
+        _, _, qm, sample = _build_and_quantize(
+            topology=topology, input_scaling=1.5,
+        )
+        _parity(qm, sample)
+
+
+def test_parity_with_offset_and_scaling():
+    """Joint test: non-zero offset AND non-unit scaling."""
+    _, _, qm, sample = _build_and_quantize(
+        topology=Topology.SCR, input_offset=-0.3, input_scaling=2.0,
+    )
+    _parity(qm, sample)
 
 
 # ---------------------------------------------------------------- CompiledQuantizedRC

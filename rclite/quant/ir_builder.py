@@ -1,16 +1,18 @@
 """Build an rclite IR `Module` for the integer (i32) path from a QuantizedModel.
 
-The integer path differs from the float builder in three ways:
-
-  - **No PreprocessInput op.** The caller must preprocess + quantize the
-    input before calling the kernel. The IR body starts directly at
-    `ReservoirStep`.
+The integer path differs from the float builder in two ways:
 
   - **LUT-based tanh.** The reservoir step always uses a quantized LUT
     for tanh; libm tanhf is unavailable in int math.
 
   - **Pre-quantized weights.** `weights` carries i32 arrays and the LUT
     table; the lowering treats them as integer globals.
+
+The IR body starts with `PreprocessInput`, mirroring the float pipeline:
+the kernel consumes already-input-quantized raw samples and computes
+`u_pre_q` internally via fixed-point arithmetic. This keeps the
+include_input readout passthrough bit-exact with the float reference
+when `input_offset != 0` or `input_scaling != 1`.
 
 Module-level metadata records `dtype="i32"`, the Q-format fractional
 widths, and the LUT geometry — the LLVM lowering reads these to pick
@@ -21,7 +23,7 @@ from __future__ import annotations
 from rclite.core.profile import Topology
 from rclite.ir.module import Module
 from rclite.ir.ops import (
-    ReservoirStep, BuildPhi, ReadoutLinear, TimeLoop,
+    PreprocessInput, ReservoirStep, BuildPhi, ReadoutLinear, TimeLoop,
 )
 from .model import QuantizedModel
 
@@ -51,6 +53,11 @@ def build_ir_from_quantized(qmodel: QuantizedModel) -> Module:
         weights["W_res"] = qmodel.W_res_q
 
     body = (
+        PreprocessInput(
+            offset=float(rc.input.input_offset),
+            scale=float(rc.input.input_scaling),
+            K=K,
+        ),
         ReservoirStep(
             leak=float(rc.reservoir.leak_rate),
             bias=float(rc.reservoir.bias),

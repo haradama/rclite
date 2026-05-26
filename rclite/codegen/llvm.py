@@ -603,6 +603,9 @@ class _IntLowerer:
 
         self.h = self.b.alloca(self.storage_ty, size=_ci(self.N), name="h")
         self.pre_arr = self.b.alloca(self.storage_ty, size=_ci(self.N), name="pre")
+        self.u_pre = self.b.alloca(
+            self.storage_ty, size=_ci(max(self.K, 1)), name="u_pre",
+        )
         self.phi_arr = (
             self.b.alloca(self.storage_ty, size=_ci(max(max_F, 1)), name="phi")
             if needs_phi else None
@@ -694,10 +697,12 @@ class _IntLowerer:
 
     def _lower(self, op):
         from rclite.ir.ops import (
-            TimeLoop, ReservoirStep, BuildPhi, ReadoutLinear,
+            TimeLoop, PreprocessInput, ReservoirStep, BuildPhi, ReadoutLinear,
         )
         if isinstance(op, TimeLoop):
             return self._lower_time_loop(op)
+        if isinstance(op, PreprocessInput):
+            return self._lower_preprocess(op)
         if isinstance(op, ReservoirStep):
             return self._lower_reservoir_step(op)
         if isinstance(op, BuildPhi):
@@ -715,12 +720,38 @@ class _IntLowerer:
                 self._lower(body_op)
         self.t = None
 
+    def _lower_preprocess(self, op):
+        """u_pre_q[k] := ((X_raw_q[k] - offset_q) * scaling_q) >> weight_frac
+
+        Both `X_raw_q` and `offset_q` live at input_scale (Q.input_frac).
+        `scaling_q` is quantized at weight_scale, so the multiply lands at
+        input_scale * weight_scale; shifting right by weight_frac brings the
+        result back to input_scale — the scale `ReservoirStep` expects for
+        its `u_pre` operand.
+        """
+        if op.K == 0:
+            return
+        input_scale = 1 << self.input_frac
+        weight_scale = 1 << self.weight_frac
+        offset_q = int(round(op.offset * input_scale))
+        scaling_q = int(round(op.scale * weight_scale))
+        offset_const = self._cs(offset_q)
+        scale_const = self._cs(scaling_q)
+
+        tK = self.b.mul(self.t, _ci(op.K))
+        with _loop(self.b, _ci(op.K), "kpre") as k:
+            x_raw_q = _load1d(self.b, self.X_arg, self.b.add(tK, k))
+            diff = self.b.sub(x_raw_q, offset_const)
+            u_pre_val = self._fixed_mul_to_storage(
+                diff, scale_const, self.weight_frac,
+            )
+            _store1d(self.b, self.u_pre, k, u_pre_val)
+
     def _lower_reservoir_step(self, op):
         g_Win = self.globals["W_in"]
         g_Wres = self.globals.get(op.W_res_name) if op.W_res_name else None
         g_lut = self.globals["lut_table"]
         K, N = op.K, op.N
-        tK = self.b.mul(self.t, _ci(K))
 
         with _loop(self.b, _ci(N), "ipre") as i:
             # acc is accum_ty (i32 for i16 storage, i64 for i32 storage).
@@ -728,7 +759,9 @@ class _IntLowerer:
             self.b.store(self._ca(self.bias_q), self.acc)
             with _loop(self.b, _ci(K), "kin") as k:
                 w = _load2d_global(self.b, g_Win, K, i, k)
-                u = _load1d(self.b, self.X_arg, self.b.add(tK, k))
+                # u_pre lives in scratch (filled by _lower_preprocess); X_arg
+                # is the *raw* input — the readout in BuildPhi reads it.
+                u = _load1d(self.b, self.u_pre, k)
                 prod = self._fixed_mul_to_accum(w, u, self.shift_in)
                 self.b.store(
                     self._accum_add(self.b.load(self.acc), prod), self.acc,
@@ -1108,9 +1141,11 @@ class CompiledQuantizedRC:
     """JIT-compiled QuantizedModel (integer i32 path).
 
     Mirrors the float CompiledRC interface but consumes a `QuantizedModel`
-    and emits the i32 kernel. `predict()` accepts float inputs, applies
-    the IDL preprocessing and input-quantization, calls the kernel, and
-    dequantizes the output back to float.
+    and emits the i32 kernel. `predict()` accepts float inputs, quantizes
+    them at input_scale (no float preprocessing — the kernel applies
+    `(u_raw - offset) * scale` internally in fixed point so the readout
+    can see the original raw input), calls the kernel, and dequantizes the
+    output back to float.
     """
 
     name = "llvm-quantized"
@@ -1164,10 +1199,10 @@ class CompiledQuantizedRC:
         if X.ndim == 1:
             X = X[:, None]
         cfg = self.qmodel.config
-        rc = self.qmodel.rc
-        u_pre = (X - rc.input.input_offset) * rc.input.input_scaling
+        # The kernel preprocesses internally (PreprocessInput op); the caller
+        # passes raw input quantized at input_scale.
         X_q = np.ascontiguousarray(
-            self.qmodel.target.quantize_input_array(u_pre, cfg).astype(self._np_storage)
+            self.qmodel.target.quantize_input_array(X, cfg).astype(self._np_storage)
         )
         T = X_q.shape[0]
         Y_q = np.zeros((T, self.qmodel.M), dtype=self._np_storage)

@@ -257,9 +257,10 @@ def rmse_r2(Y_pred, Y_true):
 
 
 def build_esn(N, topology, input_offset, seed=42):
-    # NOTE: integer QAT path requires input_offset=0 today — QuantizedExecutor
-    # uses raw X for readout passthrough while CompiledQuantizedRC uses
-    # preprocessed X. Force offset=0 for an apples-to-apples 4-way benchmark.
+    # input_offset=0 keeps the bench fair: the scratch C naive_q template
+    # takes preprocessed-and-quantized input, while rclite_q's kernel now
+    # preprocesses internally. Lifting the offset would require updating the
+    # C template too — out of scope for this benchmark.
     return ReservoirComputer(
         input=InputNode(units=1, activation=Activation.IDENTITY,
                         input_scaling=1.0, input_offset=0.0, name="in"),

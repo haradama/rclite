@@ -149,23 +149,33 @@ class QuantizedExecutor:
     # ------------------------------------------------------------------
     # Convenience wrappers operating on float arrays
 
+    def _preprocess_q(self, u_raw_q: np.ndarray) -> np.ndarray:
+        """Fixed-point ((u_raw_q - offset_q) * scaling_q) >> weight_frac.
+
+        Mirrors `_IntLowerer._lower_preprocess` so the Python reference and
+        the LLVM kernel agree bit-exactly when `input_offset != 0` or
+        `input_scaling != 1`.
+        """
+        cfg = self.config
+        rc = self.qmodel.rc
+        offset_q = int(round(rc.input.input_offset * cfg.input_scale))
+        scaling_q = int(round(rc.input.input_scaling * cfg.weight_scale))
+        diff = u_raw_q.astype(np.int64) - offset_q
+        u_pre_64 = (diff * scaling_q) >> cfg.weight_frac
+        return trunc_i32(u_pre_64)
+
     def predict(self, X: np.ndarray) -> np.ndarray:
         """Run the entire trajectory; X is a (T, K) float array."""
         if X.ndim == 1:
             X = X[:, None]
         cfg = self.config
-        rc = self.qmodel.rc
-        offset = rc.input.input_offset
-        scale = rc.input.input_scaling
 
         T = X.shape[0]
         Y_q = np.zeros((T, self.qmodel.M), dtype=np.int32)
 
         for t in range(T):
-            u_raw = X[t]
-            u_pre = (u_raw - offset) * scale
-            u_pre_q = self.target.quantize_input_array(u_pre, cfg)
-            u_raw_q = self.target.quantize_input_array(u_raw, cfg)
+            u_raw_q = self.target.quantize_input_array(X[t], cfg)
+            u_pre_q = self._preprocess_q(u_raw_q)
             self.step_q(u_pre_q)
             Y_q[t] = self.predict_one_q(u_raw_q, self.state_q)
 
@@ -177,15 +187,12 @@ class QuantizedExecutor:
         if X.ndim == 1:
             X = X[:, None]
         cfg = self.config
-        rc = self.qmodel.rc
-        offset = rc.input.input_offset
-        scale = rc.input.input_scaling
 
         T = X.shape[0]
         H_q = np.zeros((T, self.qmodel.N), dtype=np.int32)
         for t in range(T):
-            u_pre = (X[t] - offset) * scale
-            u_pre_q = self.target.quantize_input_array(u_pre, cfg)
+            u_raw_q = self.target.quantize_input_array(X[t], cfg)
+            u_pre_q = self._preprocess_q(u_raw_q)
             self.step_q(u_pre_q)
             H_q[t] = self.state_q
         return H_q.astype(np.float64) / cfg.state_scale
