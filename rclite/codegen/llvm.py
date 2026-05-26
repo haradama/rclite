@@ -717,7 +717,7 @@ class _IntLowerer:
 
     def _lower_reservoir_step(self, op):
         g_Win = self.globals["W_in"]
-        g_Wres = self.globals["W_res"]
+        g_Wres = self.globals.get(op.W_res_name) if op.W_res_name else None
         g_lut = self.globals["lut_table"]
         K, N = op.K, op.N
         tK = self.b.mul(self.t, _ci(K))
@@ -733,13 +733,9 @@ class _IntLowerer:
                 self.b.store(
                     self._accum_add(self.b.load(self.acc), prod), self.acc,
                 )
-            with _loop(self.b, _ci(N), "jres") as j:
-                w = _load2d_global(self.b, g_Wres, N, i, j)
-                s = _load1d(self.b, self.h, j)
-                prod = self._fixed_mul_to_accum(w, s, self.shift_res)
-                self.b.store(
-                    self._accum_add(self.b.load(self.acc), prod), self.acc,
-                )
+            # Topology-aware reservoir contribution. For structured topologies
+            # this emits O(1) scalar work per row instead of an O(N) matmul.
+            self._emit_res_contrib_int(op, g_Wres, i)
             # Truncate widened accumulator back to storage_ty for pre[i].
             pre_val = self.b.trunc(self.b.load(self.acc), self.storage_ty)
             _store1d(self.b, self.pre_arr, i, pre_val)
@@ -754,6 +750,73 @@ class _IntLowerer:
                                               self.state_frac)
             new_h = self.b.add(t1, t2)
             _store1d(self.b, self.h, i, new_h)
+
+    def _emit_res_contrib_int(self, op, g_Wres, i):
+        """Add the W_res @ h contribution to `self.acc`, branching on topology.
+
+        Mirrors `_Lowerer._emit_res_contrib` but with fixed-point arithmetic.
+        For DLR/SCR/DLRB this emits O(1) work per row using the scalar
+        `chain_weight` (and `chain_feedback` for DLRB) — quantized at
+        weight_scale to match the dense quantized matrix's representation
+        at the nonzero positions. Dense matmul is the fallback for RANDOM /
+        ESN_STANDARD topologies.
+        """
+        b = self.b
+        N = op.N
+        weight_scale = 1 << self.weight_frac
+
+        if op.topology == Topology.DLR:
+            # h[i-1] contribution for i > 0; mask via select
+            cw_q = int(round(op.chain_weight * weight_scale))
+            is_pos = b.icmp_signed(">", i, _ci(0))
+            i_safe = b.select(is_pos, b.sub(i, _ci(1)), _ci(0))
+            val = _load1d(b, self.h, i_safe)
+            prod = self._fixed_mul_to_accum(self._cs(cw_q), val, self.shift_res)
+            contrib = b.select(is_pos, prod, self._ca(0))
+            b.store(self._accum_add(b.load(self.acc), contrib), self.acc)
+        elif op.topology == Topology.SCR:
+            # Cyclic chain: prev = (i - 1) mod N
+            cw_q = int(round(op.chain_weight * weight_scale))
+            is_zero = b.icmp_signed("==", i, _ci(0))
+            i_prev = b.select(is_zero, _ci(N - 1), b.sub(i, _ci(1)))
+            val = _load1d(b, self.h, i_prev)
+            prod = self._fixed_mul_to_accum(self._cs(cw_q), val, self.shift_res)
+            b.store(self._accum_add(b.load(self.acc), prod), self.acc)
+        elif op.topology == Topology.DLRB:
+            cw_q = int(round(op.chain_weight * weight_scale))
+            cb_q = int(round(op.chain_feedback * weight_scale))
+            # Backward chain: chain_weight * h[i-1] for i > 0
+            is_pos = b.icmp_signed(">", i, _ci(0))
+            i_back = b.select(is_pos, b.sub(i, _ci(1)), _ci(0))
+            val_back = _load1d(b, self.h, i_back)
+            prod_back = self._fixed_mul_to_accum(self._cs(cw_q), val_back,
+                                                  self.shift_res)
+            contrib_back = b.select(is_pos, prod_back, self._ca(0))
+            # Forward chain: chain_feedback * h[i+1] for i < N-1
+            is_lt_last = b.icmp_signed("<", i, _ci(N - 1))
+            i_fwd = b.select(is_lt_last, b.add(i, _ci(1)), _ci(N - 1))
+            val_fwd = _load1d(b, self.h, i_fwd)
+            prod_fwd = self._fixed_mul_to_accum(self._cs(cb_q), val_fwd,
+                                                  self.shift_res)
+            contrib_fwd = b.select(is_lt_last, prod_fwd, self._ca(0))
+            acc_val = b.load(self.acc)
+            b.store(
+                self._accum_add(self._accum_add(acc_val, contrib_back),
+                                 contrib_fwd),
+                self.acc,
+            )
+        else:
+            # Dense matmul fallback (RANDOM / ESN_STANDARD)
+            if g_Wres is None:
+                raise RuntimeError(
+                    f"dense matmul requested but W_res not in globals "
+                    f"(topology={op.topology.name})"
+                )
+            with _loop(b, _ci(N), "jres") as j:
+                w = _load2d_global(b, g_Wres, N, i, j)
+                s = _load1d(b, self.h, j)
+                prod = self._fixed_mul_to_accum(w, s, self.shift_res)
+                b.store(self._accum_add(b.load(self.acc), prod), self.acc)
 
     def _emit_lut_lookup(self, x_q, g_lut):
         """Quantized tanh LUT with linear interpolation.

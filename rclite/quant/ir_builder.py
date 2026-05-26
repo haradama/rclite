@@ -45,10 +45,10 @@ def build_ir_from_quantized(qmodel: QuantizedModel) -> Module:
         "W_out": qmodel.W_out_q,
         "lut_table": qmodel.lut_table_q,
     }
-    # Always emit W_res for the integer path — structured topologies have a
-    # genuinely sparse i32 matrix after quantization, and the lowering walks
-    # all rows including zero entries (LLVM optimizes zeros away post-fold).
-    weights["W_res"] = qmodel.W_res_q
+    # Structured topologies (DLR/DLRB/SCR) get a topology-aware kernel in
+    # the lowering — no need to emit the (mostly-zero) W_res matrix.
+    if not is_structured:
+        weights["W_res"] = qmodel.W_res_q
 
     body = (
         ReservoirStep(
@@ -58,7 +58,7 @@ def build_ir_from_quantized(qmodel: QuantizedModel) -> Module:
             topology=rc.reservoir.topology,
             chain_weight=float(rc.reservoir.chain_weight),
             chain_feedback=float(rc.reservoir.chain_feedback),
-            W_res_name="W_res",
+            W_res_name=None if is_structured else "W_res",
         ),
         BuildPhi(
             include_bias=rc.readout.include_bias,

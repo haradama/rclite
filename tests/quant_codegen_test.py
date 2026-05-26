@@ -93,12 +93,30 @@ def _run_via_jit(qm, X_q):
 
 
 def test_build_ir_from_quantized_metadata():
-    _, _, qm, _ = _build_and_quantize()
+    # Use a dense topology so W_res is present
+    _, _, qm, _ = _build_and_quantize(topology=Topology.ESN_STANDARD)
     m = build_ir_from_quantized(qm)
     assert m.metadata["dtype"] == "i32"
     assert m.metadata["state_frac"] == 18
     assert "W_in" in m.weights and "W_res" in m.weights
     assert "W_out" in m.weights and "lut_table" in m.weights
+
+
+def test_build_ir_drops_W_res_for_structured():
+    """Structured topologies use scalar chain ops in the lowering — no
+    dense W_res matrix should land in the module's weights dict."""
+    for topology in (Topology.SCR, Topology.DLR, Topology.DLRB):
+        _, _, qm, _ = _build_and_quantize(topology=topology)
+        m = build_ir_from_quantized(qm)
+        assert "W_res" not in m.weights, \
+            f"W_res should not be emitted for {topology.name}"
+        # ReservoirStep should also have W_res_name=None
+        from rclite.ir.ops import ReservoirStep, TimeLoop
+        for op in m.ops:
+            if isinstance(op, TimeLoop):
+                for body_op in op.body:
+                    if isinstance(body_op, ReservoirStep):
+                        assert body_op.W_res_name is None
 
 
 def test_build_ir_requires_lut():
