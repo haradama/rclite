@@ -1,0 +1,18 @@
+[tools]
+python = "3.14"
+uv = "0.11"
+
+[env]
+_.python.venv = { path = ".venv", create = true }
+
+[tasks.install]
+description = "Sync the project's virtualenv against pyproject.toml"
+run = "uv sync"
+
+[tasks.test]
+description = "Run the test suite"
+run = "uv run python -m pytest tests"
+
+[tasks.bench]
+description = "Run host benchmarks"
+run = "uv run python benchmarks/compare_host_full.py"

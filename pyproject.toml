@@ -1,0 +1,17 @@
+[project]
+name = "rclite"
+version = "0.1.0"
+description = "Reservoir Computing deployment framework for embedded systems, in the spirit of TensorFlow Lite for Microcontrollers."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "llvmlite>=0.42",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["rclite"]
