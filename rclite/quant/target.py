@@ -102,3 +102,51 @@ class I16FixedPoint(QuantTarget):
     name: ClassVar[str] = "i16"
     storage_bits: ClassVar[int] = 16
     accum_bits: ClassVar[int] = 32
+
+
+@dataclass(frozen=True)
+class I8Affine(QuantTarget):
+    """TFLM-style affine i8 quantization (skeleton — no LLVM emit yet).
+
+    Real-value mapping per tensor::
+
+        r = (q - zero_point) * scale
+
+    Unlike the symmetric `IxFixedPoint` family (which uses pure Q-format
+    scale powers of 2 with zero_point implicitly = 0), the affine target
+    carries a per-tensor `(scale: float, zero_point: int)` pair. This is
+    what TFLite Micro uses for i8 deployment and what gives the tightest
+    range packing.
+
+    Implementation roadmap:
+
+      1. Replace `QuantConfig.{state,input,weight}_frac` with per-tensor
+         `AffineParams(scale: float, zero_point: int, scale_M0: int,
+         scale_n: int)`, where the multiplier `scale_a * scale_b / scale_c`
+         is represented as `M0 * 2^-n` for int32 fixed-point use.
+      2. Update `quantize_weights` to produce i8 outputs with the right
+         zero_point shifts in the cross terms of `(q_a - z_a)(q_w - z_w)`.
+      3. Add an `_I8AffineLowerer` that emits the requantize-and-multiply
+         pattern (TFLM kernel-style) instead of pure Q-format mul-shift.
+
+    For now this class exists so user code can register the target name
+    and the framework's abstraction surfaces the future i8 path.
+    Constructing `quantize_model(..., target=I8Affine())` raises with a
+    pointer to this docstring.
+    """
+    name: ClassVar[str] = "i8-affine"
+    storage_bits: ClassVar[int] = 8
+    accum_bits: ClassVar[int] = 32
+
+    def quantize_state(self, x, cfg):  # type: ignore[override]
+        raise NotImplementedError(
+            "I8Affine target is a skeleton — full LLVM emit is not "
+            "implemented. See rclite/quant/target.py docstring for the "
+            "implementation roadmap. Use I32FixedPoint or I16FixedPoint."
+        )
+
+    quantize_input = quantize_state
+    quantize_weight = quantize_state
+    quantize_state_array = quantize_state
+    quantize_input_array = quantize_state
+    quantize_weight_array = quantize_state

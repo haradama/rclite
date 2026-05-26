@@ -462,17 +462,18 @@ def emit_module(rc: ReservoirComputer, exe: RCExecutor,
     return _Lowerer(ir_module, dtype=dtype).lower()
 
 
-def emit_quantized_module(qmodel, *, passes=None) -> ir.Module:
-    """Build LLVM IR for the integer (i32) quantized path.
+def emit_quantized_module(qmodel, *, passes=None,
+                            saturating: bool = True) -> ir.Module:
+    """Build LLVM IR for the integer quantized path (i32 or i16).
 
-    Takes a `QuantizedModel` (with quantized weights + LUT), builds the
-    rclite IR with `dtype='i32'`, applies optional passes, and lowers via
-    `_IntLowerer`. The emitted function signature is:
+    Function signature:
+        void rc_predict(int64_t T, storage_t* X, storage_t* Y);
+    where storage_t = int32_t for `I32FixedPoint` and int16_t for `I16FixedPoint`.
 
-        void rc_predict(int64_t T, int32_t* X, int32_t* Y);
-
-    where X holds preprocessed-and-quantized input at input_scale and Y
-    receives output at state_scale.
+    `saturating=True` wraps inner-loop accumulations and the final
+    truncation with `@llvm.sadd.sat.*` and clamping selects, so overflow
+    saturates instead of wrapping. Recommended for i16 (narrow range);
+    cheap to leave on for i32 as well.
     """
     from rclite.quant.ir_builder import build_ir_from_quantized
 
@@ -481,7 +482,7 @@ def emit_quantized_module(qmodel, *, passes=None) -> ir.Module:
         passes = []
     for p in passes:
         ir_module = p(ir_module)
-    return _IntLowerer(ir_module).lower()
+    return _IntLowerer(ir_module, saturating=saturating).lower()
 
 
 # ----------------------------------------------------------------------------
@@ -494,29 +495,56 @@ def _load1d_global(b: ir.IRBuilder, g, idx):
 
 
 class _IntLowerer:
-    """Lower an rclite IR module under `dtype='i32'` to LLVM IR.
+    """Lower an rclite IR module under `dtype` in {'i32', 'i16'} to LLVM IR.
 
-    Fixed-point multiply pattern (mirage-compatible):
-        i32 * i32 -> sext to i64 -> mul -> ashr by shift -> trunc to i32
+    Parameterized over storage_ty / accum_ty:
+        i32 storage : accumulator i64    (mirage default)
+        i16 storage : accumulator i32    (-OS / size-constrained)
+
+    Fixed-point multiply pattern:
+        a:storage * b:storage -> sext to accum -> mul -> ashr -> trunc storage
     Shift amounts depend on operand provenance:
         W_in * input_q   : shift = weight_frac + input_frac - state_frac
         W_res * state_q  : shift = weight_frac
         state * leak_q   : shift = state_frac
-        readout accum    : i64 accumulator, final shift by state_frac
-    Tanh is realized by linear-interpolated LUT lookup in `tanh_lut_lookup`.
+        readout accum    : accum_ty accumulator, final shift by state_frac
+    Tanh is realized by linear-interpolated LUT lookup; the lookup itself
+    uses i32 intermediates regardless of storage width (LUT index/position
+    can exceed i16 range).
+
+    `saturating=True` swaps plain integer add for `@llvm.sadd.sat.*` in the
+    matmul accumulators (mostly relevant for i16 where overflow is realistic).
     """
 
-    def __init__(self, ir_module):
+    def __init__(self, ir_module, *, saturating: bool = True):
         from rclite.ir.ops import (
             TimeLoop, ReservoirStep, BuildPhi, ReadoutLinear, FusedStepReadout,
         )
 
         self.ir_module = ir_module
         md = ir_module.metadata
-        if md.get("dtype") != "i32":
+        dtype = md.get("dtype")
+        if dtype == "i32":
+            # Mirage-compatible: storage and per-row accumulator both i32;
+            # full i64 product only as an intermediate inside fixed_mul.
+            self.storage_ty = _I32
+            self.accum_ty = _I32
+            self.product_ty = _I64
+            self.storage_bits = 32
+            self.accum_bits = 32
+        elif dtype == "i16":
+            # i16 stores narrowly, but per-row accumulation must widen to
+            # i32 to survive sums over N terms.
+            self.storage_ty = ir.IntType(16)
+            self.accum_ty = _I32
+            self.product_ty = _I32
+            self.storage_bits = 16
+            self.accum_bits = 32
+        else:
             raise ValueError(
-                f"_IntLowerer requires dtype='i32', got {md.get('dtype')!r}"
+                f"_IntLowerer supports dtype in {{'i32', 'i16'}}, got {dtype!r}"
             )
+        self.saturating = saturating
 
         self.state_frac = int(md["state_frac"])
         self.input_frac = int(md["input_frac"])
@@ -532,17 +560,29 @@ class _IntLowerer:
         self.shift_res = self.weight_frac
         self.one_minus_leak_q = (1 << self.state_frac) - self.leak_q
 
-        self.module = ir.Module(name=f"rc_jit_i32_{id(ir_module)}")
+        self.module = ir.Module(name=f"rc_jit_{dtype}_{id(ir_module)}")
         self.module.triple = llvm.get_default_triple()
 
-        # i32 weight globals
+        # Declare saturating add intrinsic for the accumulator type
+        # (used in the recurrent matmul where overflow risk is highest).
+        if saturating:
+            sat_name = f"llvm.sadd.sat.i{self.accum_bits}"
+            self.sadd_sat_fn = ir.Function(
+                self.module,
+                ir.FunctionType(self.accum_ty, [self.accum_ty, self.accum_ty]),
+                name=sat_name,
+            )
+        else:
+            self.sadd_sat_fn = None
+
+        # Weight / LUT globals at storage_ty (i32 or i16)
         self.globals = {}
         for name, arr in ir_module.weights.items():
-            self.globals[name] = self._emit_i32_global(name, arr)
+            self.globals[name] = self._emit_int_global(name, arr)
 
         fnty = ir.FunctionType(
             ir.VoidType(),
-            [_I64, _I32.as_pointer(), _I32.as_pointer()],
+            [_I64, self.storage_ty.as_pointer(), self.storage_ty.as_pointer()],
         )
         self.fn = ir.Function(self.module, fnty, name="rc_predict")
         self.T_arg, self.X_arg, self.Y_arg = self.fn.args
@@ -551,7 +591,6 @@ class _IntLowerer:
         entry = self.fn.append_basic_block("entry")
         self.b = ir.IRBuilder(entry)
 
-        # Determine if BuildPhi/ReadoutLinear need a phi buffer
         needs_phi = any(
             isinstance(op, (ReadoutLinear, BuildPhi))
             for op in self._flatten_ops()
@@ -562,22 +601,32 @@ class _IntLowerer:
             default=self.N + self.K + 1,
         )
 
-        self.h = self.b.alloca(_I32, size=_ci(self.N), name="h")
-        self.pre_arr = self.b.alloca(_I32, size=_ci(self.N), name="pre")
+        self.h = self.b.alloca(self.storage_ty, size=_ci(self.N), name="h")
+        self.pre_arr = self.b.alloca(self.storage_ty, size=_ci(self.N), name="pre")
         self.phi_arr = (
-            self.b.alloca(_I32, size=_ci(max(max_F, 1)), name="phi")
+            self.b.alloca(self.storage_ty, size=_ci(max(max_F, 1)), name="phi")
             if needs_phi else None
         )
-        self.acc = self.b.alloca(_I32, name="acc")
-        self.acc64 = self.b.alloca(_I64, name="acc64")
+        # Accumulator is in accum_ty (wider) — protects against per-row overflow
+        # in the matmul over N terms.
+        self.acc = self.b.alloca(self.accum_ty, name="acc")
+        self.acc64 = self.b.alloca(_I64, name="acc64")  # readout always i64
 
         with _loop(self.b, _ci(self.N), "init") as i:
-            _store1d(self.b, self.h, i, self._ci32(0))
+            _store1d(self.b, self.h, i, self._cs(0))
 
         self.t = None
 
     # ------------------------------------------------------------------
     # helpers
+
+    def _cs(self, v: int) -> ir.Constant:
+        """Constant in storage type (i16 or i32)."""
+        return ir.Constant(self.storage_ty, int(v))
+
+    def _ca(self, v: int) -> ir.Constant:
+        """Constant in accumulator type (i32 or i64)."""
+        return ir.Constant(self.accum_ty, int(v))
 
     def _ci32(self, v: int) -> ir.Constant:
         return ir.Constant(_I32, int(v))
@@ -585,15 +634,22 @@ class _IntLowerer:
     def _ci64(self, v: int) -> ir.Constant:
         return ir.Constant(_I64, int(v))
 
-    def _emit_i32_global(self, name, arr):
+    def _emit_int_global(self, name, arr):
         import numpy as np
-        flat = np.asarray(arr).reshape(-1).astype(np.int32)
-        ty = ir.ArrayType(_I32, flat.size)
+        np_dtype = np.int16 if self.storage_bits == 16 else np.int32
+        flat = np.asarray(arr).reshape(-1).astype(np_dtype)
+        ty = ir.ArrayType(self.storage_ty, flat.size)
         g = ir.GlobalVariable(self.module, ty, name=name)
         g.linkage = "internal"
         g.global_constant = True
-        g.initializer = ir.Constant(ty, [self._ci32(int(v)) for v in flat])
+        g.initializer = ir.Constant(ty, [self._cs(int(v)) for v in flat])
         return g
+
+    def _accum_add(self, a, b_val):
+        """Add two accum_ty values. Optionally use saturating intrinsic."""
+        if self.saturating and self.sadd_sat_fn is not None:
+            return self.b.call(self.sadd_sat_fn, [a, b_val])
+        return self.b.add(a, b_val)
 
     def _flatten_ops(self):
         from rclite.ir.ops import TimeLoop
@@ -602,13 +658,30 @@ class _IntLowerer:
             if isinstance(op, TimeLoop):
                 yield from op.body
 
-    def _fixed_mul(self, a, b_val, shift: int):
-        """(a * b_val) >> shift, with i32->i64 promote, ashr, trunc."""
-        a64 = self.b.sext(a, _I64)
-        b64 = self.b.sext(b_val, _I64)
-        prod = self.b.mul(a64, b64)
-        shifted = self.b.ashr(prod, self._ci64(shift))
-        return self.b.trunc(shifted, _I32)
+    def _fixed_mul_to_storage(self, a, b_val, shift: int):
+        """(a * b_val) >> shift, storage→product promote, ashr, trunc back to storage."""
+        a_p = self.b.sext(a, self.product_ty)
+        b_p = self.b.sext(b_val, self.product_ty)
+        prod = self.b.mul(a_p, b_p)
+        shifted = self.b.ashr(prod, ir.Constant(self.product_ty, shift))
+        return self.b.trunc(shifted, self.storage_ty)
+
+    def _fixed_mul_to_accum(self, a, b_val, shift: int):
+        """Same operation but result returned in accum_ty.
+
+        For i32 (accum_ty == storage_ty == i32), identical to to_storage.
+        For i16 (accum_ty == i32 > storage_ty == i16), keeps the wider
+        product/shift result so per-row accumulation has headroom.
+        """
+        a_p = self.b.sext(a, self.product_ty)
+        b_p = self.b.sext(b_val, self.product_ty)
+        prod = self.b.mul(a_p, b_p)
+        shifted = self.b.ashr(prod, ir.Constant(self.product_ty, shift))
+        if self.product_ty == self.accum_ty:
+            return shifted
+        if self.product_ty.width > self.accum_ty.width:
+            return self.b.trunc(shifted, self.accum_ty)
+        return self.b.sext(shifted, self.accum_ty)
 
     # ------------------------------------------------------------------
     # dispatcher
@@ -650,40 +723,56 @@ class _IntLowerer:
         tK = self.b.mul(self.t, _ci(K))
 
         with _loop(self.b, _ci(N), "ipre") as i:
-            self.b.store(self._ci32(self.bias_q), self.acc)
+            # acc is accum_ty (i32 for i16 storage, i64 for i32 storage).
+            # bias_q is stored at state_scale, sext-widen it.
+            self.b.store(self._ca(self.bias_q), self.acc)
             with _loop(self.b, _ci(K), "kin") as k:
                 w = _load2d_global(self.b, g_Win, K, i, k)
                 u = _load1d(self.b, self.X_arg, self.b.add(tK, k))
-                prod = self._fixed_mul(w, u, self.shift_in)
-                self.b.store(self.b.add(self.b.load(self.acc), prod), self.acc)
+                prod = self._fixed_mul_to_accum(w, u, self.shift_in)
+                self.b.store(
+                    self._accum_add(self.b.load(self.acc), prod), self.acc,
+                )
             with _loop(self.b, _ci(N), "jres") as j:
                 w = _load2d_global(self.b, g_Wres, N, i, j)
                 s = _load1d(self.b, self.h, j)
-                prod = self._fixed_mul(w, s, self.shift_res)
-                self.b.store(self.b.add(self.b.load(self.acc), prod), self.acc)
-            _store1d(self.b, self.pre_arr, i, self.b.load(self.acc))
+                prod = self._fixed_mul_to_accum(w, s, self.shift_res)
+                self.b.store(
+                    self._accum_add(self.b.load(self.acc), prod), self.acc,
+                )
+            # Truncate widened accumulator back to storage_ty for pre[i].
+            pre_val = self.b.trunc(self.b.load(self.acc), self.storage_ty)
+            _store1d(self.b, self.pre_arr, i, pre_val)
 
         with _loop(self.b, _ci(N), "iupd") as i:
             pre_i = _load1d(self.b, self.pre_arr, i)
             activated = self._emit_lut_lookup(pre_i, g_lut)
             h_old = _load1d(self.b, self.h, i)
-            t1 = self._fixed_mul(h_old, self._ci32(self.one_minus_leak_q),
-                                  self.state_frac)
-            t2 = self._fixed_mul(activated, self._ci32(self.leak_q),
-                                  self.state_frac)
+            t1 = self._fixed_mul_to_storage(h_old, self._cs(self.one_minus_leak_q),
+                                              self.state_frac)
+            t2 = self._fixed_mul_to_storage(activated, self._cs(self.leak_q),
+                                              self.state_frac)
             new_h = self.b.add(t1, t2)
             _store1d(self.b, self.h, i, new_h)
 
     def _emit_lut_lookup(self, x_q, g_lut):
-        """Quantized tanh LUT with linear interpolation."""
+        """Quantized tanh LUT with linear interpolation.
+
+        Internal arithmetic uses i32 (pos_q and t_q may exceed i16 range).
+        Input/output are storage_ty (i16 or i32) — sign-extension and
+        truncation happen at the boundaries.
+        """
         b = self.b
         sf = self.state_frac
         n = self.lut_n
+
+        # Widen input to i32 if needed
+        x32 = x_q if self.storage_bits >= 32 else b.sext(x_q, _I32)
         xmin = self._ci32(self.lut_xmin_q)
         xmax = self._ci32(self.lut_xmax_q)
 
-        is_lo = b.icmp_signed("<", x_q, xmin)
-        x1 = b.select(is_lo, xmin, x_q)
+        is_lo = b.icmp_signed("<", x32, xmin)
+        x1 = b.select(is_lo, xmin, x32)
         is_hi = b.icmp_signed(">", x1, xmax)
         x = b.select(is_hi, xmax, x1)
 
@@ -710,11 +799,22 @@ class _IntLowerer:
 
         i0_idx = b.sext(i0, _I64)
         i1_idx = b.sext(i1, _I64)
-        y0 = _load1d_global(b, g_lut, i0_idx)
-        y1 = _load1d_global(b, g_lut, i1_idx)
-        dy = b.sub(y1, y0)
-        dy_frac = self._fixed_mul(dy, frac_q, sf)
-        return b.add(y0, dy_frac)
+        # LUT entries are storage_ty; widen to i32 for interp arithmetic.
+        y0_s = _load1d_global(b, g_lut, i0_idx)
+        y1_s = _load1d_global(b, g_lut, i1_idx)
+        y0_32 = y0_s if self.storage_bits >= 32 else b.sext(y0_s, _I32)
+        y1_32 = y1_s if self.storage_bits >= 32 else b.sext(y1_s, _I32)
+        dy = b.sub(y1_32, y0_32)
+        # dy * frac_q >> sf, all in i32
+        dy_64 = b.sext(dy, _I64)
+        frac_64 = b.sext(frac_q, _I64)
+        dy_frac_64 = b.ashr(b.mul(dy_64, frac_64), self._ci64(sf))
+        dy_frac = b.trunc(dy_frac_64, _I32)
+        result_32 = b.add(y0_32, dy_frac)
+        # Truncate back to storage_ty
+        if self.storage_bits >= 32:
+            return result_32
+        return b.trunc(result_32, self.storage_ty)
 
     def _lower_build_phi(self, op):
         if self.phi_arr is None:
@@ -723,10 +823,10 @@ class _IntLowerer:
         tK = self.b.mul(self.t, _ci(K))
         off = 0
         if op.include_bias:
-            # phi[0] = (1 << state_frac) so that phi[0] * W_out_q[0]
-            # ends up at state_scale^2 like all other contributions.
+            # phi[0] = (1 << state_frac) so phi[0] * W_out_q[0] gives
+            # state_scale^2 like all other contributions.
             _store1d(self.b, self.phi_arr, _ci(off),
-                      self._ci32(1 << self.state_frac))
+                      self._cs(1 << self.state_frac))
             off += 1
         if op.include_input:
             with _loop(self.b, _ci(K), "kphi") as k:
@@ -738,9 +838,24 @@ class _IntLowerer:
                       _load1d(self.b, self.h, i))
 
     def _lower_readout_linear(self, op):
+        """Readout in i64 accumulator regardless of storage width.
+
+        Optionally uses `@llvm.sadd.sat.i64` for accumulation when
+        `saturating=True`. Final i64 → storage_ty truncation happens after
+        the >> state_frac shift, with saturation to the storage range.
+        """
         g_Wout = self.globals["W_out"]
         F = op.F
         tM = self.b.mul(self.t, _ci(op.M))
+        sadd_i64 = (self.module.globals.get("llvm.sadd.sat.i64")
+                     if self.saturating else None)
+        if self.saturating and sadd_i64 is None:
+            sadd_i64 = ir.Function(
+                self.module,
+                ir.FunctionType(_I64, [_I64, _I64]),
+                name="llvm.sadd.sat.i64",
+            )
+
         with _loop(self.b, _ci(op.M), "m") as m:
             self.b.store(self._ci64(0), self.acc64)
             with _loop(self.b, _ci(F), "fout") as fi:
@@ -749,12 +864,28 @@ class _IntLowerer:
                 w64 = self.b.sext(w, _I64)
                 pv64 = self.b.sext(pv, _I64)
                 prod = self.b.mul(w64, pv64)
-                self.b.store(self.b.add(self.b.load(self.acc64), prod),
-                              self.acc64)
+                cur = self.b.load(self.acc64)
+                summed = (self.b.call(sadd_i64, [cur, prod])
+                          if self.saturating
+                          else self.b.add(cur, prod))
+                self.b.store(summed, self.acc64)
             shifted = self.b.ashr(self.b.load(self.acc64),
                                     self._ci64(self.state_frac))
-            y_i32 = self.b.trunc(shifted, _I32)
-            _store1d(self.b, self.Y_arg, self.b.add(tM, m), y_i32)
+            # Saturating truncation to storage_ty: clamp to storage range
+            # before truncation to avoid wrap-around.
+            if self.storage_bits == 32:
+                y = self.b.trunc(shifted, _I32)
+            else:
+                lo = self._ci64(-(1 << (self.storage_bits - 1)))
+                hi = self._ci64((1 << (self.storage_bits - 1)) - 1)
+                clipped_lo = self.b.select(
+                    self.b.icmp_signed("<", shifted, lo), lo, shifted
+                )
+                clipped = self.b.select(
+                    self.b.icmp_signed(">", clipped_lo, hi), hi, clipped_lo
+                )
+                y = self.b.trunc(clipped, self.storage_ty)
+            _store1d(self.b, self.Y_arg, self.b.add(tM, m), y)
 
 
 class CompiledRC:
@@ -921,11 +1052,15 @@ class CompiledQuantizedRC:
 
     name = "llvm-quantized"
 
-    def __init__(self, qmodel, opt_level: int = 3, passes=None):
+    def __init__(self, qmodel, opt_level: int = 3, passes=None,
+                 saturating: bool = True):
         _ensure_initialized()
         self.qmodel = qmodel
         self.rc = qmodel.rc
-        self._ir_text = str(emit_quantized_module(qmodel, passes=passes))
+        self.saturating = saturating
+        self._ir_text = str(emit_quantized_module(
+            qmodel, passes=passes, saturating=saturating,
+        ))
         self._mod = llvm.parse_assembly(self._ir_text)
         self._mod.verify()
 
@@ -944,11 +1079,22 @@ class CompiledQuantizedRC:
         self._engine.finalize_object()
         self._engine.run_static_constructors()
 
+        # ctypes signature depends on storage width
+        sw = qmodel.target.storage_bits
+        if sw == 32:
+            self._cstorage = ctypes.c_int32
+            self._np_storage = np.int32
+        elif sw == 16:
+            self._cstorage = ctypes.c_int16
+            self._np_storage = np.int16
+        else:
+            raise NotImplementedError(f"storage width {sw} not supported in JIT")
+
         addr = self._engine.get_function_address("rc_predict")
         self._cfn = ctypes.CFUNCTYPE(
             None, ctypes.c_int64,
-            ctypes.POINTER(ctypes.c_int32),
-            ctypes.POINTER(ctypes.c_int32),
+            ctypes.POINTER(self._cstorage),
+            ctypes.POINTER(self._cstorage),
         )(addr)
 
     def predict(self, X: np.ndarray) -> np.ndarray:
@@ -956,17 +1102,16 @@ class CompiledQuantizedRC:
             X = X[:, None]
         cfg = self.qmodel.config
         rc = self.qmodel.rc
-        # Preprocess + quantize input
         u_pre = (X - rc.input.input_offset) * rc.input.input_scaling
         X_q = np.ascontiguousarray(
-            self.qmodel.target.quantize_input_array(u_pre, cfg).astype(np.int32)
+            self.qmodel.target.quantize_input_array(u_pre, cfg).astype(self._np_storage)
         )
         T = X_q.shape[0]
-        Y_q = np.zeros((T, self.qmodel.M), dtype=np.int32)
+        Y_q = np.zeros((T, self.qmodel.M), dtype=self._np_storage)
         self._cfn(
             ctypes.c_int64(T),
-            X_q.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
-            Y_q.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+            X_q.ctypes.data_as(ctypes.POINTER(self._cstorage)),
+            Y_q.ctypes.data_as(ctypes.POINTER(self._cstorage)),
         )
         return Y_q.astype(np.float64) / cfg.state_scale
 

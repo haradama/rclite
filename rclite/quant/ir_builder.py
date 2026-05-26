@@ -68,12 +68,22 @@ def build_ir_from_quantized(qmodel: QuantizedModel) -> Module:
         ReadoutLinear(M=M, F=F),
     )
 
+    # Pick IR-level dtype string from the target's storage width
+    if qmodel.target.storage_bits == 32:
+        dtype = "i32"
+    elif qmodel.target.storage_bits == 16:
+        dtype = "i16"
+    else:
+        raise NotImplementedError(
+            f"storage width {qmodel.target.storage_bits} not supported by IR"
+        )
+
     return Module(
         K=K, N=N, M=M,
         weights=weights,
         ops=[TimeLoop(body=body)],
         metadata={
-            "dtype": "i32",
+            "dtype": dtype,
             "topology": rc.reservoir.topology.name,
             "include_bias": rc.readout.include_bias,
             "include_input": rc.readout.include_input,
