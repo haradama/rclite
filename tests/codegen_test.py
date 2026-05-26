@@ -198,7 +198,7 @@ def test_emit_produces_valid_ir():
     ir = jit.llvm_ir
     assert "@\"rc_predict\"" in ir or "@rc_predict" in ir
     assert "@\"tanh\"" in ir or "@tanh" in ir
-    assert "rc_W_in" in ir and "rc_W_res" in ir and "rc_W_out" in ir
+    assert "W_in" in ir and "W_res" in ir and "W_out" in ir
 
 
 def test_assembly_is_emitted():

@@ -116,163 +116,350 @@ def _loop(b: ir.IRBuilder, count, name: str = "i"):
         b.position_at_end(done)
 
 
-def emit_module(rc: ReservoirComputer, exe: RCExecutor,
-                *, dtype: str = "f64") -> ir.Module:
-    """Build the LLVM IR module for the given trained reservoir computer.
+@contextmanager
+def _loop_strided(b: ir.IRBuilder, start, end, stride, name: str = "i"):
+    """Emit a `for i = start; i < end; i += stride` loop."""
+    fn = b.block.function
+    hdr = fn.append_basic_block(name + "_hdr")
+    body = fn.append_basic_block(name + "_body")
+    done = fn.append_basic_block(name + "_done")
 
-    `dtype` selects the floating-point width — `f64` (host default) or
-    `f32` (Cortex-M cross-compile). Weights stored as f64 in `exe` are
-    cast to the chosen width when emitted as IR constants.
+    idx = b.alloca(_I64, name=name + "_idx")
+    b.store(start, idx)
+    b.branch(hdr)
+
+    b.position_at_end(hdr)
+    cond = b.icmp_signed("<", b.load(idx), end)
+    b.cbranch(cond, body, done)
+
+    b.position_at_end(body)
+    cur = b.load(idx, name=name + "_v")
+    try:
+        yield cur
+    finally:
+        b.store(b.add(b.load(idx), stride), idx)
+        b.branch(hdr)
+        b.position_at_end(done)
+
+
+# ----------------------------------------------------------------------------
+# IR-driven lowering
+
+
+class _Lowerer:
+    """Walks an `rclite.ir.Module` and emits LLVM IR."""
+
+    def __init__(self, ir_module, dtype: str):
+        from rclite.ir.ops import ReadoutLinear, BuildPhi, FusedStepReadout, TimeLoop
+
+        self.ir_module = ir_module
+        self.fty, self.tanh_name, self.np_dtype, _ = _dtype_bindings(dtype)
+        self.K, self.N, self.M = ir_module.K, ir_module.N, ir_module.M
+
+        self.module = ir.Module(name=f"rc_jit_{id(ir_module)}")
+        self.module.triple = llvm.get_default_triple()
+
+        self.libm_fn = ir.Function(
+            self.module, ir.FunctionType(self.fty, [self.fty]),
+            name=self.tanh_name,
+        )
+
+        # Emit weight globals
+        self.globals = {}
+        for name, arr in ir_module.weights.items():
+            self.globals[name] = self._emit_global(name, arr)
+
+        # rc_predict function
+        fnty = ir.FunctionType(
+            ir.VoidType(),
+            [_I64, self.fty.as_pointer(), self.fty.as_pointer()],
+        )
+        self.fn = ir.Function(self.module, fnty, name="rc_predict")
+        self.T_arg, self.X_arg, self.Y_arg = self.fn.args
+        self.T_arg.name = "T"; self.X_arg.name = "X"; self.Y_arg.name = "Y"
+
+        entry = self.fn.append_basic_block("entry")
+        self.b = ir.IRBuilder(entry)
+
+        # Determine scratch sizes
+        needs_phi = any(
+            isinstance(op, (ReadoutLinear, BuildPhi))
+            for op in self._flatten_ops()
+        )
+        max_F = max((op.F for op in self._flatten_ops()
+                      if isinstance(op, (ReadoutLinear, FusedStepReadout))),
+                     default=self.N + self.K + 1)
+
+        self.h = self.b.alloca(self.fty, size=_ci(self.N), name="h")
+        self.u_pre = self.b.alloca(self.fty, size=_ci(self.K), name="u_pre")
+        self.pre_arr = self.b.alloca(self.fty, size=_ci(self.N), name="pre")
+        self.phi_arr = (
+            self.b.alloca(self.fty, size=_ci(max(max_F, 1)), name="phi")
+            if needs_phi else None
+        )
+        self.acc = self.b.alloca(self.fty, name="acc")
+
+        # Init h to zero
+        with _loop(self.b, _ci(self.N), "init") as i:
+            _store1d(self.b, self.h, i, self._cf(0.0))
+
+        self.t = None  # current time index, valid inside a TimeLoop body
+
+    def _cf(self, v):
+        return ir.Constant(self.fty, float(v))
+
+    def _emit_global(self, name, arr):
+        flat = np.ascontiguousarray(arr, dtype=self.np_dtype).reshape(-1)
+        ty = ir.ArrayType(self.fty, flat.size)
+        g = ir.GlobalVariable(self.module, ty, name=name)
+        g.linkage = "internal"
+        g.global_constant = True
+        g.initializer = ir.Constant(ty, [self._cf(float(v)) for v in flat])
+        return g
+
+    def _flatten_ops(self):
+        from rclite.ir.ops import TimeLoop
+        for op in self.ir_module.ops:
+            yield op
+            if isinstance(op, TimeLoop):
+                yield from op.body
+
+    def lower(self) -> ir.Module:
+        for op in self.ir_module.ops:
+            self._lower(op)
+        self.b.ret_void()
+        return self.module
+
+    def _lower(self, op):
+        from rclite.ir.ops import (
+            TimeLoop, PreprocessInput, ReservoirStep, BuildPhi,
+            ReadoutLinear, FusedStepReadout,
+        )
+        if isinstance(op, TimeLoop):
+            return self._lower_time_loop(op)
+        if isinstance(op, PreprocessInput):
+            return self._lower_preprocess(op)
+        if isinstance(op, ReservoirStep):
+            return self._lower_reservoir_step(op)
+        if isinstance(op, BuildPhi):
+            return self._lower_build_phi(op)
+        if isinstance(op, ReadoutLinear):
+            return self._lower_readout_linear(op)
+        if isinstance(op, FusedStepReadout):
+            return self._lower_fused(op)
+        raise NotImplementedError(f"unknown op: {type(op).__name__}")
+
+    def _lower_time_loop(self, op):
+        K_unroll = op.unroll
+        T = self.T_arg
+        if K_unroll == 1:
+            with _loop(self.b, T, "t") as t:
+                self.t = t
+                for body_op in op.body:
+                    self._lower(body_op)
+            self.t = None
+            return
+        # Unroll body by `K_unroll` over [0, T_unrolled), tail loop for remainder.
+        K_const = _ci(K_unroll)
+        T_unrolled = self.b.mul(self.b.sdiv(T, K_const), K_const)
+        with _loop_strided(self.b, _ci(0), T_unrolled, K_const, "tu") as t_base:
+            for k in range(K_unroll):
+                self.t = (t_base if k == 0
+                          else self.b.add(t_base, _ci(k), name=f"t_{k}"))
+                for body_op in op.body:
+                    self._lower(body_op)
+        with _loop_strided(self.b, T_unrolled, T, _ci(1), "ttail") as t:
+            self.t = t
+            for body_op in op.body:
+                self._lower(body_op)
+        self.t = None
+
+    def _lower_preprocess(self, op):
+        tK = self.b.mul(self.t, _ci(op.K))
+        with _loop(self.b, _ci(op.K), "kpre") as k:
+            x_val = _load1d(self.b, self.X_arg, self.b.add(tK, k))
+            up = self.b.fmul(
+                self.b.fsub(x_val, self._cf(op.offset)),
+                self._cf(op.scale),
+            )
+            _store1d(self.b, self.u_pre, k, up)
+
+    def _lower_reservoir_step(self, op):
+        g_Win = self.globals[op.W_in_name]
+        g_Wres = self.globals.get(op.W_res_name) if op.W_res_name else None
+
+        with _loop(self.b, _ci(op.N), "ipre") as i:
+            self.b.store(self._cf(op.bias), self.acc)
+            with _loop(self.b, _ci(op.K), "kin") as k:
+                w = _load2d_global(self.b, g_Win, op.K, i, k)
+                u_val = _load1d(self.b, self.u_pre, k)
+                self.b.store(
+                    self.b.fadd(self.b.load(self.acc), self.b.fmul(w, u_val)),
+                    self.acc,
+                )
+            self._emit_res_contrib(op.topology, op.N, op.chain_weight,
+                                    op.chain_feedback, g_Wres, i)
+            _store1d(self.b, self.pre_arr, i, self.b.load(self.acc))
+
+        with _loop(self.b, _ci(op.N), "iupd") as i:
+            h_old = _load1d(self.b, self.h, i)
+            pre_i = _load1d(self.b, self.pre_arr, i)
+            tan = self.b.call(self.libm_fn, [pre_i])
+            new_h = self.b.fadd(
+                self.b.fmul(self._cf(1.0 - op.leak), h_old),
+                self.b.fmul(self._cf(op.leak), tan),
+            )
+            _store1d(self.b, self.h, i, new_h)
+
+    def _emit_res_contrib(self, topology, N, chain_weight, chain_feedback,
+                           g_Wres, i):
+        b = self.b
+        cf = self._cf
+        if topology == Topology.DLR:
+            is_pos = b.icmp_signed(">", i, _ci(0))
+            i_safe = b.select(is_pos, b.sub(i, _ci(1)), _ci(0))
+            val = _load1d(b, self.h, i_safe)
+            contrib = b.select(is_pos, b.fmul(cf(chain_weight), val), cf(0.0))
+            b.store(b.fadd(b.load(self.acc), contrib), self.acc)
+        elif topology == Topology.SCR:
+            is_zero = b.icmp_signed("==", i, _ci(0))
+            i_prev = b.select(is_zero, _ci(N - 1), b.sub(i, _ci(1)))
+            val = _load1d(b, self.h, i_prev)
+            b.store(b.fadd(b.load(self.acc),
+                            b.fmul(cf(chain_weight), val)), self.acc)
+        elif topology == Topology.DLRB:
+            is_pos = b.icmp_signed(">", i, _ci(0))
+            i_back = b.select(is_pos, b.sub(i, _ci(1)), _ci(0))
+            val_back = _load1d(b, self.h, i_back)
+            contrib_back = b.select(is_pos,
+                                     b.fmul(cf(chain_weight), val_back),
+                                     cf(0.0))
+            is_lt_last = b.icmp_signed("<", i, _ci(N - 1))
+            i_fwd = b.select(is_lt_last, b.add(i, _ci(1)), _ci(N - 1))
+            val_fwd = _load1d(b, self.h, i_fwd)
+            contrib_fwd = b.select(is_lt_last,
+                                    b.fmul(cf(chain_feedback), val_fwd),
+                                    cf(0.0))
+            b.store(b.fadd(b.fadd(b.load(self.acc), contrib_back),
+                            contrib_fwd), self.acc)
+        else:
+            with _loop(b, _ci(N), "jres") as j:
+                w = _load2d_global(b, g_Wres, N, i, j)
+                hv = _load1d(b, self.h, j)
+                b.store(b.fadd(b.load(self.acc), b.fmul(w, hv)), self.acc)
+
+    def _lower_build_phi(self, op):
+        if self.phi_arr is None:
+            raise RuntimeError("BuildPhi requires phi buffer")
+        tK = self.b.mul(self.t, _ci(op.K))
+        off = 0
+        if op.include_bias:
+            _store1d(self.b, self.phi_arr, _ci(off), self._cf(1.0))
+            off += 1
+        if op.include_input:
+            with _loop(self.b, _ci(op.K), "kphi") as k:
+                x_val = _load1d(self.b, self.X_arg, self.b.add(tK, k))
+                _store1d(self.b, self.phi_arr,
+                          self.b.add(_ci(off), k), x_val)
+            off += op.K
+        with _loop(self.b, _ci(op.N), "iphi") as i:
+            _store1d(self.b, self.phi_arr,
+                      self.b.add(_ci(off), i),
+                      _load1d(self.b, self.h, i))
+
+    def _lower_readout_linear(self, op):
+        g_Wout = self.globals[op.W_out_name]
+        tM = self.b.mul(self.t, _ci(op.M))
+        with _loop(self.b, _ci(op.M), "m") as m:
+            self.b.store(self._cf(0.0), self.acc)
+            with _loop(self.b, _ci(op.F), "fout") as fi:
+                w = _load2d_global(self.b, g_Wout, op.F, m, fi)
+                pv = _load1d(self.b, self.phi_arr, fi)
+                self.b.store(
+                    self.b.fadd(self.b.load(self.acc), self.b.fmul(w, pv)),
+                    self.acc,
+                )
+            _store1d(self.b, self.Y_arg, self.b.add(tM, m),
+                      self.b.load(self.acc))
+
+    def _lower_fused(self, op):
+        """Step + readout in one op: no phi buffer materialization."""
+        g_Win = self.globals[op.W_in_name]
+        g_Wres = self.globals.get(op.W_res_name) if op.W_res_name else None
+        g_Wout = self.globals[op.W_out_name]
+        b = self.b
+        cf = self._cf
+
+        # Step (same as _lower_reservoir_step)
+        with _loop(b, _ci(op.N), "ipre") as i:
+            b.store(cf(op.bias), self.acc)
+            with _loop(b, _ci(op.K), "kin") as k:
+                w = _load2d_global(b, g_Win, op.K, i, k)
+                u_val = _load1d(b, self.u_pre, k)
+                b.store(b.fadd(b.load(self.acc), b.fmul(w, u_val)), self.acc)
+            self._emit_res_contrib(op.topology, op.N, op.chain_weight,
+                                    op.chain_feedback, g_Wres, i)
+            _store1d(b, self.pre_arr, i, b.load(self.acc))
+        with _loop(b, _ci(op.N), "iupd") as i:
+            h_old = _load1d(b, self.h, i)
+            pre_i = _load1d(b, self.pre_arr, i)
+            tan = b.call(self.libm_fn, [pre_i])
+            new_h = b.fadd(
+                b.fmul(cf(1.0 - op.leak), h_old),
+                b.fmul(cf(op.leak), tan),
+            )
+            _store1d(b, self.h, i, new_h)
+
+        # Readout — phi is virtual; we index W_out's columns directly.
+        tM = b.mul(self.t, _ci(op.M))
+        tK = b.mul(self.t, _ci(op.K))
+        bias_off = 1 if op.include_bias_phi else 0
+        input_off = bias_off + (op.K if op.include_input_phi else 0)
+
+        with _loop(b, _ci(op.M), "m") as m:
+            b.store(cf(0.0), self.acc)
+            if op.include_bias_phi:
+                w_bias = _load2d_global(b, g_Wout, op.F, m, _ci(0))
+                # phi[0] is constant 1.0, so the term is just w_bias.
+                b.store(b.fadd(b.load(self.acc), w_bias), self.acc)
+            if op.include_input_phi:
+                with _loop(b, _ci(op.K), "kfo") as k:
+                    w = _load2d_global(b, g_Wout, op.F, m,
+                                        b.add(_ci(bias_off), k))
+                    x_val = _load1d(b, self.X_arg, b.add(tK, k))
+                    b.store(b.fadd(b.load(self.acc), b.fmul(w, x_val)),
+                             self.acc)
+            with _loop(b, _ci(op.N), "ifo") as i:
+                w = _load2d_global(b, g_Wout, op.F, m,
+                                    b.add(_ci(input_off), i))
+                hv = _load1d(b, self.h, i)
+                b.store(b.fadd(b.load(self.acc), b.fmul(w, hv)), self.acc)
+            _store1d(b, self.Y_arg, b.add(tM, m), b.load(self.acc))
+
+
+def emit_module(rc: ReservoirComputer, exe: RCExecutor,
+                *, dtype: str = "f64", passes=None) -> ir.Module:
+    """Build an rclite IR module, apply passes, and lower to LLVM IR.
+
+    `dtype` selects f64 (host) vs f32 (Cortex-M cross-compile).
+    `passes` is a list of `rclite.ir.passes.*` instances; defaults to
+    `[StructuralSpecialize()]`.
     """
     if rc.reservoir.activation != Activation.TANH:
         raise NotImplementedError(
             f"LLVM backend only supports tanh; got {rc.reservoir.activation.name}"
         )
-    if exe.W_out is None:
-        raise ValueError("Readout has not been trained — call fit() first")
 
-    fty, tanh_name, np_dtype, _ = _dtype_bindings(dtype)
+    # Import here to avoid an import cycle (rclite.ir uses runtime types).
+    from rclite.ir import build_ir
+    from rclite.ir.passes import StructuralSpecialize
 
-    K = rc.input.units
-    N = rc.reservoir.units
-    M = rc.readout.units
-    F = exe._feature_dim()
-
-    leak = float(rc.reservoir.leak_rate)
-    one_minus_leak = 1.0 - leak
-    bias_val = float(rc.reservoir.bias)
-    in_off = float(rc.input.input_offset)
-    in_sc = float(rc.input.input_scaling)
-    inc_bias = bool(rc.readout.include_bias)
-    inc_input = bool(rc.readout.include_input)
-
-    module = ir.Module(name=f"rc_jit_{id(rc)}")
-    module.triple = llvm.get_default_triple()
-
-    def cf(v):
-        return ir.Constant(fty, float(v))
-
-    def emit_global(name, arr):
-        flat = np.ascontiguousarray(arr, dtype=np_dtype).reshape(-1)
-        ty = ir.ArrayType(fty, flat.size)
-        g = ir.GlobalVariable(module, ty, name=name)
-        g.linkage = "internal"
-        g.global_constant = True
-        g.initializer = ir.Constant(ty, [cf(float(v)) for v in flat])
-        return g
-
-    def emit_res(b, g_Wres_, h_, i_, acc_):
-        topo = rc.reservoir.topology
-        if topo == Topology.DLR:
-            r = float(rc.reservoir.chain_weight)
-            is_pos = b.icmp_signed(">", i_, _ci(0))
-            i_safe = b.select(is_pos, b.sub(i_, _ci(1)), _ci(0))
-            val = _load1d(b, h_, i_safe)
-            contrib = b.select(is_pos, b.fmul(cf(r), val), cf(0.0))
-            b.store(b.fadd(b.load(acc_), contrib), acc_)
-        elif topo == Topology.SCR:
-            r = float(rc.reservoir.chain_weight)
-            is_zero = b.icmp_signed("==", i_, _ci(0))
-            i_prev = b.select(is_zero, _ci(N - 1), b.sub(i_, _ci(1)))
-            val = _load1d(b, h_, i_prev)
-            b.store(b.fadd(b.load(acc_), b.fmul(cf(r), val)), acc_)
-        elif topo == Topology.DLRB:
-            r = float(rc.reservoir.chain_weight)
-            bw = float(rc.reservoir.chain_feedback)
-            is_pos = b.icmp_signed(">", i_, _ci(0))
-            i_back = b.select(is_pos, b.sub(i_, _ci(1)), _ci(0))
-            val_back = _load1d(b, h_, i_back)
-            contrib_back = b.select(is_pos, b.fmul(cf(r), val_back), cf(0.0))
-            is_lt_last = b.icmp_signed("<", i_, _ci(N - 1))
-            i_fwd = b.select(is_lt_last, b.add(i_, _ci(1)), _ci(N - 1))
-            val_fwd = _load1d(b, h_, i_fwd)
-            contrib_fwd = b.select(is_lt_last, b.fmul(cf(bw), val_fwd), cf(0.0))
-            b.store(b.fadd(b.fadd(b.load(acc_), contrib_back), contrib_fwd), acc_)
-        else:
-            with _loop(b, _ci(N), "jres") as j:
-                w = _load2d_global(b, g_Wres_, N, i_, j)
-                hv = _load1d(b, h_, j)
-                b.store(b.fadd(b.load(acc_), b.fmul(w, hv)), acc_)
-
-    libm_fn = ir.Function(module, ir.FunctionType(fty, [fty]), name=tanh_name)
-
-    g_Win = emit_global("rc_W_in", exe.W_in)
-    is_structured = rc.reservoir.topology in (
-        Topology.DLR, Topology.DLRB, Topology.SCR
-    )
-    g_Wres = None if is_structured else emit_global("rc_W_res", exe.W_res)
-    g_Wout = emit_global("rc_W_out", exe.W_out)
-
-    fnty = ir.FunctionType(
-        ir.VoidType(),
-        [_I64, fty.as_pointer(), fty.as_pointer()],
-    )
-    fn = ir.Function(module, fnty, name="rc_predict")
-    T_arg, X_arg, Y_arg = fn.args
-    T_arg.name, X_arg.name, Y_arg.name = "T", "X", "Y"
-
-    entry = fn.append_basic_block("entry")
-    b = ir.IRBuilder(entry)
-
-    h = b.alloca(fty, size=_ci(N), name="h")
-    u_pre = b.alloca(fty, size=_ci(K), name="u_pre")
-    pre_arr = b.alloca(fty, size=_ci(N), name="pre")
-    phi_arr = b.alloca(fty, size=_ci(F), name="phi")
-    acc = b.alloca(fty, name="acc")
-
-    with _loop(b, _ci(N), "init") as i:
-        _store1d(b, h, i, cf(0.0))
-
-    with _loop(b, T_arg, "t") as t:
-        tK = b.mul(t, _ci(K))
-        tM = b.mul(t, _ci(M))
-
-        with _loop(b, _ci(K), "kpre") as k:
-            x_val = _load1d(b, X_arg, b.add(tK, k))
-            up = b.fmul(b.fsub(x_val, cf(in_off)), cf(in_sc))
-            _store1d(b, u_pre, k, up)
-
-        with _loop(b, _ci(N), "ipre") as i:
-            b.store(cf(bias_val), acc)
-            with _loop(b, _ci(K), "kin") as k:
-                w = _load2d_global(b, g_Win, K, i, k)
-                u_val = _load1d(b, u_pre, k)
-                b.store(b.fadd(b.load(acc), b.fmul(w, u_val)), acc)
-            emit_res(b, g_Wres, h, i, acc)
-            _store1d(b, pre_arr, i, b.load(acc))
-
-        with _loop(b, _ci(N), "iupd") as i:
-            h_old = _load1d(b, h, i)
-            pre_i = _load1d(b, pre_arr, i)
-            tan = b.call(libm_fn, [pre_i])
-            new_h = b.fadd(
-                b.fmul(cf(one_minus_leak), h_old),
-                b.fmul(cf(leak), tan),
-            )
-            _store1d(b, h, i, new_h)
-
-        off = 0
-        if inc_bias:
-            _store1d(b, phi_arr, _ci(off), cf(1.0))
-            off += 1
-        if inc_input:
-            with _loop(b, _ci(K), "kphi") as k:
-                x_val = _load1d(b, X_arg, b.add(tK, k))
-                _store1d(b, phi_arr, b.add(_ci(off), k), x_val)
-            off += K
-        with _loop(b, _ci(N), "iphi") as i:
-            _store1d(b, phi_arr, b.add(_ci(off), i), _load1d(b, h, i))
-
-        with _loop(b, _ci(M), "m") as m:
-            b.store(cf(0.0), acc)
-            with _loop(b, _ci(F), "fout") as fi:
-                w = _load2d_global(b, g_Wout, F, m, fi)
-                pv = _load1d(b, phi_arr, fi)
-                b.store(b.fadd(b.load(acc), b.fmul(w, pv)), acc)
-            _store1d(b, Y_arg, b.add(tM, m), b.load(acc))
-
-    b.ret_void()
-    return module
+    ir_module = build_ir(rc, exe)
+    if passes is None:
+        passes = [StructuralSpecialize()]
+    for p in passes:
+        ir_module = p(ir_module)
+    return _Lowerer(ir_module, dtype=dtype).lower()
 
 
 class CompiledRC:
@@ -284,11 +471,12 @@ class CompiledRC:
     name = "llvm"
 
     def __init__(self, rc: ReservoirComputer, exe: RCExecutor,
-                 opt_level: int = 3, vectorize: bool = True):
+                 opt_level: int = 3, vectorize: bool = True,
+                 passes=None):
         _ensure_initialized()
         self.rc = rc
         self.exe = exe
-        self._ir_text = str(emit_module(rc, exe))
+        self._ir_text = str(emit_module(rc, exe, passes=passes))
         self._mod = llvm.parse_assembly(self._ir_text)
         self._mod.verify()
 
@@ -440,7 +628,7 @@ class CrossCompiledRC:
 
     def __init__(self, rc: ReservoirComputer, exe: RCExecutor, *,
                  triple: str, cpu: str = "", features: str = "",
-                 dtype: str = "f32", opt_level: int = 2):
+                 dtype: str = "f32", opt_level: int = 2, passes=None):
         _ensure_all_targets()
         self.rc = rc
         self.exe = exe
@@ -448,7 +636,7 @@ class CrossCompiledRC:
         self.cpu = cpu
         self.dtype = dtype
 
-        module = emit_module(rc, exe, dtype=dtype)
+        module = emit_module(rc, exe, dtype=dtype, passes=passes)
         module.triple = triple
         self._ir_text = str(module)
         self._mod = llvm.parse_assembly(self._ir_text)
