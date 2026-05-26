@@ -462,6 +462,301 @@ def emit_module(rc: ReservoirComputer, exe: RCExecutor,
     return _Lowerer(ir_module, dtype=dtype).lower()
 
 
+def emit_quantized_module(qmodel, *, passes=None) -> ir.Module:
+    """Build LLVM IR for the integer (i32) quantized path.
+
+    Takes a `QuantizedModel` (with quantized weights + LUT), builds the
+    rclite IR with `dtype='i32'`, applies optional passes, and lowers via
+    `_IntLowerer`. The emitted function signature is:
+
+        void rc_predict(int64_t T, int32_t* X, int32_t* Y);
+
+    where X holds preprocessed-and-quantized input at input_scale and Y
+    receives output at state_scale.
+    """
+    from rclite.quant.ir_builder import build_ir_from_quantized
+
+    ir_module = build_ir_from_quantized(qmodel)
+    if passes is None:
+        passes = []
+    for p in passes:
+        ir_module = p(ir_module)
+    return _IntLowerer(ir_module).lower()
+
+
+# ----------------------------------------------------------------------------
+# Integer (quantized) lowering
+
+
+def _load1d_global(b: ir.IRBuilder, g, idx):
+    """Load element from a 1D global array at i64/i32 index."""
+    return b.load(b.gep(g, [_ci32(0), idx]))
+
+
+class _IntLowerer:
+    """Lower an rclite IR module under `dtype='i32'` to LLVM IR.
+
+    Fixed-point multiply pattern (mirage-compatible):
+        i32 * i32 -> sext to i64 -> mul -> ashr by shift -> trunc to i32
+    Shift amounts depend on operand provenance:
+        W_in * input_q   : shift = weight_frac + input_frac - state_frac
+        W_res * state_q  : shift = weight_frac
+        state * leak_q   : shift = state_frac
+        readout accum    : i64 accumulator, final shift by state_frac
+    Tanh is realized by linear-interpolated LUT lookup in `tanh_lut_lookup`.
+    """
+
+    def __init__(self, ir_module):
+        from rclite.ir.ops import (
+            TimeLoop, ReservoirStep, BuildPhi, ReadoutLinear, FusedStepReadout,
+        )
+
+        self.ir_module = ir_module
+        md = ir_module.metadata
+        if md.get("dtype") != "i32":
+            raise ValueError(
+                f"_IntLowerer requires dtype='i32', got {md.get('dtype')!r}"
+            )
+
+        self.state_frac = int(md["state_frac"])
+        self.input_frac = int(md["input_frac"])
+        self.weight_frac = int(md["weight_frac"])
+        self.lut_n = int(md["lut_n"])
+        self.lut_xmin_q = int(md["lut_xmin_q"])
+        self.lut_xmax_q = int(md["lut_xmax_q"])
+        self.leak_q = int(md["leak_q"])
+        self.bias_q = int(md["bias_q"])
+
+        self.K, self.N, self.M = ir_module.K, ir_module.N, ir_module.M
+        self.shift_in = self.weight_frac + self.input_frac - self.state_frac
+        self.shift_res = self.weight_frac
+        self.one_minus_leak_q = (1 << self.state_frac) - self.leak_q
+
+        self.module = ir.Module(name=f"rc_jit_i32_{id(ir_module)}")
+        self.module.triple = llvm.get_default_triple()
+
+        # i32 weight globals
+        self.globals = {}
+        for name, arr in ir_module.weights.items():
+            self.globals[name] = self._emit_i32_global(name, arr)
+
+        fnty = ir.FunctionType(
+            ir.VoidType(),
+            [_I64, _I32.as_pointer(), _I32.as_pointer()],
+        )
+        self.fn = ir.Function(self.module, fnty, name="rc_predict")
+        self.T_arg, self.X_arg, self.Y_arg = self.fn.args
+        self.T_arg.name = "T"; self.X_arg.name = "X"; self.Y_arg.name = "Y"
+
+        entry = self.fn.append_basic_block("entry")
+        self.b = ir.IRBuilder(entry)
+
+        # Determine if BuildPhi/ReadoutLinear need a phi buffer
+        needs_phi = any(
+            isinstance(op, (ReadoutLinear, BuildPhi))
+            for op in self._flatten_ops()
+        )
+        max_F = max(
+            (op.F for op in self._flatten_ops()
+              if isinstance(op, (ReadoutLinear, FusedStepReadout))),
+            default=self.N + self.K + 1,
+        )
+
+        self.h = self.b.alloca(_I32, size=_ci(self.N), name="h")
+        self.pre_arr = self.b.alloca(_I32, size=_ci(self.N), name="pre")
+        self.phi_arr = (
+            self.b.alloca(_I32, size=_ci(max(max_F, 1)), name="phi")
+            if needs_phi else None
+        )
+        self.acc = self.b.alloca(_I32, name="acc")
+        self.acc64 = self.b.alloca(_I64, name="acc64")
+
+        with _loop(self.b, _ci(self.N), "init") as i:
+            _store1d(self.b, self.h, i, self._ci32(0))
+
+        self.t = None
+
+    # ------------------------------------------------------------------
+    # helpers
+
+    def _ci32(self, v: int) -> ir.Constant:
+        return ir.Constant(_I32, int(v))
+
+    def _ci64(self, v: int) -> ir.Constant:
+        return ir.Constant(_I64, int(v))
+
+    def _emit_i32_global(self, name, arr):
+        import numpy as np
+        flat = np.asarray(arr).reshape(-1).astype(np.int32)
+        ty = ir.ArrayType(_I32, flat.size)
+        g = ir.GlobalVariable(self.module, ty, name=name)
+        g.linkage = "internal"
+        g.global_constant = True
+        g.initializer = ir.Constant(ty, [self._ci32(int(v)) for v in flat])
+        return g
+
+    def _flatten_ops(self):
+        from rclite.ir.ops import TimeLoop
+        for op in self.ir_module.ops:
+            yield op
+            if isinstance(op, TimeLoop):
+                yield from op.body
+
+    def _fixed_mul(self, a, b_val, shift: int):
+        """(a * b_val) >> shift, with i32->i64 promote, ashr, trunc."""
+        a64 = self.b.sext(a, _I64)
+        b64 = self.b.sext(b_val, _I64)
+        prod = self.b.mul(a64, b64)
+        shifted = self.b.ashr(prod, self._ci64(shift))
+        return self.b.trunc(shifted, _I32)
+
+    # ------------------------------------------------------------------
+    # dispatcher
+
+    def lower(self) -> ir.Module:
+        for op in self.ir_module.ops:
+            self._lower(op)
+        self.b.ret_void()
+        return self.module
+
+    def _lower(self, op):
+        from rclite.ir.ops import (
+            TimeLoop, ReservoirStep, BuildPhi, ReadoutLinear,
+        )
+        if isinstance(op, TimeLoop):
+            return self._lower_time_loop(op)
+        if isinstance(op, ReservoirStep):
+            return self._lower_reservoir_step(op)
+        if isinstance(op, BuildPhi):
+            return self._lower_build_phi(op)
+        if isinstance(op, ReadoutLinear):
+            return self._lower_readout_linear(op)
+        raise NotImplementedError(
+            f"{type(op).__name__} not supported in the integer path"
+        )
+
+    def _lower_time_loop(self, op):
+        with _loop(self.b, self.T_arg, "t") as t:
+            self.t = t
+            for body_op in op.body:
+                self._lower(body_op)
+        self.t = None
+
+    def _lower_reservoir_step(self, op):
+        g_Win = self.globals["W_in"]
+        g_Wres = self.globals["W_res"]
+        g_lut = self.globals["lut_table"]
+        K, N = op.K, op.N
+        tK = self.b.mul(self.t, _ci(K))
+
+        with _loop(self.b, _ci(N), "ipre") as i:
+            self.b.store(self._ci32(self.bias_q), self.acc)
+            with _loop(self.b, _ci(K), "kin") as k:
+                w = _load2d_global(self.b, g_Win, K, i, k)
+                u = _load1d(self.b, self.X_arg, self.b.add(tK, k))
+                prod = self._fixed_mul(w, u, self.shift_in)
+                self.b.store(self.b.add(self.b.load(self.acc), prod), self.acc)
+            with _loop(self.b, _ci(N), "jres") as j:
+                w = _load2d_global(self.b, g_Wres, N, i, j)
+                s = _load1d(self.b, self.h, j)
+                prod = self._fixed_mul(w, s, self.shift_res)
+                self.b.store(self.b.add(self.b.load(self.acc), prod), self.acc)
+            _store1d(self.b, self.pre_arr, i, self.b.load(self.acc))
+
+        with _loop(self.b, _ci(N), "iupd") as i:
+            pre_i = _load1d(self.b, self.pre_arr, i)
+            activated = self._emit_lut_lookup(pre_i, g_lut)
+            h_old = _load1d(self.b, self.h, i)
+            t1 = self._fixed_mul(h_old, self._ci32(self.one_minus_leak_q),
+                                  self.state_frac)
+            t2 = self._fixed_mul(activated, self._ci32(self.leak_q),
+                                  self.state_frac)
+            new_h = self.b.add(t1, t2)
+            _store1d(self.b, self.h, i, new_h)
+
+    def _emit_lut_lookup(self, x_q, g_lut):
+        """Quantized tanh LUT with linear interpolation."""
+        b = self.b
+        sf = self.state_frac
+        n = self.lut_n
+        xmin = self._ci32(self.lut_xmin_q)
+        xmax = self._ci32(self.lut_xmax_q)
+
+        is_lo = b.icmp_signed("<", x_q, xmin)
+        x1 = b.select(is_lo, xmin, x_q)
+        is_hi = b.icmp_signed(">", x1, xmax)
+        x = b.select(is_hi, xmax, x1)
+
+        num64 = b.sext(b.sub(x, xmin), _I64)
+        denom64 = self._ci64(self.lut_xmax_q - self.lut_xmin_q)
+        shl = b.shl(num64, self._ci64(sf))
+        div = b.sdiv(shl, denom64)
+        t_q = b.trunc(div, _I32)
+
+        n_minus1 = self._ci32(n - 1)
+        pos_q = b.mul(t_q, n_minus1)
+
+        i0_raw = b.ashr(pos_q, self._ci32(sf))
+        n_minus2 = self._ci32(n - 2)
+        too_big = b.icmp_signed(">", i0_raw, n_minus2)
+        i0_c1 = b.select(too_big, n_minus2, i0_raw)
+        zero32 = self._ci32(0)
+        too_neg = b.icmp_signed("<", i0_c1, zero32)
+        i0 = b.select(too_neg, zero32, i0_c1)
+        i1 = b.add(i0, self._ci32(1))
+
+        i0_shl = b.shl(i0, self._ci32(sf))
+        frac_q = b.sub(pos_q, i0_shl)
+
+        i0_idx = b.sext(i0, _I64)
+        i1_idx = b.sext(i1, _I64)
+        y0 = _load1d_global(b, g_lut, i0_idx)
+        y1 = _load1d_global(b, g_lut, i1_idx)
+        dy = b.sub(y1, y0)
+        dy_frac = self._fixed_mul(dy, frac_q, sf)
+        return b.add(y0, dy_frac)
+
+    def _lower_build_phi(self, op):
+        if self.phi_arr is None:
+            raise RuntimeError("BuildPhi requires phi buffer")
+        K, N = op.K, op.N
+        tK = self.b.mul(self.t, _ci(K))
+        off = 0
+        if op.include_bias:
+            # phi[0] = (1 << state_frac) so that phi[0] * W_out_q[0]
+            # ends up at state_scale^2 like all other contributions.
+            _store1d(self.b, self.phi_arr, _ci(off),
+                      self._ci32(1 << self.state_frac))
+            off += 1
+        if op.include_input:
+            with _loop(self.b, _ci(K), "kphi") as k:
+                u_val = _load1d(self.b, self.X_arg, self.b.add(tK, k))
+                _store1d(self.b, self.phi_arr, self.b.add(_ci(off), k), u_val)
+            off += K
+        with _loop(self.b, _ci(N), "iphi") as i:
+            _store1d(self.b, self.phi_arr, self.b.add(_ci(off), i),
+                      _load1d(self.b, self.h, i))
+
+    def _lower_readout_linear(self, op):
+        g_Wout = self.globals["W_out"]
+        F = op.F
+        tM = self.b.mul(self.t, _ci(op.M))
+        with _loop(self.b, _ci(op.M), "m") as m:
+            self.b.store(self._ci64(0), self.acc64)
+            with _loop(self.b, _ci(F), "fout") as fi:
+                w = _load2d_global(self.b, g_Wout, F, m, fi)
+                pv = _load1d(self.b, self.phi_arr, fi)
+                w64 = self.b.sext(w, _I64)
+                pv64 = self.b.sext(pv, _I64)
+                prod = self.b.mul(w64, pv64)
+                self.b.store(self.b.add(self.b.load(self.acc64), prod),
+                              self.acc64)
+            shifted = self.b.ashr(self.b.load(self.acc64),
+                                    self._ci64(self.state_frac))
+            y_i32 = self.b.trunc(shifted, _I32)
+            _store1d(self.b, self.Y_arg, self.b.add(tM, m), y_i32)
+
+
 class CompiledRC:
     """JIT-compiled ReservoirComputer (LLVM backend).
 
@@ -613,6 +908,89 @@ class CompiledRC:
 
 def compile_rc(rc: ReservoirComputer, exe: RCExecutor, **kwargs) -> CompiledRC:
     return CompiledRC(rc, exe, **kwargs)
+
+
+class CompiledQuantizedRC:
+    """JIT-compiled QuantizedModel (integer i32 path).
+
+    Mirrors the float CompiledRC interface but consumes a `QuantizedModel`
+    and emits the i32 kernel. `predict()` accepts float inputs, applies
+    the IDL preprocessing and input-quantization, calls the kernel, and
+    dequantizes the output back to float.
+    """
+
+    name = "llvm-quantized"
+
+    def __init__(self, qmodel, opt_level: int = 3, passes=None):
+        _ensure_initialized()
+        self.qmodel = qmodel
+        self.rc = qmodel.rc
+        self._ir_text = str(emit_quantized_module(qmodel, passes=passes))
+        self._mod = llvm.parse_assembly(self._ir_text)
+        self._mod.verify()
+
+        target = llvm.Target.from_triple(llvm.get_default_triple())
+        self._tm = target.create_target_machine(opt=opt_level)
+
+        pto = llvm.create_pipeline_tuning_options()
+        pto.speed_level = opt_level
+        pto.loop_vectorization = True
+        pto.slp_vectorization = True
+        pb = llvm.create_pass_builder(self._tm, pto)
+        mpm = pb.getModulePassManager()
+        mpm.run(self._mod, pb)
+
+        self._engine = llvm.create_mcjit_compiler(self._mod, self._tm)
+        self._engine.finalize_object()
+        self._engine.run_static_constructors()
+
+        addr = self._engine.get_function_address("rc_predict")
+        self._cfn = ctypes.CFUNCTYPE(
+            None, ctypes.c_int64,
+            ctypes.POINTER(ctypes.c_int32),
+            ctypes.POINTER(ctypes.c_int32),
+        )(addr)
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        if X.ndim == 1:
+            X = X[:, None]
+        cfg = self.qmodel.config
+        rc = self.qmodel.rc
+        # Preprocess + quantize input
+        u_pre = (X - rc.input.input_offset) * rc.input.input_scaling
+        X_q = np.ascontiguousarray(
+            self.qmodel.target.quantize_input_array(u_pre, cfg).astype(np.int32)
+        )
+        T = X_q.shape[0]
+        Y_q = np.zeros((T, self.qmodel.M), dtype=np.int32)
+        self._cfn(
+            ctypes.c_int64(T),
+            X_q.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+            Y_q.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+        )
+        return Y_q.astype(np.float64) / cfg.state_scale
+
+    @property
+    def llvm_ir(self) -> str:
+        return self._ir_text
+
+    @property
+    def optimized_ir(self) -> str:
+        return str(self._mod)
+
+    @property
+    def assembly(self) -> str:
+        return self._tm.emit_assembly(self._mod)
+
+    def emit_object(self, path: str) -> None:
+        target = llvm.Target.from_triple(llvm.get_default_triple())
+        tm_pic = target.create_target_machine(opt=3, reloc="pic")
+        with open(path, "wb") as f:
+            f.write(tm_pic.emit_object(self._mod))
+
+
+def compile_quantized_rc(qmodel, **kwargs) -> CompiledQuantizedRC:
+    return CompiledQuantizedRC(qmodel, **kwargs)
 
 
 class CrossCompiledRC:

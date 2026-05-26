@@ -18,6 +18,7 @@ from typing import Optional
 import numpy as np
 
 from rclite.codegen import compile_rc, cross_compile_rc
+from rclite.codegen.llvm import emit_quantized_module
 from ..target import Target, CompiledArtifact, RunResult
 from .boards import CortexM0Board, MicrobitV1
 
@@ -153,6 +154,137 @@ class CortexM0Target(Target):
             output_dir=out,
             binary=elf,
             sources=[main_path, hdr, startup_path, linker_path],
+            objects=[rc_o, out / "startup.o", out / "main.o"],
+            metadata=metadata,
+        )
+
+    def compile_quantized(self, qmodel, *,
+                            output_dir,
+                            test_inputs: np.ndarray,
+                            **_) -> CompiledArtifact:
+        """Cross-compile a quantized model. The kernel takes i32 inputs
+        already at input_scale (preprocessed). main.c embeds the i32-encoded
+        input/reference arrays and uses pure integer arithmetic — no libm
+        tanhf, no soft-float."""
+        import llvmlite.binding as llvm
+        if shutil.which(self.cc) is None:
+            raise RuntimeError(
+                f"{self.cc} not found on PATH — install gcc-arm-none-eabi"
+            )
+
+        out = pathlib.Path(output_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        cfg = qmodel.config
+
+        # Cross-compile the i32 kernel
+        ll_mod = emit_quantized_module(qmodel)
+        ll_mod.triple = self.triple
+        from rclite.codegen.llvm import _ensure_all_targets
+        _ensure_all_targets()
+        mod = llvm.parse_assembly(str(ll_mod))
+        mod.verify()
+        target = llvm.Target.from_triple(self.triple)
+        tm = target.create_target_machine(cpu=self.cpu, opt=2, reloc="static")
+        pto = llvm.create_pipeline_tuning_options()
+        pto.speed_level = 2
+        pto.loop_vectorization = False
+        pto.slp_vectorization = False
+        pb = llvm.create_pass_builder(tm, pto)
+        pb.getModulePassManager().run(mod, pb)
+        rc_o = out / "rc_predict.o"
+        with open(rc_o, "wb") as f:
+            f.write(tm.emit_object(mod))
+        with open(out / "rc_predict.s", "w") as f:
+            f.write(tm.emit_assembly(mod))
+
+        # Quantize test inputs (matches what CompiledQuantizedRC.predict does)
+        rc = qmodel.rc
+        u_pre = (test_inputs - rc.input.input_offset) * rc.input.input_scaling
+        X_q = qmodel.target.quantize_input_array(u_pre, cfg).astype(np.int32)
+
+        # Reference outputs (bit-exact via Python QuantizedExecutor)
+        from rclite.quant.executor import QuantizedExecutor
+        qexe = QuantizedExecutor(qmodel)
+        Y_ref_q = np.zeros((test_inputs.shape[0], qmodel.M), dtype=np.int32)
+        for t in range(test_inputs.shape[0]):
+            qexe.step_q(X_q[t] if X_q.ndim > 1 else np.array([X_q[t]], dtype=np.int32))
+            # phi-style readout uses raw input passthrough scaling — match the
+            # kernel's BuildPhi by feeding the (preprocessed-quantized) X_q here.
+            from rclite.quant._intops import trunc_i32
+            phi_input = X_q[t] if X_q.ndim > 1 else np.array([X_q[t]], dtype=np.int32)
+            Y_ref_q[t] = qexe.predict_one_q(phi_input, qexe.state_q)
+
+        # Render main.c from template
+        tmpl_path = _SUPPORT_DIR / "main_template_q.c"
+        tmpl = tmpl_path.read_text()
+        T = len(X_q)
+        x_lit = ", ".join(str(int(v)) for v in X_q.ravel())
+        y_lit = ", ".join(str(int(v)) for v in Y_ref_q.ravel())
+        main_c = (tmpl
+                  .replace("@@T_LEN@@", str(T))
+                  .replace("@@STATE_FRAC@@", str(cfg.state_frac))
+                  .replace("@@X_VALUES_Q@@", x_lit)
+                  .replace("@@Y_VALUES_Q@@", y_lit))
+        main_path = out / "main.c"
+        main_path.write_text(main_c)
+
+        # Stage startup + linker
+        startup_path = out / "startup.c"
+        linker_path = out / self.board.linker_script
+        shutil.copy(_SUPPORT_DIR / "startup.c", startup_path)
+        shutil.copy(_SUPPORT_DIR / self.board.linker_script, linker_path)
+
+        cflags = [
+            f"-mcpu={self.cpu}", "-mthumb", "-O2", "-g",
+            "-ffunction-sections", "-fdata-sections", "-Wall",
+            f"-I{out}",
+        ]
+        for src in (startup_path, main_path):
+            obj = src.with_suffix(".o")
+            cp = subprocess.run([self.cc, "-c", *cflags, str(src), "-o", str(obj)],
+                                capture_output=True, text=True)
+            if cp.returncode != 0:
+                raise RuntimeError(f"compile failed for {src.name}: {cp.stderr}")
+
+        elf = out / "rc.elf"
+        link_cmd = [
+            self.cc, f"-mcpu={self.cpu}", "-mthumb",
+            "-T", str(linker_path),
+            "-nostartfiles",
+            "-Wl,--gc-sections",
+            f"-Wl,-Map={out / 'rc.map'}",
+            "--specs=nosys.specs",
+            *_AEABI_ALIASES,
+            str(out / "startup.o"),
+            str(out / "main.o"),
+            str(rc_o),
+            "-o", str(elf),
+            "-lgcc", "-lc", "-lnosys",  # no -lm: integer path has no FP
+        ]
+        cp = subprocess.run(link_cmd, capture_output=True, text=True)
+        if cp.returncode != 0:
+            raise RuntimeError(f"link failed: {cp.stderr}")
+
+        metadata = {
+            "board": self.board, "triple": self.triple,
+            "cpu": self.cpu, "dtype": "i32",
+            "state_frac": cfg.state_frac,
+            "quantized": True,
+        }
+        try:
+            sz = subprocess.run(
+                [self.cc.replace("gcc", "size"), str(elf)],
+                capture_output=True, text=True, check=True,
+            )
+            metadata["size"] = sz.stdout.strip()
+        except Exception:
+            pass
+
+        return CompiledArtifact(
+            target_name=self.name + "/quantized",
+            output_dir=out,
+            binary=elf,
+            sources=[main_path, startup_path, linker_path],
             objects=[rc_o, out / "startup.o", out / "main.o"],
             metadata=metadata,
         )
