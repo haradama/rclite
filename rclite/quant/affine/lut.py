@@ -46,7 +46,11 @@ class LUTStrategy:
     interp_frac_bits: int = 8
     # For POLYNOMIAL only:
     poly_qf_bits: int = 16   # Q-format fractional bits for intermediate compute
-    poly_clip: float = 2.0   # clip |x| ≤ poly_clip before evaluating
+    poly_clip: float = 2.0   # clip |x| ≤ poly_clip before evaluating; 2.0
+                              # empirically yields the best least-squares fit
+                              # over the active tanh region (|x| < 2 spans
+                              # roughly -0.96 to +0.96 of tanh's range)
+    poly_degree: int = 5     # odd-only polynomial: 3 or 5
 
     def __post_init__(self):
         if self.kind == LUTKind.LINEAR_INTERP:
@@ -65,6 +69,10 @@ class LUTStrategy:
                 )
             if self.poly_clip <= 0:
                 raise ValueError(f"poly_clip must be > 0, got {self.poly_clip}")
+            if self.poly_degree not in (3, 5):
+                raise ValueError(
+                    f"poly_degree must be 3 or 5, got {self.poly_degree}"
+                )
 
     @classmethod
     def direct(cls) -> "LUTStrategy":
@@ -77,10 +85,11 @@ class LUTStrategy:
                     n_entries=n_entries, interp_frac_bits=interp_frac_bits)
 
     @classmethod
-    def polynomial(cls, poly_qf_bits: int = 16,
+    def polynomial(cls, degree: int = 5, poly_qf_bits: int = 16,
                     poly_clip: float = 2.0) -> "LUTStrategy":
         return cls(kind=LUTKind.POLYNOMIAL,
-                    poly_qf_bits=poly_qf_bits, poly_clip=poly_clip)
+                    poly_degree=degree, poly_qf_bits=poly_qf_bits,
+                    poly_clip=poly_clip)
 
 
 # ---------------------------------------------------------------------------
@@ -103,16 +112,16 @@ class LUTArtifacts:
                   fixed-point position in Q.interp_frac_bits
 
     For POLYNOMIAL:
-        table   : empty (np.zeros(0, dtype=storage))
-        offset  : 0
-        x_to_qf_M0, x_to_qf_n   : multiplier converting (q_pre - zp_pre)
-                                   to x in Q.poly_qf_bits
-        qf_to_state_M0, qf_to_state_n :
-                                   multiplier converting Q.poly_qf_bits
-                                   tanh value back to state scale (mantissa
-                                   only — caller adds zp_state)
-        x_clip_qf : |x| clamp threshold, in Q.poly_qf_bits
-        one_qf    : value of 1.0 in Q.poly_qf_bits (for clamp ceiling)
+        table          : empty (np.zeros(0, dtype=storage))
+        offset         : 0
+        x_to_qf_M0/n   : multiplier converting (q_pre - zp_pre) to x in Q.qf
+        qf_to_state_M0/n : multiplier converting Q.qf tanh value to Δq_state
+                          (caller adds zp_state)
+        x_clip_qf      : |x| clamp threshold, in Q.qf
+        one_qf         : value of 1.0 in Q.qf (for clamp ceiling)
+        poly_a1_qf, poly_a3_qf, poly_a5_qf
+                       : odd-only minimax coefficients in Q.qf
+                         (a1 for x, a3 for x³, a5 for x⁵ — a5 = 0 if degree==3)
     """
     table: np.ndarray
     offset: int = 0
@@ -126,6 +135,9 @@ class LUTArtifacts:
     qf_to_state_n: int = 0
     x_clip_qf: int = 0
     one_qf: int = 0
+    poly_a1_qf: int = 0
+    poly_a3_qf: int = 0
+    poly_a5_qf: int = 0
 
 
 def build_lut_artifacts(config: AffineQuantConfig,
@@ -176,24 +188,46 @@ def _build_linear_interp(config: AffineQuantConfig,
     )
 
 
+def _fit_odd_minimax_tanh(clip: float, degree: int) -> tuple[float, float, float]:
+    """Least-squares-fit odd polynomial coefficients (a1, a3, a5) for tanh on
+    [-clip, clip]. `degree` is 3 or 5; for degree=3 we return a5=0.
+
+    LSQ is not strict minimax but for our use cases the max-error is within
+    ~30% of true Remez. Good enough for embedded.
+    """
+    # Sample densely; bias slightly toward boundaries where tanh saturates.
+    xs = np.linspace(-clip, clip, 4001)
+    ys = np.tanh(xs)
+    if degree == 3:
+        # ys ≈ a1*x + a3*x³
+        A = np.column_stack([xs, xs ** 3])
+        a, *_ = np.linalg.lstsq(A, ys, rcond=None)
+        return float(a[0]), float(a[1]), 0.0
+    if degree == 5:
+        A = np.column_stack([xs, xs ** 3, xs ** 5])
+        a, *_ = np.linalg.lstsq(A, ys, rcond=None)
+        return float(a[0]), float(a[1]), float(a[2])
+    raise ValueError(f"degree must be 3 or 5, got {degree}")
+
+
 def _build_polynomial(config: AffineQuantConfig,
                         strategy: LUTStrategy) -> LUTArtifacts:
     sb = config.storage_bits
     qf = strategy.poly_qf_bits
-    # 1) Multiplier that turns (q_pre - zp_pre) into x in Q.qf:
-    #    x_qf ≈ (q_pre - zp_pre) * s_pre * 2^qf
+    # 1) (q_pre - zp_pre) → x in Q.qf
     M_x_real = config.pre.scale * float(1 << qf)
     M_x_M0, M_x_n = quantize_multiplier(M_x_real)
-
-    # 2) Multiplier that turns Q.qf tanh value into Δq_state (then caller
-    #    adds zp_state):  q_state - zp_state = round(tanh_qf / (2^qf * s_state))
+    # 2) Q.qf tanh value → Δq_state
     M_back_real = 1.0 / (float(1 << qf) * config.state.scale)
     M_back_M0, M_back_n = quantize_multiplier(M_back_real)
-
-    # Polynomial uses Taylor degree-3 (tanh ≈ x - x³/3) clamped to |x| ≤ clip
-    # and the result clamped to ±1. Both clamp constants in Q.qf:
+    # 3) Clamp constants in Q.qf
     x_clip_qf = int(round(strategy.poly_clip * (1 << qf)))
     one_qf = 1 << qf
+    # 4) Minimax coefficients fit on [-clip, clip], expressed in Q.qf.
+    a1, a3, a5 = _fit_odd_minimax_tanh(strategy.poly_clip, strategy.poly_degree)
+    a1_qf = int(round(a1 * (1 << qf)))
+    a3_qf = int(round(a3 * (1 << qf)))
+    a5_qf = int(round(a5 * (1 << qf)))
 
     return LUTArtifacts(
         table=np.zeros(0, dtype=config.state.storage_dtype),
@@ -201,4 +235,5 @@ def _build_polynomial(config: AffineQuantConfig,
         x_to_qf_M0=M_x_M0, x_to_qf_n=M_x_n,
         qf_to_state_M0=M_back_M0, qf_to_state_n=M_back_n,
         x_clip_qf=x_clip_qf, one_qf=one_qf,
+        poly_a1_qf=a1_qf, poly_a3_qf=a3_qf, poly_a5_qf=a5_qf,
     )

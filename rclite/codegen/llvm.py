@@ -1096,12 +1096,16 @@ class _AffineLowerer:
             self.lut_idx_n            = int(md["lut_idx_n"])
         elif self.lut_kind == "polynomial":
             self.poly_qf_bits = int(md["poly_qf_bits"])
+            self.poly_degree  = int(md.get("poly_degree", 5))
             self.poly_x_M0    = int(md["poly_x_M0"])
             self.poly_x_n     = int(md["poly_x_n"])
             self.poly_back_M0 = int(md["poly_back_M0"])
             self.poly_back_n  = int(md["poly_back_n"])
             self.poly_clip_qf = int(md["poly_clip_qf"])
             self.poly_one_qf  = int(md["poly_one_qf"])
+            self.poly_a1_qf   = int(md["poly_a1_qf"])
+            self.poly_a3_qf   = int(md["poly_a3_qf"])
+            self.poly_a5_qf   = int(md["poly_a5_qf"])
 
         # Requantize multipliers (M0, n)
         self.M_in_M0,  self.M_in_n  = int(md["M_in_M0"]),  int(md["M_in_n"])
@@ -1116,6 +1120,21 @@ class _AffineLowerer:
 
         self.include_bias  = bool(md["include_bias"])
         self.include_input = bool(md["include_input"])
+
+        # Topology specialisation (SCR/DLR/DLRB skip the dense W_res matmul).
+        self.structured       = bool(md.get("structured", False))
+        self.topology_name    = md.get("topology", "ESN_STANDARD")
+        self.chain_weight_q   = int(md.get("chain_weight_q", 0))
+        self.chain_feedback_q = int(md.get("chain_feedback_q", 0))
+
+        # Integer input preprocess (active iff input_offset != 0 or
+        # input_scaling != 1). When active, the kernel computes u_pre into
+        # a scratch buffer that the W_in matmul reads; otherwise the matmul
+        # reads X directly.
+        self.has_int_preprocess = bool(md.get("has_integer_preprocess", False))
+        self.pre_M0    = int(md.get("pre_M0", 0))
+        self.pre_n     = int(md.get("pre_n", 0))
+        self.pre_const = int(md.get("pre_const", 0))
 
         self.K, self.N, self.M = ir_module.K, ir_module.N, ir_module.M
 
@@ -1150,6 +1169,14 @@ class _AffineLowerer:
         self.pre_buf = self.b.alloca(
             self.storage_ty, size=_ci(self.N), name="pre",
         )
+        # u_pre scratch only allocated when integer preprocess is in play —
+        # otherwise the matmul reads X directly.
+        if self.has_int_preprocess:
+            self.u_pre_buf = self.b.alloca(
+                self.storage_ty, size=_ci(max(self.K, 1)), name="u_pre",
+            )
+        else:
+            self.u_pre_buf = None
 
         # Initialize state to zp_state
         with _loop(self.b, _ci(self.N), "init") as i:
@@ -1206,10 +1233,14 @@ class _AffineLowerer:
         """If accumulator is i64, clamp to i32 range and truncate; else passthrough."""
         if self.accum_ty == _I32:
             return val_ty
+        return self._clamp_i64_to_i32(val_ty)
+
+    def _clamp_i64_to_i32(self, val_i64):
+        """Clamp an i64 value to the signed i32 range and truncate to i32."""
         lo = self._ci64(-(1 << 31))
         hi = self._ci64((1 << 31) - 1)
         clipped_lo = self.b.select(
-            self.b.icmp_signed("<", val_ty, lo), lo, val_ty,
+            self.b.icmp_signed("<", val_i64, lo), lo, val_i64,
         )
         clipped = self.b.select(
             self.b.icmp_signed(">", clipped_lo, hi), hi, clipped_lo,
@@ -1253,10 +1284,12 @@ class _AffineLowerer:
 
     def _lower(self, op):
         from rclite.ir.ops import (
-            TimeLoop, ReservoirStep, BuildPhi, ReadoutLinear,
+            TimeLoop, PreprocessInput, ReservoirStep, BuildPhi, ReadoutLinear,
         )
         if isinstance(op, TimeLoop):
             return self._lower_time_loop(op)
+        if isinstance(op, PreprocessInput):
+            return self._lower_preprocess_affine(op)
         if isinstance(op, ReservoirStep):
             return self._lower_reservoir_step(op)
         if isinstance(op, BuildPhi):
@@ -1267,6 +1300,28 @@ class _AffineLowerer:
         raise NotImplementedError(
             f"{type(op).__name__} not supported in the affine path"
         )
+
+    def _lower_preprocess_affine(self, op):
+        """Integer preprocess: u_pre[k] = sat(pre_const + apply_mult(q_x − zp_x)).
+
+        Mirrors `AffineQuantizedExecutor._quantize_u_pre` step for step.
+        """
+        K = op.K
+        if K == 0 or not self.has_int_preprocess:
+            return
+        t = self.t
+        tK = self.b.mul(t, _ci(K))
+        with _loop(self.b, _ci(K), "kpre_aff") as k:
+            x_q = _load1d(self.b, self.X_arg, self.b.add(tK, k))
+            centered = self.b.sub(
+                self.b.sext(x_q, _I32), self._ci32(self.zp_input),
+            )
+            delta = self._emit_requantize_i32(
+                centered, self.pre_M0, self.pre_n,
+            )
+            total = self.b.add(delta, self._ci32(self.pre_const))
+            _store1d(self.b, self.u_pre_buf, k,
+                      self._emit_saturate_to_storage(total))
 
     def _lower_time_loop(self, op):
         with _loop(self.b, self.T_arg, "t") as t:
@@ -1280,9 +1335,10 @@ class _AffineLowerer:
 
     def _lower_reservoir_step(self, op):
         g_Win  = self.globals["W_in"]
-        g_Wres = self.globals["W_res"]
         g_rs_in  = self.globals["row_sum_W_in"]
-        g_rs_res = self.globals["row_sum_W_res"]
+        # W_res / row_sum_W_res only exist for non-structured (dense) topologies.
+        g_Wres = self.globals.get("W_res")
+        g_rs_res = self.globals.get("row_sum_W_res")
         K, N = op.K, op.N
         t = self.t
 
@@ -1293,9 +1349,14 @@ class _AffineLowerer:
             self.b.store(self._ca(0), acc_in_var)
             with _loop(self.b, _ci(K), "kin") as k:
                 w = _load2d_global(self.b, g_Win, K, i, k)
-                # Raw input is already at (s_input, zp_input) == (s_u_pre, zp_u_pre)
-                x = _load1d(self.b, self.X_arg,
-                              self.b.add(self.b.mul(t, _ci(K)), k))
+                # Identity preprocess: read X directly (s_input == s_u_pre).
+                # Integer preprocess: read u_pre buffer populated by
+                # _lower_preprocess_affine at the top of this time step.
+                if self.has_int_preprocess:
+                    x = _load1d(self.b, self.u_pre_buf, k)
+                else:
+                    x = _load1d(self.b, self.X_arg,
+                                  self.b.add(self.b.mul(t, _ci(K)), k))
                 w_a = self.b.sext(w, self.accum_ty)
                 x_a = self.b.sext(x, self.accum_ty)
                 prod = self.b.mul(w_a, x_a)
@@ -1315,28 +1376,31 @@ class _AffineLowerer:
                 self.M_in_M0, self.M_in_n,
             )
 
-            # acc_res
-            acc_res_var = self.b.alloca(self.accum_ty, name="acc_res")
-            self.b.store(self._ca(0), acc_res_var)
-            with _loop(self.b, _ci(N), "jres") as j:
-                w = _load2d_global(self.b, g_Wres, N, i, j)
-                h = _load1d(self.b, self.h_buf, j)
-                w_a = self.b.sext(w, self.accum_ty)
-                h_a = self.b.sext(h, self.accum_ty)
-                prod = self.b.mul(w_a, h_a)
-                self.b.store(
-                    self.b.add(self.b.load(acc_res_var), prod), acc_res_var,
+            # acc_res in i32 (after structured collapse OR dense matmul + clamp).
+            if self.structured:
+                acc_res_i32 = self._emit_chain_contribution(i, N)
+            else:
+                acc_res_var = self.b.alloca(self.accum_ty, name="acc_res")
+                self.b.store(self._ca(0), acc_res_var)
+                with _loop(self.b, _ci(N), "jres") as j:
+                    w = _load2d_global(self.b, g_Wres, N, i, j)
+                    h = _load1d(self.b, self.h_buf, j)
+                    w_a = self.b.sext(w, self.accum_ty)
+                    h_a = self.b.sext(h, self.accum_ty)
+                    prod = self.b.mul(w_a, h_a)
+                    self.b.store(
+                        self.b.add(self.b.load(acc_res_var), prod), acc_res_var,
+                    )
+                rs_res_i32 = _load1d_global(self.b, g_rs_res, i)
+                rs_res = (rs_res_i32 if self.accum_ty == _I32
+                          else self.b.sext(rs_res_i32, self.accum_ty))
+                acc_res_final = self.b.sub(
+                    self.b.load(acc_res_var),
+                    self.b.mul(self._ca(self.zp_state), rs_res),
                 )
-            rs_res_i32 = _load1d_global(self.b, g_rs_res, i)
-            rs_res = (rs_res_i32 if self.accum_ty == _I32
-                      else self.b.sext(rs_res_i32, self.accum_ty))
-            acc_res_final = self.b.sub(
-                self.b.load(acc_res_var),
-                self.b.mul(self._ca(self.zp_state), rs_res),
-            )
+                acc_res_i32 = self._clamp_to_i32(acc_res_final)
             rq_res = self._emit_requantize_i32(
-                self._clamp_to_i32(acc_res_final),
-                self.M_res_M0, self.M_res_n,
+                acc_res_i32, self.M_res_M0, self.M_res_n,
             )
 
             # pre = zp_pre + bias_pre + rq_in + rq_res  (i32, then saturate)
@@ -1363,6 +1427,59 @@ class _AffineLowerer:
             new_h_total = self.b.add(new_h_c, self._ci32(self.zp_state))
             new_h_q = self._emit_saturate_to_storage(new_h_total)
             _store1d(self.b, self.h_buf, i, new_h_q)
+
+    # ------------------------------------------------------------------
+    # structured-topology W_res contribution (SCR / DLR / DLRB)
+
+    def _emit_chain_contribution(self, i, N):
+        """Return the i32 acc_res for row `i` under a structured topology.
+
+        Algebraic identity (since q_W_res is symmetric, zp_W_res = 0):
+            sum_j q_W[i,j]·q_h[j]  −  zp_state·row_sum_W[i]
+          =  cw_q · (q_h[prev] − zp_state)              for SCR/DLR(i>0)
+          +  cf_q · (q_h[next] − zp_state)              for DLRB extra edge
+
+        Each chain entry is a single i8/i16 weight, so the product fits
+        in i32 without a wider accumulator.
+        """
+        b = self.b
+        cw = self._ci32(self.chain_weight_q)
+        cf = self._ci32(self.chain_feedback_q)
+        zp_state_const = self._ci32(self.zp_state)
+        zero32 = self._ci32(0)
+
+        def _h_centered(idx_i64):
+            h_val = _load1d(b, self.h_buf, idx_i64)
+            return b.sub(b.sext(h_val, _I32), zp_state_const)
+
+        topo = self.topology_name
+        if topo == "SCR":
+            # prev_idx = (i==0 ? N-1 : i-1)
+            is_zero = b.icmp_signed("==", i, _ci(0))
+            i_prev = b.select(is_zero, _ci(N - 1), b.sub(i, _ci(1)))
+            return b.mul(cw, _h_centered(i_prev))
+        if topo == "DLR":
+            # only contribute for i > 0
+            is_pos = b.icmp_signed(">", i, _ci(0))
+            i_safe = b.select(is_pos, b.sub(i, _ci(1)), _ci(0))
+            prod = b.mul(cw, _h_centered(i_safe))
+            return b.select(is_pos, prod, zero32)
+        if topo == "DLRB":
+            # backward chain: chain_weight * h[i-1] for i > 0
+            is_pos = b.icmp_signed(">", i, _ci(0))
+            i_back = b.select(is_pos, b.sub(i, _ci(1)), _ci(0))
+            back_prod = b.mul(cw, _h_centered(i_back))
+            contrib_back = b.select(is_pos, back_prod, zero32)
+            # forward chain: chain_feedback * h[i+1] for i < N-1
+            is_lt = b.icmp_signed("<", i, _ci(N - 1))
+            i_fwd = b.select(is_lt, b.add(i, _ci(1)), _ci(N - 1))
+            fwd_prod = b.mul(cf, _h_centered(i_fwd))
+            contrib_fwd = b.select(is_lt, fwd_prod, zero32)
+            return b.add(contrib_back, contrib_fwd)
+        raise ValueError(
+            f"_emit_chain_contribution: unsupported structured topology "
+            f"{topo!r}"
+        )
 
     # ------------------------------------------------------------------
     # activation — dispatch on lut_kind
@@ -1424,13 +1541,16 @@ class _AffineLowerer:
         return self._emit_saturate_to_storage(interp_i32)
 
     def _emit_act_polynomial(self, p_storage):
-        """Taylor degree-3 tanh in Q.qf, clamped to [-1, 1].
+        """Odd-only minimax tanh, Horner in x², bit-exact with Python ref.
 
-        Mirrors `AffineQuantizedExecutor._activate_polynomial` step for step.
-        Computes  y = x - x³/3  for clamped x; both clamps applied in Q.qf.
+            x² = (x·x) >> qf
+            inner = ((x²·a5) >> qf) + a3
+            outer = ((x²·inner) >> qf) + a1
+            y     = (x·outer) >> qf
+            y     = clamp(y, ±one_qf)
         """
         qf = self.poly_qf_bits
-        # x_qf = requantize(sext(p) - zp_pre, x_M0, x_n), then widen to i64.
+        # x_qf = requantize(sext(p) - zp_pre, x_M0, x_n), widen to i64.
         centered = self.b.sub(self.b.sext(p_storage, _I32),
                                 self._ci32(self.zp_pre))
         x_qf_i32 = self._emit_requantize_i32(centered,
@@ -1443,18 +1563,21 @@ class _AffineLowerer:
                                clip_neg, x_qf)
         x_qf = self.b.select(self.b.icmp_signed(">", x_qf, clip_pos),
                                clip_pos, x_qf)
-        # 1/3 in Q.qf (rounded to nearest)
-        third_qf = ((1 << qf) // 3) + (1 if ((1 << qf) % 3) >= 2 else 0)
-        third_const = self._ci64(third_qf)
         qf_const = self._ci64(qf)
-        # x² = (x*x) >> qf
+        a1_const = self._ci64(self.poly_a1_qf)
+        a3_const = self._ci64(self.poly_a3_qf)
+        a5_const = self._ci64(self.poly_a5_qf)
+        # Horner in x²:  y = x · (a1 + x² · (a3 + x² · a5))
         x2_qf = self.b.ashr(self.b.mul(x_qf, x_qf), qf_const)
-        # x³ = (x * x²) >> qf
-        x3_qf = self.b.ashr(self.b.mul(x_qf, x2_qf), qf_const)
-        # x³/3 = (x³ * third) >> qf
-        x3_div3_qf = self.b.ashr(self.b.mul(x3_qf, third_const), qf_const)
-        # y = x - x³/3
-        y_qf = self.b.sub(x_qf, x3_div3_qf)
+        inner = self.b.add(
+            self.b.ashr(self.b.mul(x2_qf, a5_const), qf_const),
+            a3_const,
+        )
+        outer = self.b.add(
+            self.b.ashr(self.b.mul(x2_qf, inner), qf_const),
+            a1_const,
+        )
+        y_qf = self.b.ashr(self.b.mul(x_qf, outer), qf_const)
         # Clamp y to ±one_qf
         one_pos = self._ci64(self.poly_one_qf)
         one_neg = self._ci64(-self.poly_one_qf)
@@ -1462,7 +1585,7 @@ class _AffineLowerer:
                                one_neg, y_qf)
         y_qf = self.b.select(self.b.icmp_signed(">", y_qf, one_pos),
                                one_pos, y_qf)
-        # Δq_state = requantize(y_qf -> state scale), then +zp_state
+        # Δq_state = requantize(y_qf), then +zp_state
         y_qf_i32 = self.b.trunc(y_qf, _I32)
         delta = self._emit_requantize_i32(y_qf_i32,
                                             self.poly_back_M0, self.poly_back_n)
@@ -1488,6 +1611,10 @@ class _AffineLowerer:
         t = self.t
         tM = self.b.mul(t, _ci(Mout))
 
+        # The readout accumulates in i64 — W_out may be wider than the base
+        # storage (mixed precision) and N can be large, so the matmul must
+        # not overflow. Each block is clamped to i32 before its requantize,
+        # matching the Python reference exactly.
         with _loop(self.b, _ci(Mout), "m") as m:
             y_var = self.b.alloca(_I32, name="y_acc")
             self.b.store(self._ci32(self.zp_output), y_var)
@@ -1495,59 +1622,53 @@ class _AffineLowerer:
             if self.include_bias:
                 w0 = _load2d_global(self.b, g_Wout, F, m, _ci(off_bias))
                 rq_b = self._emit_requantize_i32(
-                    self.b.sext(w0, _I32),
+                    self._clamp_i64_to_i32(self.b.sext(w0, _I64)),
                     self.M_out_bias_M0, self.M_out_bias_n,
                 )
                 self.b.store(self.b.add(self.b.load(y_var), rq_b), y_var)
 
             if self.include_input:
-                acc_var = self.b.alloca(self.accum_ty, name="acc_input_ro")
-                self.b.store(self._ca(0), acc_var)
+                acc_var = self.b.alloca(_I64, name="acc_input_ro")
+                self.b.store(self._ci64(0), acc_var)
                 with _loop(self.b, _ci(K), "kin_ro") as k:
                     col = self.b.add(_ci(off_input), k)
                     w = _load2d_global(self.b, g_Wout, F, m, col)
                     x = _load1d(self.b, self.X_arg,
                                   self.b.add(self.b.mul(t, _ci(K)), k))
-                    w_a = self.b.sext(w, self.accum_ty)
-                    x_a = self.b.sext(x, self.accum_ty)
-                    prod = self.b.mul(w_a, x_a)
+                    prod = self.b.mul(self.b.sext(w, _I64),
+                                       self.b.sext(x, _I64))
                     self.b.store(
                         self.b.add(self.b.load(acc_var), prod), acc_var,
                     )
-                rs_i32 = _load1d_global(self.b, g_rs_input, m)
-                rs = (rs_i32 if self.accum_ty == _I32
-                      else self.b.sext(rs_i32, self.accum_ty))
+                rs = self.b.sext(_load1d_global(self.b, g_rs_input, m), _I64)
                 adj = self.b.sub(
                     self.b.load(acc_var),
-                    self.b.mul(self._ca(self.zp_input), rs),
+                    self.b.mul(self._ci64(self.zp_input), rs),
                 )
                 rq_i = self._emit_requantize_i32(
-                    self._clamp_to_i32(adj),
+                    self._clamp_i64_to_i32(adj),
                     self.M_out_input_M0, self.M_out_input_n,
                 )
                 self.b.store(self.b.add(self.b.load(y_var), rq_i), y_var)
 
-            acc_var = self.b.alloca(self.accum_ty, name="acc_state_ro")
-            self.b.store(self._ca(0), acc_var)
+            acc_var = self.b.alloca(_I64, name="acc_state_ro")
+            self.b.store(self._ci64(0), acc_var)
             with _loop(self.b, _ci(N), "jst_ro") as j:
                 col = self.b.add(_ci(off_state), j)
                 w = _load2d_global(self.b, g_Wout, F, m, col)
                 h = _load1d(self.b, self.h_buf, j)
-                w_a = self.b.sext(w, self.accum_ty)
-                h_a = self.b.sext(h, self.accum_ty)
-                prod = self.b.mul(w_a, h_a)
+                prod = self.b.mul(self.b.sext(w, _I64),
+                                   self.b.sext(h, _I64))
                 self.b.store(
                     self.b.add(self.b.load(acc_var), prod), acc_var,
                 )
-            rs_i32 = _load1d_global(self.b, g_rs_state, m)
-            rs = (rs_i32 if self.accum_ty == _I32
-                  else self.b.sext(rs_i32, self.accum_ty))
+            rs = self.b.sext(_load1d_global(self.b, g_rs_state, m), _I64)
             adj = self.b.sub(
                 self.b.load(acc_var),
-                self.b.mul(self._ca(self.zp_state), rs),
+                self.b.mul(self._ci64(self.zp_state), rs),
             )
             rq_s = self._emit_requantize_i32(
-                self._clamp_to_i32(adj),
+                self._clamp_i64_to_i32(adj),
                 self.M_out_state_M0, self.M_out_state_n,
             )
             self.b.store(self.b.add(self.b.load(y_var), rq_s), y_var)

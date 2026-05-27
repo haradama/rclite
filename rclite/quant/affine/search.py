@@ -82,9 +82,11 @@ def _recalibrate_for_new_W_out(
     Reservoir-side params (input, u_pre, state, pre, W_in, W_res) come
     from float-trace calibration and don't depend on W_out, so we leave
     them untouched. Output range is re-derived from the training targets
-    (the model is *trying* to match these).
+    (the model is *trying* to match these). W_out blocks keep their
+    (possibly wider) mixed-precision width.
     """
-    sb = cfg.storage_bits
+    sb = cfg.storage_bits             # activations / output width
+    wob = cfg.w_out_storage_bits       # readout-weight width (mixed precision)
     K = rc.input.units
     N = rc.reservoir.units
     off = 0
@@ -92,14 +94,14 @@ def _recalibrate_for_new_W_out(
     W_out_input_p = None
     if rc.readout.include_bias:
         W_out_bias_p = AffineParams.symmetric_absmax(
-            W_out_new[:, 0:1], storage_bits=sb)
+            W_out_new[:, 0:1], storage_bits=wob)
         off = 1
     if rc.readout.include_input:
         W_out_input_p = AffineParams.symmetric_absmax(
-            W_out_new[:, off:off + K], storage_bits=sb)
+            W_out_new[:, off:off + K], storage_bits=wob)
         off += K
     W_out_state_p = AffineParams.symmetric_absmax(
-        W_out_new[:, off:off + N], storage_bits=sb)
+        W_out_new[:, off:off + N], storage_bits=wob)
     # Use the post-washout targets — that's what the model is fit to.
     output_p = AffineParams.asymmetric_minmax(
         train_Y[washout:], storage_bits=sb)
@@ -121,6 +123,7 @@ def search_quantization_affine(
     eval_Y: np.ndarray,
     *,
     storage_bits: int = 8,
+    w_out_storage_bits: Optional[int] = None,
     n_iterations: int = 1,
     calibration_X: Optional[np.ndarray] = None,
     ridge_lambda: Optional[float] = None,
@@ -131,7 +134,10 @@ def search_quantization_affine(
     Returns the best (`AffineQuantizedModel`, eval MSE) over `n_iterations`
     refit rounds plus the initial (round 0) single-pass calibration.
 
-    `calibration_X` defaults to `train_X`.
+    `calibration_X` defaults to `train_X`. `w_out_storage_bits` selects a
+    wider readout-weight width (mixed precision); the QAT refit then fits
+    that wider W_out to the quantized state trajectory — the combination
+    that recovers single-output i8 accuracy.
     """
     if exe.W_out is None:
         raise ValueError("exe has no trained readout — call exe.fit() first")
@@ -146,7 +152,8 @@ def search_quantization_affine(
     washout = int(rc.readout.washout)
 
     # Round 0: single-pass calibration from float traces.
-    cfg = calibrate_from_data(rc, exe, calibration_X, storage_bits=storage_bits)
+    cfg = calibrate_from_data(rc, exe, calibration_X, storage_bits=storage_bits,
+                               w_out_storage_bits=w_out_storage_bits)
     W_out_current = np.asarray(exe.W_out).copy()
 
     history: List[Tuple[int, float]] = []

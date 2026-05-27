@@ -41,7 +41,8 @@ def expect_raises(exc_type, fn, *args, **kwargs):
 
 
 def _build_and_quant(storage_bits=8, units=20, topology=Topology.SCR,
-                       include_bias=True, include_input=True, T=300, seed=0):
+                       include_bias=True, include_input=True, T=300, seed=0,
+                       lut_strategy=None):
     rc = ReservoirComputer(
         input=InputNode(units=1, input_offset=0.0, input_scaling=1.0,
                         input_distribution=Distribution.BERNOULLI, name="in"),
@@ -128,7 +129,12 @@ def test_build_ir_metadata_present():
 
 
 def test_build_ir_weights_include_row_sums():
-    _, _, qm, _ = _build_and_quant(include_bias=True, include_input=True)
+    # Use ESN_STANDARD (dense) so W_res / row_sum_W_res are present in the
+    # IR globals; structured topologies (the default in _build_and_quant)
+    # now intentionally skip emitting W_res — see
+    # `test_structured_topology_omits_W_res_global` in quant_affine_lut_test.
+    _, _, qm, _ = _build_and_quant(include_bias=True, include_input=True,
+                                       topology=Topology.ESN_STANDARD)
     mod = build_ir_from_quantized_affine(qm)
     for name in ("W_in", "W_res", "W_out", "lut_table",
                   "row_sum_W_in", "row_sum_W_res",
@@ -136,8 +142,10 @@ def test_build_ir_weights_include_row_sums():
         assert name in mod.weights, f"missing weight: {name}"
 
 
-def test_build_ir_rejects_nontrivial_preprocess():
-    """offset != 0 or scaling != 1 must raise NotImplementedError in MVP."""
+def test_build_ir_supports_nontrivial_preprocess():
+    """offset != 0 or scaling != 1 used to raise NotImplementedError; now we
+    emit a PreprocessInput op + integer preprocess metadata instead."""
+    from rclite.ir.ops import PreprocessInput, TimeLoop
     rc = ReservoirComputer(
         input=InputNode(units=1, input_offset=0.5, input_scaling=1.0,
                         input_distribution=Distribution.BERNOULLI),
@@ -154,7 +162,18 @@ def test_build_ir_rejects_nontrivial_preprocess():
     exe.fit(X, Y)
     cfg = calibrate_from_data(rc, exe, X, storage_bits=8)
     qm = quantize_model_affine(rc, exe, cfg)
-    expect_raises(NotImplementedError, build_ir_from_quantized_affine, qm)
+    assert qm.has_integer_preprocess
+    mod = build_ir_from_quantized_affine(qm)
+    # The TimeLoop body should now include a PreprocessInput op.
+    found = False
+    for op in mod.ops:
+        if isinstance(op, TimeLoop):
+            for body_op in op.body:
+                if isinstance(body_op, PreprocessInput):
+                    found = True
+    assert found, "PreprocessInput op missing from IR for non-trivial preprocess"
+    assert mod.metadata["has_integer_preprocess"] is True
+    assert mod.metadata["pre_M0"] != 0
 
 
 # ---------------------------------------------------------------- emit / compile
@@ -245,6 +264,62 @@ def test_parity_across_seeds_i16():
 
 
 # ---------------------------------------------------------------- meta tests
+
+
+def test_parity_mixed_precision_i8_state_i16_wout():
+    """Mixed precision (i8 reservoir/state, i16 W_out) must stay bit-exact
+    between the Python reference and the JIT kernel."""
+    for topology in (Topology.SCR, Topology.ESN_STANDARD):
+        rc = ReservoirComputer(
+            input=InputNode(units=1, input_offset=0.0, input_scaling=1.0,
+                            input_distribution=Distribution.BERNOULLI),
+            reservoir=ReservoirNode(units=24, topology=topology,
+                                     chain_weight=0.9, leak_rate=0.3, seed=42),
+            readout=ReadoutNode(units=1, trainer=Trainer.RIDGE,
+                                 regularization=1e-6, washout=40,
+                                 include_bias=True, include_input=True),
+        )
+        exe = RCExecutor(rc)
+        rng = np.random.default_rng(0)
+        X = rng.standard_normal((300, 1)) * 0.15
+        Y = np.sin(np.arange(300) * 0.1)[:, None]
+        exe.fit(X[:260], Y[:260])
+        cfg = calibrate_from_data(rc, exe, X[:260], storage_bits=8,
+                                    w_out_storage_bits=16)
+        qm = quantize_model_affine(rc, exe, cfg)
+        assert qm.W_out_q.dtype == np.int16
+        assert qm.W_in_q.dtype == np.int8
+        Y_jit = CompiledAffineRC(qm).predict(X[200:230])
+        Y_py = AffineQuantizedExecutor(qm).predict(X[200:230])
+        diff = float(np.max(np.abs(Y_jit - Y_py)))
+        assert diff == 0.0, f"{topology.name} mixed-prec: JIT vs Py diff = {diff}"
+
+
+def test_mixed_precision_ir_emits_i16_wout_global():
+    """The W_out global should be i16 while X/Y pointers stay i8."""
+    rc = ReservoirComputer(
+        input=InputNode(units=1, input_offset=0.0, input_scaling=1.0,
+                        input_distribution=Distribution.BERNOULLI),
+        reservoir=ReservoirNode(units=20, topology=Topology.SCR,
+                                 chain_weight=0.9, leak_rate=0.3, seed=42),
+        readout=ReadoutNode(units=1, trainer=Trainer.RIDGE,
+                             regularization=1e-6, washout=40,
+                             include_bias=True, include_input=True),
+    )
+    exe = RCExecutor(rc)
+    rng = np.random.default_rng(0)
+    X = rng.standard_normal((200, 1)) * 0.15
+    Y = np.sin(np.arange(200) * 0.1)[:, None]
+    exe.fit(X[:160], Y[:160])
+    cfg = calibrate_from_data(rc, exe, X[:160], storage_bits=8,
+                                w_out_storage_bits=16)
+    qm = quantize_model_affine(rc, exe, cfg)
+    ir_text = str(emit_quantized_affine_module(qm))
+    # W_out global is i16; kernel signature (X/Y) is i8*
+    assert "i8*" in ir_text
+    # llvmlite quotes global names: @"W_out" = internal constant [F x i16] ...
+    assert '@"W_out" = internal constant' in ir_text
+    assert "x i16]" in ir_text   # W_out array element type is i16
 
 
 def test_compiled_affine_ir_text_property():

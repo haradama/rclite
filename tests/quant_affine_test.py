@@ -566,6 +566,89 @@ def test_qat_does_not_mutate_exe_W_out():
         "search_quantization_affine mutated exe.W_out"
 
 
+# ---------------------------------------------------------------- mixed precision
+
+
+def test_config_w_out_storage_bits_property():
+    rc, exe, X, _ = _build_esn(units=20)
+    cfg = calibrate_from_data(rc, exe, X, storage_bits=8, w_out_storage_bits=16)
+    assert cfg.storage_bits == 8
+    assert cfg.w_out_storage_bits == 16
+    assert cfg.mixed_precision is True
+    # Uniform precision → not mixed
+    cfg2 = calibrate_from_data(rc, exe, X, storage_bits=8)
+    assert cfg2.mixed_precision is False
+
+
+def test_config_rejects_w_out_narrower_than_base():
+    p8 = AffineParams(scale=0.01, zero_point=0, storage_bits=8)
+    p16act = AffineParams(scale=0.01, zero_point=3, storage_bits=16)
+    p16 = AffineParams(scale=0.01, zero_point=0, storage_bits=16)
+    # base = i16 activations, but W_out at i8 → must reject (W_out < base)
+    expect_raises(ValueError, AffineQuantConfig,
+                   input=p16act, u_pre=p16act, state=p16, pre=p16act,
+                   W_in=p16, W_res=p16, W_out_state=p8, output=p16act)
+
+
+def test_mixed_precision_quantize_dtypes():
+    rc, exe, X, _ = _build_esn(units=20)
+    cfg = calibrate_from_data(rc, exe, X, storage_bits=8, w_out_storage_bits=16)
+    qm = quantize_model_affine(rc, exe, cfg)
+    assert qm.W_in_q.dtype == np.int8     # reservoir weights stay i8
+    assert qm.W_res_q.dtype == np.int8
+    assert qm.W_out_q.dtype == np.int16   # readout weights are i16
+    assert qm.storage_bits == 8
+    assert qm.w_out_storage_bits == 16
+
+
+def test_mixed_precision_executor_runs():
+    rc, exe, X, _ = _build_esn(units=30)
+    cfg = calibrate_from_data(rc, exe, X, storage_bits=8, w_out_storage_bits=16)
+    qm = quantize_model_affine(rc, exe, cfg)
+    Y = AffineQuantizedExecutor(qm).predict(X[200:230])
+    assert Y.shape == (30, 1)
+    assert np.all(np.isfinite(Y))
+
+
+def test_mixed_precision_qat_beats_pure_i8_on_mackey_glass():
+    """i8 reservoir + i16 W_out (+ QAT) should beat pure-i8 (+ QAT): the i16
+    readout weights recover much of the readout-coefficient quantization loss
+    that is the measured pure-i8 bottleneck."""
+    from rclite import (InputNode as IN, ReservoirNode as RN, ReadoutNode as RoN,
+                         ReservoirComputer as RC2, Activation,
+                         Distribution as D, Topology as Tp, Trainer as Tr)
+    from examples.mackey_glass_esn import mackey_glass
+    series = mackey_glass(n=2000)
+    X = series[:-1, None]; Y = series[1:, None]
+    rc = RC2(
+        input=IN(units=1, input_offset=0.0, input_scaling=1.0,
+                 input_distribution=D.BERNOULLI),
+        reservoir=RN(units=80, activation=Activation.TANH, topology=Tp.SCR,
+                     chain_weight=0.9, leak_rate=0.3, seed=42),
+        readout=RoN(units=1, trainer=Tr.RIDGE, regularization=1e-6,
+                    washout=300, include_bias=True, include_input=True),
+    )
+    exe = RCExecutor(rc)
+    exe.fit(X[:1500], Y[:1500])
+    eX, eY = X[1500:1600], Y[1500:1600]
+    full = X[:1600]; sl = slice(1500, 1600)
+    sig = float(np.std(eY))
+
+    def nrmse(qm):
+        pred = AffineQuantizedExecutor(qm).predict(full)
+        return float(np.sqrt(np.mean((pred[sl] - eY) ** 2))) / sig * 100
+
+    r8 = search_quantization_affine(rc, exe, X[:1500], Y[:1500], eX, eY,
+                                     storage_bits=8, n_iterations=1)
+    rm = search_quantization_affine(rc, exe, X[:1500], Y[:1500], eX, eY,
+                                     storage_bits=8, w_out_storage_bits=16,
+                                     n_iterations=1)
+    n8 = nrmse(r8.best_qmodel)
+    nm = nrmse(rm.best_qmodel)
+    assert rm.best_qmodel.mixed_precision is True
+    assert nm < n8, f"mixed ({nm:.2f}%) did not beat pure i8 ({n8:.2f}%)"
+
+
 def test_i16_affine_beats_i8_affine_on_same_model():
     """The whole point of i16 over i8: tighter scales → better fidelity.
 

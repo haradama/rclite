@@ -30,7 +30,9 @@ import numpy as np
 
 from rclite.core.profile import Topology
 from rclite.ir.module import Module
-from rclite.ir.ops import ReservoirStep, BuildPhi, ReadoutLinear, TimeLoop
+from rclite.ir.ops import (
+    PreprocessInput, ReservoirStep, BuildPhi, ReadoutLinear, TimeLoop,
+)
 
 from .lut import LUTKind
 from .quantize import AffineQuantizedModel
@@ -39,31 +41,27 @@ from .quantize import AffineQuantizedModel
 def build_ir_from_quantized_affine(qmodel: AffineQuantizedModel) -> Module:
     rc = qmodel.rc
     cfg = qmodel.config
-    if rc.input.input_offset != 0.0:
-        raise NotImplementedError(
-            "affine IR currently requires input_offset == 0 "
-            f"(got {rc.input.input_offset})"
-        )
-    if rc.input.input_scaling != 1.0:
-        raise NotImplementedError(
-            "affine IR currently requires input_scaling == 1 "
-            f"(got {rc.input.input_scaling})"
-        )
 
     K, N, M = qmodel.K, qmodel.N, qmodel.M
     F = qmodel.F
 
-    # MVP: always emit dense W_res, even for structured topologies. The Python
-    # executor already does dense matmul + zp folding; structured-specialised
-    # affine codegen is a future optimisation.
+    # SCR/DLR/DLRB have at most 1–2 non-zero entries per W_res row, all
+    # equal to (the quantised) chain_weight / chain_feedback. Skip emitting
+    # the dense W_res + row_sum_W_res globals; the lowering reads the
+    # chain constants from metadata and folds zp inline.
+    is_structured = rc.reservoir.topology in (
+        Topology.DLR, Topology.DLRB, Topology.SCR,
+    )
+
     weights: dict[str, np.ndarray] = {
         "W_in": qmodel.W_in_q,
-        "W_res": qmodel.W_res_q,
         "W_out": qmodel.W_out_q,
         "row_sum_W_in": qmodel.row_sum_W_in,
-        "row_sum_W_res": qmodel.row_sum_W_res,
         "row_sum_Wout_state": qmodel.row_sum_Wout_state,
     }
+    if not is_structured:
+        weights["W_res"] = qmodel.W_res_q
+        weights["row_sum_W_res"] = qmodel.row_sum_W_res
     # The LUT global is only emitted for the table-based strategies.
     if qmodel.lut_strategy.kind in (LUTKind.DIRECT, LUTKind.LINEAR_INTERP):
         weights["lut_table"] = qmodel.lut_q
@@ -74,7 +72,20 @@ def build_ir_from_quantized_affine(qmodel: AffineQuantizedModel) -> Module:
             )
         weights["row_sum_Wout_input"] = qmodel.row_sum_Wout_input
 
-    body = (
+    # When input_offset != 0 or input_scaling != 1, the kernel needs an
+    # integer preprocess step that writes u_pre[k] into a scratch buffer
+    # the W_in matmul then reads from. We piggy-back on the existing
+    # `PreprocessInput` IR op; the affine lowerer recognises it via
+    # `has_integer_preprocess` metadata and emits the affine integer form
+    # (M_pre,n,pre_const) instead of the symmetric one.
+    body_ops = []
+    if qmodel.has_integer_preprocess:
+        body_ops.append(PreprocessInput(
+            offset=float(rc.input.input_offset),
+            scale=float(rc.input.input_scaling),
+            K=K,
+        ))
+    body_ops += [
         ReservoirStep(
             leak=float(rc.reservoir.leak_rate),
             bias=float(rc.reservoir.bias),
@@ -82,7 +93,7 @@ def build_ir_from_quantized_affine(qmodel: AffineQuantizedModel) -> Module:
             topology=rc.reservoir.topology,
             chain_weight=float(rc.reservoir.chain_weight),
             chain_feedback=float(rc.reservoir.chain_feedback),
-            W_res_name="W_res",
+            W_res_name=None if is_structured else "W_res",
         ),
         BuildPhi(
             include_bias=rc.readout.include_bias,
@@ -90,7 +101,19 @@ def build_ir_from_quantized_affine(qmodel: AffineQuantizedModel) -> Module:
             K=K, N=N,
         ),
         ReadoutLinear(M=M, F=F),
-    )
+    ]
+    body = tuple(body_ops)
+
+    # Pre-quantize the chain constants once (matches what dense W_res_q
+    # holds at the chain positions); the lowering uses them as scalar i32
+    # operands so the symmetric chain matmul collapses to one multiply.
+    weight_qmin = -(1 << (qmodel.storage_bits - 1))
+    weight_qmax = (1 << (qmodel.storage_bits - 1)) - 1
+    def _qweight(v: float) -> int:
+        q = int(round(v / cfg.W_res.scale))
+        return max(weight_qmin, min(weight_qmax, q))
+    chain_weight_q   = _qweight(float(rc.reservoir.chain_weight))
+    chain_feedback_q = _qweight(float(rc.reservoir.chain_feedback))
 
     art = qmodel.lut_artifacts
     strat = qmodel.lut_strategy
@@ -98,6 +121,7 @@ def build_ir_from_quantized_affine(qmodel: AffineQuantizedModel) -> Module:
         "quantization": "affine",
         "dtype": f"i{qmodel.storage_bits}",
         "storage_bits": qmodel.storage_bits,
+        "w_out_storage_bits": qmodel.w_out_storage_bits,
         "topology": rc.reservoir.topology.name,
         "include_bias": rc.readout.include_bias,
         "include_input": rc.readout.include_input,
@@ -124,6 +148,16 @@ def build_ir_from_quantized_affine(qmodel: AffineQuantizedModel) -> Module:
         # LUT strategy
         "lut_kind": strat.kind.value,
         "lut_offset": qmodel.lut_offset,
+        # Topology + chain constants (for structured-topology specialisation)
+        "structured":       is_structured,
+        "chain_weight_q":   chain_weight_q,
+        "chain_feedback_q": chain_feedback_q,
+        # Integer preprocess (only used when input_offset != 0 or
+        # input_scaling != 1; otherwise the kernel reads X directly as u_pre)
+        "has_integer_preprocess": qmodel.has_integer_preprocess,
+        "pre_M0":    qmodel.pre_M0,
+        "pre_n":     qmodel.pre_n,
+        "pre_const": qmodel.pre_const,
     }
     if strat.kind == LUTKind.LINEAR_INTERP:
         md["lut_n_entries"]       = strat.n_entries
@@ -132,12 +166,16 @@ def build_ir_from_quantized_affine(qmodel: AffineQuantizedModel) -> Module:
         md["lut_idx_n"]            = art.idx_n
     elif strat.kind == LUTKind.POLYNOMIAL:
         md["poly_qf_bits"]    = strat.poly_qf_bits
+        md["poly_degree"]     = strat.poly_degree
         md["poly_x_M0"]       = art.x_to_qf_M0
         md["poly_x_n"]        = art.x_to_qf_n
         md["poly_back_M0"]    = art.qf_to_state_M0
         md["poly_back_n"]     = art.qf_to_state_n
         md["poly_clip_qf"]    = art.x_clip_qf
         md["poly_one_qf"]     = art.one_qf
+        md["poly_a1_qf"]      = art.poly_a1_qf
+        md["poly_a3_qf"]      = art.poly_a3_qf
+        md["poly_a5_qf"]      = art.poly_a5_qf
 
     return Module(K=K, N=N, M=M, weights=weights,
                    ops=[TimeLoop(body=body)], metadata=md)

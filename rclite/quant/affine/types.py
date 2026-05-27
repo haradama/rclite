@@ -129,26 +129,51 @@ class AffineQuantConfig:
     W_out_input: AffineParams | None = None   # symmetric (zp=0)
 
     def __post_init__(self):
-        weight_fields = ["W_in", "W_res", "W_out_state"]
+        w_out_fields = ["W_out_state"]
         if self.W_out_bias is not None:
-            weight_fields.append("W_out_bias")
+            w_out_fields.append("W_out_bias")
         if self.W_out_input is not None:
-            weight_fields.append("W_out_input")
+            w_out_fields.append("W_out_input")
+        weight_fields = ["W_in", "W_res"] + w_out_fields
         for name in weight_fields:
             wp = getattr(self, name)
             if wp.zero_point != 0:
                 raise ValueError(
                     f"{name}.zero_point must be 0 (symmetric weight convention)"
                 )
+        # Activations + reservoir weights share the base storage width.
         sb = self.input.storage_bits
-        all_fields = ["u_pre", "state", "pre", "output"] + weight_fields
-        for name in all_fields:
+        base_fields = ["u_pre", "state", "pre", "output", "W_in", "W_res"]
+        for name in base_fields:
             other = getattr(self, name)
             if other.storage_bits != sb:
                 raise ValueError(
                     f"storage_bits mismatch: input={sb}, {name}={other.storage_bits}"
                 )
+        # W_out blocks may use a *wider* width (mixed precision, e.g. i16
+        # readout weights with an i8 reservoir). They must all agree with
+        # each other and be >= the base width.
+        wob = self.W_out_state.storage_bits
+        for name in w_out_fields:
+            other = getattr(self, name)
+            if other.storage_bits != wob:
+                raise ValueError(
+                    f"W_out block storage_bits mismatch: "
+                    f"W_out_state={wob}, {name}={other.storage_bits}"
+                )
+        if wob < sb:
+            raise ValueError(
+                f"W_out storage_bits ({wob}) must be >= base storage_bits ({sb})"
+            )
 
     @property
     def storage_bits(self) -> int:
         return self.input.storage_bits
+
+    @property
+    def w_out_storage_bits(self) -> int:
+        return self.W_out_state.storage_bits
+
+    @property
+    def mixed_precision(self) -> bool:
+        return self.w_out_storage_bits != self.storage_bits

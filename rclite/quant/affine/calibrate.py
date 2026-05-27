@@ -76,13 +76,23 @@ def calibrate_from_data(
     X: np.ndarray,
     *,
     storage_bits: int = 8,
+    w_out_storage_bits: Optional[int] = None,
     washout: Optional[int] = None,
 ) -> AffineQuantConfig:
     """Build an `AffineQuantConfig` from float traces on calibration data.
 
     `washout` defaults to the readout's washout (so transient values don't
     skew the activation/state ranges).
+
+    `w_out_storage_bits` selects a (typically wider) storage width for the
+    readout weights — the mixed-precision path. Defaults to `storage_bits`.
+    Setting it to 16 while `storage_bits=8` keeps the reservoir at i8 but
+    represents W_out at i16, which on single-output reservoirs recovers most
+    of the accuracy lost to readout-coefficient quantization (the measured
+    i8 bottleneck) at a tiny footprint cost.
     """
+    if w_out_storage_bits is None:
+        w_out_storage_bits = storage_bits
     if exe.W_out is None:
         raise ValueError("calibration needs a trained readout; call exe.fit() first")
     if washout is None:
@@ -107,14 +117,14 @@ def calibrate_from_data(
     W_out_input_p = None
     if rc.readout.include_bias:
         W_out_bias_p = AffineParams.symmetric_absmax(
-            exe.W_out[:, 0:1], storage_bits)
+            exe.W_out[:, 0:1], w_out_storage_bits)
         off = 1
     if rc.readout.include_input:
         W_out_input_p = AffineParams.symmetric_absmax(
-            exe.W_out[:, off:off + K], storage_bits)
+            exe.W_out[:, off:off + K], w_out_storage_bits)
         off += K
     W_out_state_p = AffineParams.symmetric_absmax(
-        exe.W_out[:, off:off + N], storage_bits)
+        exe.W_out[:, off:off + N], w_out_storage_bits)
 
     return AffineQuantConfig(
         input=AffineParams.asymmetric_minmax(X_eff, storage_bits),

@@ -72,6 +72,13 @@ class AffineQuantizedModel:
     M_in_n: int = 0
     M_res_M0: int = 0
     M_res_n: int = 0
+    # Integer preprocess (only meaningful when input_offset != 0 or
+    # input_scaling != 1). For the identity case (the common case),
+    # `has_integer_preprocess = False` and the kernel uses X directly as u_pre.
+    has_integer_preprocess: bool = False
+    pre_M0: int = 0       # multiplier on (q_x - zp_input)
+    pre_n: int = 0
+    pre_const: int = 0    # zp_u_pre + round(-offset * scaling / s_upre)
     # Tanh activation strategy + precomputed data. `lut_q` / `lut_offset`
     # carry the table data for DIRECT and LINEAR_INTERP. POLYNOMIAL stores
     # its multipliers in `lut_artifacts` and leaves `lut_q` empty.
@@ -130,6 +137,10 @@ class AffineQuantizedModel:
                 + self.N)
     @property
     def storage_bits(self) -> int: return self.config.storage_bits
+    @property
+    def w_out_storage_bits(self) -> int: return self.config.w_out_storage_bits
+    @property
+    def mixed_precision(self) -> bool: return self.config.mixed_precision
 
 
 def quantize_model_affine(
@@ -169,8 +180,9 @@ def quantize_model_affine(
     # at its own scale so a tiny bias coef isn't crushed by a huge state coef.
     K = rc.input.units
     N = rc.reservoir.units
-    storage_dtype = config.state.storage_dtype
-    W_out_q = np.zeros_like(W_out, dtype=storage_dtype)
+    # W_out uses its own (possibly wider) storage dtype — mixed precision.
+    w_out_dtype = config.W_out_state.storage_dtype
+    W_out_q = np.zeros_like(W_out, dtype=w_out_dtype)
     off = 0
     if rc.readout.include_bias:
         W_out_q[:, 0:1] = config.W_out_bias.quantize_array(W_out[:, 0:1])
@@ -224,6 +236,21 @@ def quantize_model_affine(
     M_out_input_M0, M_out_input_n = quantize_multiplier(M_out_input)
     M_out_state_M0, M_out_state_n = quantize_multiplier(M_out_state)
 
+    # Integer preprocess multipliers (only needed for non-identity preprocess).
+    offset = float(rc.input.input_offset)
+    scaling = float(rc.input.input_scaling)
+    has_integer_preprocess = (offset != 0.0) or (scaling != 1.0)
+    if has_integer_preprocess:
+        # u_pre_real = (x_real - offset) * scaling
+        # q_upre - zp_upre ≈ apply_mult(q_x - zp_x, M_pre) + round(-offset*scaling/s_upre)
+        M_pre_real = config.input.scale * scaling / config.u_pre.scale
+        pre_M0, pre_n = quantize_multiplier(M_pre_real)
+        c_real = -offset * scaling / config.u_pre.scale
+        pre_const = config.u_pre.zero_point + int(round(c_real))
+    else:
+        pre_M0 = pre_n = 0
+        pre_const = 0
+
     return AffineQuantizedModel(
         rc=rc, config=config,
         W_in_q=W_in_q, W_res_q=W_res_q, W_out_q=W_out_q,
@@ -242,6 +269,8 @@ def quantize_model_affine(
         M_out_bias_M0=M_out_bias_M0, M_out_bias_n=M_out_bias_n,
         M_out_input_M0=M_out_input_M0, M_out_input_n=M_out_input_n,
         M_out_state_M0=M_out_state_M0, M_out_state_n=M_out_state_n,
+        has_integer_preprocess=has_integer_preprocess,
+        pre_M0=pre_M0, pre_n=pre_n, pre_const=pre_const,
         row_sum_Wout_input=row_sum_Wout_input,
         row_sum_Wout_state=row_sum_Wout_state,
     )
