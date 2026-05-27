@@ -1,0 +1,154 @@
+"""Per-tensor affine quantization params.
+
+`AffineParams` holds a (scale, zero_point) pair for one tensor; storage
+width is also recorded so quantize/dequantize knows how to saturate.
+`AffineQuantConfig` bundles params for every quantity in a reservoir
+computer — weights symmetric, activations possibly asymmetric.
+"""
+from __future__ import annotations
+from dataclasses import dataclass
+
+import numpy as np
+
+
+@dataclass(frozen=True)
+class AffineParams:
+    """Per-tensor affine quantization: r = (q - zero_point) * scale."""
+
+    scale: float
+    zero_point: int = 0
+    storage_bits: int = 8
+
+    def __post_init__(self):
+        if not (self.scale > 0):
+            raise ValueError(f"scale must be > 0, got {self.scale}")
+        if self.storage_bits not in (8, 16, 32):
+            raise ValueError(
+                f"storage_bits must be 8/16/32, got {self.storage_bits}"
+            )
+        qmin, qmax = self._range()
+        if not (qmin <= self.zero_point <= qmax):
+            raise ValueError(
+                f"zero_point {self.zero_point} outside [{qmin}, {qmax}] "
+                f"for {self.storage_bits}-bit storage"
+            )
+
+    def _range(self) -> tuple[int, int]:
+        b = self.storage_bits
+        return -(1 << (b - 1)), (1 << (b - 1)) - 1
+
+    @property
+    def storage_dtype(self) -> np.dtype:
+        return np.dtype(f"int{self.storage_bits}")
+
+    def quantize(self, r: float) -> int:
+        qmin, qmax = self._range()
+        q = int(round(r / self.scale)) + self.zero_point
+        return max(qmin, min(qmax, q))
+
+    def quantize_array(self, arr) -> np.ndarray:
+        qmin, qmax = self._range()
+        q = (np.rint(np.asarray(arr, dtype=np.float64) / self.scale)
+             .astype(np.int64)) + self.zero_point
+        return np.clip(q, qmin, qmax).astype(self.storage_dtype)
+
+    def dequantize(self, q: int) -> float:
+        return (int(q) - self.zero_point) * self.scale
+
+    def dequantize_array(self, q_arr) -> np.ndarray:
+        return (np.asarray(q_arr, dtype=np.float64) - self.zero_point) * self.scale
+
+    @classmethod
+    def symmetric_absmax(cls, arr, storage_bits: int = 8,
+                          eps: float = 1e-8) -> "AffineParams":
+        """Pick scale from max |arr|; zero_point=0. TFLM weight convention."""
+        m = float(np.max(np.abs(np.asarray(arr, dtype=np.float64))))
+        if m < eps:
+            m = eps
+        max_q = (1 << (storage_bits - 1)) - 1
+        return cls(scale=m / max_q, zero_point=0, storage_bits=storage_bits)
+
+    @classmethod
+    def asymmetric_minmax(cls, arr, storage_bits: int = 8,
+                           eps: float = 1e-8) -> "AffineParams":
+        """Pick scale + zero_point from observed [min, max] range.
+
+        Follows TFLM convention: the representable range always includes
+        real value 0 (extending [min, max] to span 0 if necessary). This
+        guarantees zero_point is a representable storage value and that
+        the dequantized 0 is exactly representable.
+        """
+        a = np.asarray(arr, dtype=np.float64)
+        lo = float(a.min())
+        hi = float(a.max())
+        # Always include 0 in the representable range
+        lo = min(lo, 0.0)
+        hi = max(hi, 0.0)
+        if hi - lo < eps:
+            # Degenerate (all zeros) — fall back to tiny symmetric range
+            half = max(eps, abs(lo))
+            lo, hi = -half, half
+        qmin = -(1 << (storage_bits - 1))
+        qmax = (1 << (storage_bits - 1)) - 1
+        scale = (hi - lo) / (qmax - qmin)
+        zp = int(round(qmin - lo / scale))
+        zp = max(qmin, min(qmax, zp))
+        return cls(scale=scale, zero_point=zp, storage_bits=storage_bits)
+
+
+@dataclass(frozen=True)
+class AffineQuantConfig:
+    """Per-tensor affine params for every quantity in a reservoir computer.
+
+    Convention:
+      - Weights (W_in / W_res / W_out_*) : symmetric (zero_point=0)
+      - Activations (input, u_pre, pre)  : asymmetric (zero_point may be != 0)
+      - `state` is shared between the stored reservoir state h *and* the
+        tanh activation output (both bounded by tanh, both ~symmetric in
+        practice). One param keeps the leaky integration scale-coherent.
+      - `output` is the scale at which the readout y is reported.
+
+    W_out splits into up to three column blocks (bias / input / state)
+    each with its OWN symmetric scale. This is the mirage-style mixed
+    encoding adapted to affine quant — strict per-tensor for W_out would
+    crush small coefficients (bias coefs are O(0.1), state coefs O(100)),
+    so we relax just for W_out. Each block stays symmetric (zp=0) and is
+    still "per-tensor" in the TFLM sense within its block.
+    """
+
+    input: AffineParams                       # raw X
+    u_pre: AffineParams                       # preprocessed input
+    state: AffineParams                       # reservoir state h AND tanh activated
+    pre: AffineParams                         # pre-activation
+    W_in: AffineParams                        # symmetric (zp=0)
+    W_res: AffineParams                       # symmetric (zp=0)
+    W_out_state: AffineParams                 # symmetric (zp=0), state-col block
+    output: AffineParams                      # readout y
+    # Optional: present only when the readout has those phi components.
+    W_out_bias: AffineParams | None = None    # symmetric (zp=0)
+    W_out_input: AffineParams | None = None   # symmetric (zp=0)
+
+    def __post_init__(self):
+        weight_fields = ["W_in", "W_res", "W_out_state"]
+        if self.W_out_bias is not None:
+            weight_fields.append("W_out_bias")
+        if self.W_out_input is not None:
+            weight_fields.append("W_out_input")
+        for name in weight_fields:
+            wp = getattr(self, name)
+            if wp.zero_point != 0:
+                raise ValueError(
+                    f"{name}.zero_point must be 0 (symmetric weight convention)"
+                )
+        sb = self.input.storage_bits
+        all_fields = ["u_pre", "state", "pre", "output"] + weight_fields
+        for name in all_fields:
+            other = getattr(self, name)
+            if other.storage_bits != sb:
+                raise ValueError(
+                    f"storage_bits mismatch: input={sb}, {name}={other.storage_bits}"
+                )
+
+    @property
+    def storage_bits(self) -> int:
+        return self.input.storage_bits

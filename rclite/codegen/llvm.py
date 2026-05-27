@@ -1000,6 +1000,529 @@ class _IntLowerer:
             _store1d(self.b, self.Y_arg, self.b.add(tM, m), y)
 
 
+# ----------------------------------------------------------------------------
+# Affine (asymmetric per-tensor) lowering
+
+
+def emit_quantized_affine_module(qmodel, *, passes=None) -> ir.Module:
+    """Build LLVM IR for the affine integer quantized path (i8 or i16).
+
+    Function signature is identical to the symmetric path:
+        void rc_predict(int64_t T, storage_t* X, storage_t* Y);
+
+    `qmodel` is an `AffineQuantizedModel`; weights and metadata flow
+    through `build_ir_from_quantized_affine` into the IR Module, then
+    `_AffineLowerer` emits the kernel using TFLM-style requantize.
+    """
+    from rclite.quant.affine.ir_builder import build_ir_from_quantized_affine
+
+    ir_module = build_ir_from_quantized_affine(qmodel)
+    if passes is None:
+        passes = []
+    for p in passes:
+        ir_module = p(ir_module)
+    return _AffineLowerer(ir_module).lower()
+
+
+class _AffineLowerer:
+    """Lower an affine-quantized rclite IR Module to LLVM IR.
+
+    Per-step structure (bit-exact mirror of `AffineQuantizedExecutor`):
+
+        acc_in  = sum_k q_W_in[i,k]  * q_x[k] - zp_u_pre * row_sum_W_in[i]
+        acc_res = sum_j q_W_res[i,j] * q_h[j] - zp_state  * row_sum_W_res[i]
+        pre[i]  = sat( zp_pre + bias_pre
+                       + requantize(acc_in,  M_in_M0,  M_in_n)
+                       + requantize(acc_res, M_res_M0, M_res_n) )
+        a[i]    = LUT[ sext(pre[i], i32) + lut_offset ]
+        h[i]    = sat( zp_state + (h[i] - zp_state)
+                       + requantize(a[i] - h[i], leak_M0, leak_n) )
+
+        y[m]    = sat( zp_output
+                       + requantize(W_out[m, 0],          M_out_bias_*)   # if include_bias
+                       + requantize(W_out·x  − zp·R_in,   M_out_input_*)  # if include_input
+                       + requantize(W_out·h  − zp·R_st,   M_out_state_*) )
+
+    Accumulator widths:
+        storage_bits == 8  : accum = i32, product = i32
+        storage_bits == 16 : accum = i64, product = i64 (matmul over N can
+                              overflow i32 for N ≳ 4 with full-range i16)
+
+    The requantize step takes its operand in i32 (after clamping the
+    accumulator if needed) and uses `(x*M0 + (1<<(n-1))) >> n`. The
+    rounding direction (arithmetic shift on `(prod + bias)`) exactly
+    matches what `apply_multiplier_array` does on the Python side, so
+    Python and JIT agree bit-for-bit.
+    """
+
+    def __init__(self, ir_module):
+        from rclite.ir.ops import ReservoirStep, BuildPhi, ReadoutLinear, TimeLoop
+
+        self.ir_module = ir_module
+        md = ir_module.metadata
+        if md.get("quantization") != "affine":
+            raise ValueError(
+                "_AffineLowerer expects metadata['quantization']='affine'"
+            )
+
+        self.storage_bits = int(md["storage_bits"])
+        self.storage_ty = ir.IntType(self.storage_bits)
+        if self.storage_bits == 8:
+            self.accum_ty = _I32
+        elif self.storage_bits == 16:
+            self.accum_ty = _I64
+        else:
+            raise NotImplementedError(
+                f"_AffineLowerer only supports storage_bits in {{8, 16}}, "
+                f"got {self.storage_bits}"
+            )
+
+        # Zero points (Python ints)
+        self.zp_input  = int(md["zp_input"])
+        self.zp_u_pre  = int(md["zp_u_pre"])
+        self.zp_state  = int(md["zp_state"])
+        self.zp_pre    = int(md["zp_pre"])
+        self.zp_output = int(md["zp_output"])
+
+        self.lut_offset = int(md["lut_offset"])
+        self.bias_pre   = int(md["bias_pre"])
+
+        # Requantize multipliers (M0, n)
+        self.M_in_M0,  self.M_in_n  = int(md["M_in_M0"]),  int(md["M_in_n"])
+        self.M_res_M0, self.M_res_n = int(md["M_res_M0"]), int(md["M_res_n"])
+        self.leak_M0,  self.leak_n  = int(md["leak_M0"]),  int(md["leak_n"])
+        self.M_out_bias_M0  = int(md["M_out_bias_M0"])
+        self.M_out_bias_n   = int(md["M_out_bias_n"])
+        self.M_out_input_M0 = int(md["M_out_input_M0"])
+        self.M_out_input_n  = int(md["M_out_input_n"])
+        self.M_out_state_M0 = int(md["M_out_state_M0"])
+        self.M_out_state_n  = int(md["M_out_state_n"])
+
+        self.include_bias  = bool(md["include_bias"])
+        self.include_input = bool(md["include_input"])
+
+        self.K, self.N, self.M = ir_module.K, ir_module.N, ir_module.M
+
+        self.module = ir.Module(
+            name=f"rc_affine_jit_i{self.storage_bits}_{id(ir_module)}",
+        )
+        self.module.triple = llvm.get_default_triple()
+
+        # Emit all globals (storage-typed weights + i32 precomputed row sums).
+        self.globals = {}
+        for name, arr in ir_module.weights.items():
+            self.globals[name] = self._emit_global(name, arr)
+
+        # void rc_predict(i64 T, storage_t* X, storage_t* Y)
+        fnty = ir.FunctionType(
+            ir.VoidType(),
+            [_I64, self.storage_ty.as_pointer(), self.storage_ty.as_pointer()],
+        )
+        self.fn = ir.Function(self.module, fnty, name="rc_predict")
+        self.T_arg, self.X_arg, self.Y_arg = self.fn.args
+        self.T_arg.name = "T"
+        self.X_arg.name = "X"
+        self.Y_arg.name = "Y"
+
+        entry = self.fn.append_basic_block("entry")
+        self.b = ir.IRBuilder(entry)
+
+        # Buffers
+        self.h_buf = self.b.alloca(
+            self.storage_ty, size=_ci(self.N), name="h",
+        )
+        self.pre_buf = self.b.alloca(
+            self.storage_ty, size=_ci(self.N), name="pre",
+        )
+
+        # Initialize state to zp_state
+        with _loop(self.b, _ci(self.N), "init") as i:
+            _store1d(self.b, self.h_buf, i, self._cs(self.zp_state))
+
+        self.t = None
+
+    # ------------------------------------------------------------------
+    # constants
+
+    def _cs(self, v: int) -> ir.Constant:
+        """Constant in storage_ty (i8 or i16)."""
+        return ir.Constant(self.storage_ty, int(v))
+
+    def _ca(self, v: int) -> ir.Constant:
+        """Constant in accum_ty (i32 or i64)."""
+        return ir.Constant(self.accum_ty, int(v))
+
+    def _ci32(self, v: int) -> ir.Constant:
+        return ir.Constant(_I32, int(v))
+
+    def _ci64(self, v: int) -> ir.Constant:
+        return ir.Constant(_I64, int(v))
+
+    # ------------------------------------------------------------------
+    # global emission
+
+    def _emit_global(self, name, arr):
+        flat = np.asarray(arr).reshape(-1)
+        if flat.dtype == np.int8:
+            elem_ty = ir.IntType(8)
+        elif flat.dtype == np.int16:
+            elem_ty = ir.IntType(16)
+        elif flat.dtype == np.int32:
+            elem_ty = ir.IntType(32)
+        else:
+            raise ValueError(
+                f"_AffineLowerer global {name!r}: unsupported dtype "
+                f"{flat.dtype}"
+            )
+        arr_ty = ir.ArrayType(elem_ty, flat.size)
+        g = ir.GlobalVariable(self.module, arr_ty, name=name)
+        g.linkage = "internal"
+        g.global_constant = True
+        g.initializer = ir.Constant(
+            arr_ty, [ir.Constant(elem_ty, int(v)) for v in flat],
+        )
+        return g
+
+    # ------------------------------------------------------------------
+    # core helpers
+
+    def _clamp_to_i32(self, val_ty):
+        """If accumulator is i64, clamp to i32 range and truncate; else passthrough."""
+        if self.accum_ty == _I32:
+            return val_ty
+        lo = self._ci64(-(1 << 31))
+        hi = self._ci64((1 << 31) - 1)
+        clipped_lo = self.b.select(
+            self.b.icmp_signed("<", val_ty, lo), lo, val_ty,
+        )
+        clipped = self.b.select(
+            self.b.icmp_signed(">", clipped_lo, hi), hi, clipped_lo,
+        )
+        return self.b.trunc(clipped, _I32)
+
+    def _emit_requantize_i32(self, acc_i32, M0: int, n: int):
+        """Compute `(acc * M0 + (1<<(n-1))) >> n` with i64 product. Returns i32.
+
+        Matches `apply_multiplier_array` in the Python ref bit-for-bit.
+        """
+        if M0 == 0:
+            return self._ci32(0)
+        acc_64 = self.b.sext(acc_i32, _I64)
+        prod = self.b.mul(acc_64, self._ci64(M0))
+        if n > 0:
+            prod = self.b.add(prod, self._ci64(1 << (n - 1)))
+        shr = self.b.ashr(prod, self._ci64(n))
+        return self.b.trunc(shr, _I32)
+
+    def _emit_saturate_to_storage(self, val_i32):
+        """Clamp i32 to signed storage range, then truncate to storage_ty."""
+        lo = self._ci32(-(1 << (self.storage_bits - 1)))
+        hi = self._ci32((1 << (self.storage_bits - 1)) - 1)
+        clipped_lo = self.b.select(
+            self.b.icmp_signed("<", val_i32, lo), lo, val_i32,
+        )
+        clipped = self.b.select(
+            self.b.icmp_signed(">", clipped_lo, hi), hi, clipped_lo,
+        )
+        return self.b.trunc(clipped, self.storage_ty)
+
+    # ------------------------------------------------------------------
+    # dispatcher
+
+    def lower(self) -> ir.Module:
+        for op in self.ir_module.ops:
+            self._lower(op)
+        self.b.ret_void()
+        return self.module
+
+    def _lower(self, op):
+        from rclite.ir.ops import (
+            TimeLoop, ReservoirStep, BuildPhi, ReadoutLinear,
+        )
+        if isinstance(op, TimeLoop):
+            return self._lower_time_loop(op)
+        if isinstance(op, ReservoirStep):
+            return self._lower_reservoir_step(op)
+        if isinstance(op, BuildPhi):
+            # Affine readout pulls X and h directly — no phi buffer needed.
+            return
+        if isinstance(op, ReadoutLinear):
+            return self._lower_readout_linear(op)
+        raise NotImplementedError(
+            f"{type(op).__name__} not supported in the affine path"
+        )
+
+    def _lower_time_loop(self, op):
+        with _loop(self.b, self.T_arg, "t") as t:
+            self.t = t
+            for body_op in op.body:
+                self._lower(body_op)
+        self.t = None
+
+    # ------------------------------------------------------------------
+    # reservoir step
+
+    def _lower_reservoir_step(self, op):
+        g_Win  = self.globals["W_in"]
+        g_Wres = self.globals["W_res"]
+        g_lut  = self.globals["lut_table"]
+        g_rs_in  = self.globals["row_sum_W_in"]
+        g_rs_res = self.globals["row_sum_W_res"]
+        K, N = op.K, op.N
+        t = self.t
+
+        # ---- Pre-act loop ----
+        with _loop(self.b, _ci(N), "ipre") as i:
+            # acc_in
+            acc_in_var = self.b.alloca(self.accum_ty, name="acc_in")
+            self.b.store(self._ca(0), acc_in_var)
+            with _loop(self.b, _ci(K), "kin") as k:
+                w = _load2d_global(self.b, g_Win, K, i, k)
+                # Raw input is already at (s_input, zp_input) == (s_u_pre, zp_u_pre)
+                x = _load1d(self.b, self.X_arg,
+                              self.b.add(self.b.mul(t, _ci(K)), k))
+                w_a = self.b.sext(w, self.accum_ty)
+                x_a = self.b.sext(x, self.accum_ty)
+                prod = self.b.mul(w_a, x_a)
+                self.b.store(
+                    self.b.add(self.b.load(acc_in_var), prod), acc_in_var,
+                )
+            # acc_in -= zp_u_pre * row_sum_W_in[i]
+            rs_in_i32 = _load1d_global(self.b, g_rs_in, i)
+            rs_in = (rs_in_i32 if self.accum_ty == _I32
+                     else self.b.sext(rs_in_i32, self.accum_ty))
+            acc_in_final = self.b.sub(
+                self.b.load(acc_in_var),
+                self.b.mul(self._ca(self.zp_u_pre), rs_in),
+            )
+            rq_in = self._emit_requantize_i32(
+                self._clamp_to_i32(acc_in_final),
+                self.M_in_M0, self.M_in_n,
+            )
+
+            # acc_res
+            acc_res_var = self.b.alloca(self.accum_ty, name="acc_res")
+            self.b.store(self._ca(0), acc_res_var)
+            with _loop(self.b, _ci(N), "jres") as j:
+                w = _load2d_global(self.b, g_Wres, N, i, j)
+                h = _load1d(self.b, self.h_buf, j)
+                w_a = self.b.sext(w, self.accum_ty)
+                h_a = self.b.sext(h, self.accum_ty)
+                prod = self.b.mul(w_a, h_a)
+                self.b.store(
+                    self.b.add(self.b.load(acc_res_var), prod), acc_res_var,
+                )
+            rs_res_i32 = _load1d_global(self.b, g_rs_res, i)
+            rs_res = (rs_res_i32 if self.accum_ty == _I32
+                      else self.b.sext(rs_res_i32, self.accum_ty))
+            acc_res_final = self.b.sub(
+                self.b.load(acc_res_var),
+                self.b.mul(self._ca(self.zp_state), rs_res),
+            )
+            rq_res = self._emit_requantize_i32(
+                self._clamp_to_i32(acc_res_final),
+                self.M_res_M0, self.M_res_n,
+            )
+
+            # pre = zp_pre + bias_pre + rq_in + rq_res  (i32, then saturate)
+            pre_total = self.b.add(
+                self.b.add(self._ci32(self.zp_pre + self.bias_pre), rq_in),
+                rq_res,
+            )
+            pre_q = self._emit_saturate_to_storage(pre_total)
+            _store1d(self.b, self.pre_buf, i, pre_q)
+
+        # ---- Activation + leaky integration ----
+        with _loop(self.b, _ci(N), "iact") as i:
+            p = _load1d(self.b, self.pre_buf, i)  # storage_ty
+            # LUT index: sext(p, i32) + lut_offset, then sext to i64 for GEP
+            idx_i32 = self.b.add(self.b.sext(p, _I32),
+                                   self._ci32(self.lut_offset))
+            idx_i64 = self.b.sext(idx_i32, _I64)
+            a = _load1d_global(self.b, g_lut, idx_i64)  # storage_ty
+
+            h_old = _load1d(self.b, self.h_buf, i)
+            h_c = self.b.sub(self.b.sext(h_old, _I32),
+                              self._ci32(self.zp_state))
+            a_c = self.b.sub(self.b.sext(a, _I32),
+                              self._ci32(self.zp_state))
+            diff = self.b.sub(a_c, h_c)
+            delta = self._emit_requantize_i32(diff, self.leak_M0, self.leak_n)
+            new_h_c = self.b.add(h_c, delta)
+            new_h_total = self.b.add(new_h_c, self._ci32(self.zp_state))
+            new_h_q = self._emit_saturate_to_storage(new_h_total)
+            _store1d(self.b, self.h_buf, i, new_h_q)
+
+    # ------------------------------------------------------------------
+    # readout
+
+    def _lower_readout_linear(self, op):
+        g_Wout = self.globals["W_out"]
+        g_rs_state = self.globals["row_sum_Wout_state"]
+        g_rs_input = self.globals.get("row_sum_Wout_input")
+        F = op.F
+        K = self.K
+        N = self.N
+        Mout = op.M
+
+        off_bias  = 0
+        off_input = 1 if self.include_bias else 0
+        off_state = off_input + (K if self.include_input else 0)
+
+        t = self.t
+        tM = self.b.mul(t, _ci(Mout))
+
+        with _loop(self.b, _ci(Mout), "m") as m:
+            y_var = self.b.alloca(_I32, name="y_acc")
+            self.b.store(self._ci32(self.zp_output), y_var)
+
+            if self.include_bias:
+                w0 = _load2d_global(self.b, g_Wout, F, m, _ci(off_bias))
+                rq_b = self._emit_requantize_i32(
+                    self.b.sext(w0, _I32),
+                    self.M_out_bias_M0, self.M_out_bias_n,
+                )
+                self.b.store(self.b.add(self.b.load(y_var), rq_b), y_var)
+
+            if self.include_input:
+                acc_var = self.b.alloca(self.accum_ty, name="acc_input_ro")
+                self.b.store(self._ca(0), acc_var)
+                with _loop(self.b, _ci(K), "kin_ro") as k:
+                    col = self.b.add(_ci(off_input), k)
+                    w = _load2d_global(self.b, g_Wout, F, m, col)
+                    x = _load1d(self.b, self.X_arg,
+                                  self.b.add(self.b.mul(t, _ci(K)), k))
+                    w_a = self.b.sext(w, self.accum_ty)
+                    x_a = self.b.sext(x, self.accum_ty)
+                    prod = self.b.mul(w_a, x_a)
+                    self.b.store(
+                        self.b.add(self.b.load(acc_var), prod), acc_var,
+                    )
+                rs_i32 = _load1d_global(self.b, g_rs_input, m)
+                rs = (rs_i32 if self.accum_ty == _I32
+                      else self.b.sext(rs_i32, self.accum_ty))
+                adj = self.b.sub(
+                    self.b.load(acc_var),
+                    self.b.mul(self._ca(self.zp_input), rs),
+                )
+                rq_i = self._emit_requantize_i32(
+                    self._clamp_to_i32(adj),
+                    self.M_out_input_M0, self.M_out_input_n,
+                )
+                self.b.store(self.b.add(self.b.load(y_var), rq_i), y_var)
+
+            acc_var = self.b.alloca(self.accum_ty, name="acc_state_ro")
+            self.b.store(self._ca(0), acc_var)
+            with _loop(self.b, _ci(N), "jst_ro") as j:
+                col = self.b.add(_ci(off_state), j)
+                w = _load2d_global(self.b, g_Wout, F, m, col)
+                h = _load1d(self.b, self.h_buf, j)
+                w_a = self.b.sext(w, self.accum_ty)
+                h_a = self.b.sext(h, self.accum_ty)
+                prod = self.b.mul(w_a, h_a)
+                self.b.store(
+                    self.b.add(self.b.load(acc_var), prod), acc_var,
+                )
+            rs_i32 = _load1d_global(self.b, g_rs_state, m)
+            rs = (rs_i32 if self.accum_ty == _I32
+                  else self.b.sext(rs_i32, self.accum_ty))
+            adj = self.b.sub(
+                self.b.load(acc_var),
+                self.b.mul(self._ca(self.zp_state), rs),
+            )
+            rq_s = self._emit_requantize_i32(
+                self._clamp_to_i32(adj),
+                self.M_out_state_M0, self.M_out_state_n,
+            )
+            self.b.store(self.b.add(self.b.load(y_var), rq_s), y_var)
+
+            y_q = self._emit_saturate_to_storage(self.b.load(y_var))
+            _store1d(self.b, self.Y_arg, self.b.add(tM, m), y_q)
+
+
+class CompiledAffineRC:
+    """JIT-compiled affine `AffineQuantizedModel` (host LLVM).
+
+    Mirrors `CompiledQuantizedRC` but consumes an `AffineQuantizedModel`
+    and emits via `_AffineLowerer`. `predict()` accepts float inputs,
+    quantizes them via the model's input params (matching what the
+    Python `AffineQuantizedExecutor.predict` does), calls the kernel,
+    and dequantizes the output back to float.
+    """
+
+    name = "llvm-affine"
+
+    def __init__(self, qmodel, opt_level: int = 3, passes=None):
+        _ensure_initialized()
+        self.qmodel = qmodel
+        self.rc = qmodel.rc
+        self._ir_text = str(emit_quantized_affine_module(qmodel, passes=passes))
+        self._mod = llvm.parse_assembly(self._ir_text)
+        self._mod.verify()
+
+        target = llvm.Target.from_triple(llvm.get_default_triple())
+        self._tm = target.create_target_machine(opt=opt_level)
+        pto = llvm.create_pipeline_tuning_options()
+        pto.speed_level = opt_level
+        pto.loop_vectorization = True
+        pto.slp_vectorization = True
+        pb = llvm.create_pass_builder(self._tm, pto)
+        pb.getModulePassManager().run(self._mod, pb)
+
+        self._engine = llvm.create_mcjit_compiler(self._mod, self._tm)
+        self._engine.finalize_object()
+        self._engine.run_static_constructors()
+
+        sw = qmodel.storage_bits
+        if sw == 8:
+            self._cstorage = ctypes.c_int8
+            self._np_storage = np.int8
+        elif sw == 16:
+            self._cstorage = ctypes.c_int16
+            self._np_storage = np.int16
+        else:
+            raise NotImplementedError(
+                f"CompiledAffineRC: storage_bits {sw} not supported"
+            )
+        addr = self._engine.get_function_address("rc_predict")
+        self._cfn = ctypes.CFUNCTYPE(
+            None, ctypes.c_int64,
+            ctypes.POINTER(self._cstorage),
+            ctypes.POINTER(self._cstorage),
+        )(addr)
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """Float input → JIT kernel → dequantized float output."""
+        if X.ndim == 1:
+            X = X[:, None]
+        T = X.shape[0]
+        K = self.qmodel.K
+        Mout = self.qmodel.M
+        # Quantize input via the model's input params (matches Python ref).
+        X_q = self.qmodel.config.input.quantize_array(X).astype(self._np_storage)
+        X_q = np.ascontiguousarray(X_q.reshape(-1))
+        Y_q = np.zeros(T * Mout, dtype=self._np_storage)
+        self._cfn(
+            ctypes.c_int64(T),
+            X_q.ctypes.data_as(ctypes.POINTER(self._cstorage)),
+            Y_q.ctypes.data_as(ctypes.POINTER(self._cstorage)),
+        )
+        Y_q = Y_q.reshape(T, Mout)
+        return self.qmodel.config.output.dequantize_array(Y_q)
+
+    @property
+    def llvm_ir(self) -> str:
+        return self._ir_text
+
+    @property
+    def optimized_ir(self) -> str:
+        return str(self._mod)
+
+    @property
+    def assembly(self) -> str:
+        return self._tm.emit_assembly(self._mod)
+
+
 class CompiledRC:
     """JIT-compiled ReservoirComputer (LLVM backend).
 
