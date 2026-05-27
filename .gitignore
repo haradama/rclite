@@ -57,7 +57,7 @@
 .LSOverride
 
 # Icon must end with two \r
-Icon
+Icon
 
 # Thumbnails
 ._*
@@ -154,6 +154,9 @@ instance/
 
 # Sphinx documentation
 docs/_build/
+
+# pdoc generated documentation (built by .github/workflows/docs.yml)
+/docs/
 
 # PyBuilder
 .pybuilder/
