@@ -33,6 +33,11 @@ def quantize_model(
         target = I32FixedPoint()
     if lut is None:
         lut = TanhLUTSpec()
+    # Targets with narrow storage (e.g. I8Symmetric) may impose extra
+    # constraints on the Q-format; let them reject early.
+    validate = getattr(target, "validate_config", None)
+    if callable(validate):
+        validate(config)
 
     W_in_q = target.quantize_weight_array(exe.W_in, config)
     W_res_q = target.quantize_weight_array(exe.W_res, config)

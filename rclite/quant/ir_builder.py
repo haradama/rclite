@@ -80,6 +80,8 @@ def build_ir_from_quantized(qmodel: QuantizedModel) -> Module:
         dtype = "i32"
     elif qmodel.target.storage_bits == 16:
         dtype = "i16"
+    elif qmodel.target.storage_bits == 8:
+        dtype = "i8"
     else:
         raise NotImplementedError(
             f"storage width {qmodel.target.storage_bits} not supported by IR"
