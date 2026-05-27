@@ -18,6 +18,7 @@ from rclite.runtime import RCExecutor
 from rclite.targets import (
     Target, CompiledArtifact, RunResult,
     HostTarget, CortexM0Target, MicrobitV1, Microbit,
+    WasmTarget, Wasmtime,
 )
 
 
@@ -117,6 +118,45 @@ def test_microbit_v1_board_constants():
     assert board.ram_kb == 16
     assert board.qemu_machine == "microbit"
     assert board.linker_script == "nrf51.ld"
+
+
+def test_wasmtime_class_inherits_wasm_target():
+    assert issubclass(Wasmtime, WasmTarget)
+    wt = Wasmtime()
+    assert wt.triple == "wasm32-wasip1"
+    assert wt.rust_target == "wasm32-wasip1"
+    assert wt.dtype == "f32"
+
+
+def test_wasm_target_rejects_non_f32():
+    expect_raises(ValueError, WasmTarget, dtype="f64")
+
+
+def test_wasm_target_requires_test_inputs():
+    rc, exe, _ = _build()
+    with tempfile.TemporaryDirectory() as td:
+        expect_raises(ValueError, Wasmtime().compile, rc, exe,
+                      output_dir=td)
+
+
+def test_wasmtime_full_pipeline():
+    if shutil.which("rustc") is None:
+        return  # skip — rustc not on PATH
+    if shutil.which("wasmtime") is None:
+        return  # skip — wasmtime not on PATH
+    rc, exe, sample = _build()
+    with tempfile.TemporaryDirectory() as td:
+        target = Wasmtime()
+        artifact = target.compile(rc, exe, output_dir=td, test_inputs=sample)
+        assert artifact.binary is not None
+        assert artifact.binary.exists()
+        assert artifact.binary.suffix == ".wasm"
+        assert artifact.metadata["triple"] == "wasm32-wasip1"
+        assert artifact.metadata["dtype"] == "f32"
+        assert artifact.metadata["T"] == sample.shape[0]
+        result = target.run(artifact)
+        assert result.success, f"wasmtime output:\n{result.output}"
+        assert "EMULATOR_EXIT" in result.output
 
 
 def test_target_run_result_failure_path():
