@@ -16,3 +16,11 @@ run = "uv run python -m pytest tests"
 [tasks.bench]
 description = "Run host benchmarks"
 run = "uv run python benchmarks/compare_host_full.py"
+
+[tasks.docs]
+description = "Build pdoc documentation into docs/"
+run = '''
+uv sync --extra docs
+PKGS=$(find rclite -name "__init__.py" -exec dirname {} \; | sed "s|/|.|g" | sort)
+uv run pdoc $PKGS -o docs
+'''
