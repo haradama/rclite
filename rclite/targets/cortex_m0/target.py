@@ -162,10 +162,11 @@ class CortexM0Target(Target):
                             output_dir,
                             test_inputs: np.ndarray,
                             **_) -> CompiledArtifact:
-        """Cross-compile a quantized model. The kernel takes i32 inputs
-        already at input_scale (preprocessed). main.c embeds the i32-encoded
-        input/reference arrays and uses pure integer arithmetic — no libm
-        tanhf, no soft-float."""
+        """Cross-compile a quantized model. The kernel takes storage_t inputs
+        already at input_scale (preprocessed). main.c embeds the
+        storage_t-encoded input/reference arrays and uses pure integer
+        arithmetic — no libm tanhf, no soft-float. The storage width is
+        picked from `qmodel.target.storage_bits` (32 / 16 / 8)."""
         import llvmlite.binding as llvm
         if shutil.which(self.cc) is None:
             raise RuntimeError(
@@ -175,6 +176,17 @@ class CortexM0Target(Target):
         out = pathlib.Path(output_dir)
         out.mkdir(parents=True, exist_ok=True)
         cfg = qmodel.config
+        sw = qmodel.target.storage_bits
+        if sw == 32:
+            storage_t, np_storage = "int32_t", np.int32
+        elif sw == 16:
+            storage_t, np_storage = "int16_t", np.int16
+        elif sw == 8:
+            storage_t, np_storage = "int8_t", np.int8
+        else:
+            raise NotImplementedError(
+                f"compile_quantized: storage_bits={sw} not supported"
+            )
 
         # Cross-compile the i32 kernel
         ll_mod = emit_quantized_module(qmodel)
@@ -200,19 +212,20 @@ class CortexM0Target(Target):
         # Quantize test inputs (matches what CompiledQuantizedRC.predict does)
         rc = qmodel.rc
         u_pre = (test_inputs - rc.input.input_offset) * rc.input.input_scaling
-        X_q = qmodel.target.quantize_input_array(u_pre, cfg).astype(np.int32)
+        X_q = qmodel.target.quantize_input_array(u_pre, cfg).astype(np_storage)
 
         # Reference outputs (bit-exact via Python QuantizedExecutor)
         from rclite.quant.executor import QuantizedExecutor
         qexe = QuantizedExecutor(qmodel)
-        Y_ref_q = np.zeros((test_inputs.shape[0], qmodel.M), dtype=np.int32)
+        Y_ref_q = np.zeros((test_inputs.shape[0], qmodel.M), dtype=np_storage)
         for t in range(test_inputs.shape[0]):
-            qexe.step_q(X_q[t] if X_q.ndim > 1 else np.array([X_q[t]], dtype=np.int32))
+            x_row = (X_q[t] if X_q.ndim > 1
+                     else np.array([X_q[t]], dtype=np_storage))
+            qexe.step_q(x_row.astype(np.int32))
             # phi-style readout uses raw input passthrough scaling — match the
             # kernel's BuildPhi by feeding the (preprocessed-quantized) X_q here.
-            from rclite.quant._intops import trunc_i32
-            phi_input = X_q[t] if X_q.ndim > 1 else np.array([X_q[t]], dtype=np.int32)
-            Y_ref_q[t] = qexe.predict_one_q(phi_input, qexe.state_q)
+            Y_ref_q[t] = qexe.predict_one_q(x_row.astype(np.int32),
+                                              qexe.state_q).astype(np_storage)
 
         # Render main.c from template
         tmpl_path = _SUPPORT_DIR / "main_template_q.c"
@@ -223,6 +236,7 @@ class CortexM0Target(Target):
         main_c = (tmpl
                   .replace("@@T_LEN@@", str(T))
                   .replace("@@STATE_FRAC@@", str(cfg.state_frac))
+                  .replace("@@STORAGE_T@@", storage_t)
                   .replace("@@X_VALUES_Q@@", x_lit)
                   .replace("@@Y_VALUES_Q@@", y_lit))
         main_path = out / "main.c"
@@ -267,7 +281,7 @@ class CortexM0Target(Target):
 
         metadata = {
             "board": self.board, "triple": self.triple,
-            "cpu": self.cpu, "dtype": "i32",
+            "cpu": self.cpu, "dtype": f"i{sw}",
             "state_frac": cfg.state_frac,
             "quantized": True,
         }
