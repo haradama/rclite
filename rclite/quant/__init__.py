@@ -30,6 +30,7 @@ from .online import IntegerLMSLearner
 from .affine import (
     AffineParams, AffineQuantConfig,
     calibrate_from_data,
+    LUTStrategy, LUTKind, LUTArtifacts, build_lut_artifacts,
     AffineQuantizedModel, quantize_model_affine,
     AffineQuantizedExecutor,
     search_quantization_affine, AffineSearchResult,
@@ -54,4 +55,5 @@ __all__ = [
     "AffineQuantizedExecutor",
     "search_quantization_affine", "AffineSearchResult",
     "quantize_multiplier", "build_ir_from_quantized_affine",
+    "LUTStrategy", "LUTKind", "LUTArtifacts", "build_lut_artifacts",
 ]

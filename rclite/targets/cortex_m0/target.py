@@ -18,7 +18,7 @@ from typing import Optional
 import numpy as np
 
 from rclite.codegen import compile_rc, cross_compile_rc
-from rclite.codegen.llvm import emit_quantized_module
+from rclite.codegen.llvm import emit_quantized_module, emit_quantized_affine_module
 from ..target import Target, CompiledArtifact, RunResult
 from .boards import CortexM0Board, MicrobitV1
 
@@ -296,6 +296,157 @@ class CortexM0Target(Target):
 
         return CompiledArtifact(
             target_name=self.name + "/quantized",
+            output_dir=out,
+            binary=elf,
+            sources=[main_path, startup_path, linker_path],
+            objects=[rc_o, out / "startup.o", out / "main.o"],
+            metadata=metadata,
+        )
+
+    def compile_affine_quantized(self, qmodel, *,
+                                   output_dir,
+                                   test_inputs: np.ndarray,
+                                   **_) -> CompiledArtifact:
+        """Cross-compile an `AffineQuantizedModel` to a Cortex-M0 ELF.
+
+        Storage width (i8 / i16) and the LUT strategy (DIRECT /
+        LINEAR_INTERP / POLYNOMIAL) flow through `emit_quantized_affine_module`
+        from the model. The test driver embeds the input samples and the
+        bit-exact reference outputs computed by `AffineQuantizedExecutor`,
+        all as quantized integers, so the on-device verification stays in
+        pure integer arithmetic.
+        """
+        import llvmlite.binding as llvm
+        if shutil.which(self.cc) is None:
+            raise RuntimeError(
+                f"{self.cc} not found on PATH — install gcc-arm-none-eabi"
+            )
+
+        out = pathlib.Path(output_dir)
+        out.mkdir(parents=True, exist_ok=True)
+
+        sw = qmodel.storage_bits
+        if sw == 8:
+            storage_t, np_storage = "int8_t", np.int8
+        elif sw == 16:
+            storage_t, np_storage = "int16_t", np.int16
+        else:
+            raise NotImplementedError(
+                f"compile_affine_quantized: storage_bits={sw} not supported"
+            )
+
+        # Cross-compile the affine kernel
+        ll_mod = emit_quantized_affine_module(qmodel)
+        ll_mod.triple = self.triple
+        from rclite.codegen.llvm import _ensure_all_targets
+        _ensure_all_targets()
+        mod = llvm.parse_assembly(str(ll_mod))
+        mod.verify()
+        target = llvm.Target.from_triple(self.triple)
+        tm = target.create_target_machine(cpu=self.cpu, opt=2, reloc="static")
+        pto = llvm.create_pipeline_tuning_options()
+        pto.speed_level = 2
+        pto.loop_vectorization = False
+        pto.slp_vectorization = False
+        pb = llvm.create_pass_builder(tm, pto)
+        pb.getModulePassManager().run(mod, pb)
+        rc_o = out / "rc_predict.o"
+        with open(rc_o, "wb") as f:
+            f.write(tm.emit_object(mod))
+        with open(out / "rc_predict.s", "w") as f:
+            f.write(tm.emit_assembly(mod))
+
+        # Quantize input through the model's input params (mirrors what
+        # CompiledAffineRC.predict does).
+        cfg = qmodel.config
+        X_q = cfg.input.quantize_array(test_inputs).astype(np_storage)
+
+        # Reference outputs: run the Python AffineQuantizedExecutor (which
+        # is bit-exact with the JIT) and emit q_y at the model's output
+        # scale.
+        from rclite.quant.affine.executor import AffineQuantizedExecutor
+        qexe = AffineQuantizedExecutor(qmodel)
+        if test_inputs.ndim == 1:
+            test_inputs_2d = test_inputs[:, None]
+        else:
+            test_inputs_2d = test_inputs
+        T = test_inputs_2d.shape[0]
+        Y_ref_q = np.zeros((T, qmodel.M), dtype=np_storage)
+        for t in range(T):
+            x_raw = test_inputs_2d[t]
+            x_raw_q = qexe._quantize_raw_input(x_raw)
+            u_pre_q = qexe._quantize_u_pre(x_raw)
+            qexe.step_q(u_pre_q)
+            Y_ref_q[t] = qexe.predict_one_q(x_raw_q, qexe.state_q).astype(np_storage)
+
+        # Render the affine main.c
+        tmpl_path = _SUPPORT_DIR / "main_template_q_affine.c"
+        tmpl = tmpl_path.read_text()
+        x_lit = ", ".join(str(int(v)) for v in X_q.ravel())
+        y_lit = ", ".join(str(int(v)) for v in Y_ref_q.ravel())
+        main_c = (tmpl
+                  .replace("@@T_LEN@@", str(T))
+                  .replace("@@STORAGE_T@@", storage_t)
+                  .replace("@@LUT_KIND@@", qmodel.lut_strategy.kind.value)
+                  .replace("@@X_VALUES_Q@@", x_lit)
+                  .replace("@@Y_VALUES_Q@@", y_lit))
+        main_path = out / "main.c"
+        main_path.write_text(main_c)
+
+        # Stage startup + linker
+        startup_path = out / "startup.c"
+        linker_path = out / self.board.linker_script
+        shutil.copy(_SUPPORT_DIR / "startup.c", startup_path)
+        shutil.copy(_SUPPORT_DIR / self.board.linker_script, linker_path)
+
+        cflags = [
+            f"-mcpu={self.cpu}", "-mthumb", "-O2", "-g",
+            "-ffunction-sections", "-fdata-sections", "-Wall",
+            f"-I{out}",
+        ]
+        for src in (startup_path, main_path):
+            obj = src.with_suffix(".o")
+            cp = subprocess.run([self.cc, "-c", *cflags, str(src), "-o", str(obj)],
+                                capture_output=True, text=True)
+            if cp.returncode != 0:
+                raise RuntimeError(f"compile failed for {src.name}: {cp.stderr}")
+
+        elf = out / "rc.elf"
+        link_cmd = [
+            self.cc, f"-mcpu={self.cpu}", "-mthumb",
+            "-T", str(linker_path),
+            "-nostartfiles",
+            "-Wl,--gc-sections",
+            f"-Wl,-Map={out / 'rc.map'}",
+            "--specs=nosys.specs",
+            *_AEABI_ALIASES,
+            str(out / "startup.o"),
+            str(out / "main.o"),
+            str(rc_o),
+            "-o", str(elf),
+            "-lgcc", "-lc", "-lnosys",  # no -lm: integer affine kernel
+        ]
+        cp = subprocess.run(link_cmd, capture_output=True, text=True)
+        if cp.returncode != 0:
+            raise RuntimeError(f"link failed: {cp.stderr}")
+
+        metadata = {
+            "board": self.board, "triple": self.triple,
+            "cpu": self.cpu, "dtype": f"i{sw}",
+            "quantized": True, "affine": True,
+            "lut_kind": qmodel.lut_strategy.kind.value,
+        }
+        try:
+            sz = subprocess.run(
+                [self.cc.replace("gcc", "size"), str(elf)],
+                capture_output=True, text=True, check=True,
+            )
+            metadata["size"] = sz.stdout.strip()
+        except Exception:
+            pass
+
+        return CompiledArtifact(
+            target_name=self.name + "/affine",
             output_dir=out,
             binary=elf,
             sources=[main_path, startup_path, linker_path],

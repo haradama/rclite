@@ -35,6 +35,7 @@ from rclite.runtime.reference import RCExecutor
 
 from .types import AffineQuantConfig
 from .multiplier import quantize_multiplier
+from .lut import LUTStrategy, LUTKind, LUTArtifacts, build_lut_artifacts
 
 
 @dataclass
@@ -59,10 +60,6 @@ class AffineQuantizedModel:
     W_res_q: np.ndarray  # (N, N) storage dtype
     W_out_q: np.ndarray  # (M, F) storage dtype
 
-    # 2^storage_bits-entry tanh LUT, indexed by `q_pre - qmin`.
-    lut_q: np.ndarray    # (1 << storage_bits,) storage dtype
-    lut_offset: int      # = -qmin (e.g. 128 for i8)
-
     # Per-row weight sums for zero-point cross-term folding.
     row_sum_W_in: np.ndarray   # (N,)  int32
     row_sum_W_res: np.ndarray  # (N,)  int32
@@ -75,6 +72,13 @@ class AffineQuantizedModel:
     M_in_n: int = 0
     M_res_M0: int = 0
     M_res_n: int = 0
+    # Tanh activation strategy + precomputed data. `lut_q` / `lut_offset`
+    # carry the table data for DIRECT and LINEAR_INTERP. POLYNOMIAL stores
+    # its multipliers in `lut_artifacts` and leaves `lut_q` empty.
+    lut_strategy: LUTStrategy = field(default_factory=LUTStrategy.direct)
+    lut_q: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.int8))
+    lut_offset: int = 0
+    lut_artifacts: Optional[LUTArtifacts] = None
     # Leaky integration multiplier (= leak rate, in [0, 1])
     leak_M0: int = 0
     leak_n: int = 0
@@ -128,26 +132,13 @@ class AffineQuantizedModel:
     def storage_bits(self) -> int: return self.config.storage_bits
 
 
-def _build_affine_tanh_lut(config: AffineQuantConfig) -> tuple[np.ndarray, int]:
-    """Precompute tanh(dequant(q_pre)) → q_state for every storable q_pre.
-
-    Returns (table, offset) where the lookup is `table[q_pre + offset]`.
-    """
-    sb = config.storage_bits
-    qmin = -(1 << (sb - 1))
-    qmax = (1 << (sb - 1)) - 1
-    q_pres = np.arange(qmin, qmax + 1, dtype=np.int64)
-    reals = config.pre.dequantize_array(q_pres)
-    state_qs = config.state.quantize_array(np.tanh(reals))
-    return state_qs, -qmin
-
-
 def quantize_model_affine(
     rc: ReservoirComputer,
     exe: RCExecutor,
     config: AffineQuantConfig,
     *,
     W_out_override: Optional[np.ndarray] = None,
+    lut_strategy: Optional[LUTStrategy] = None,
 ) -> AffineQuantizedModel:
     """Quantize a trained float reservoir under `config`.
 
@@ -155,7 +146,15 @@ def quantize_model_affine(
     quantization. This is the QAT-search refit path: after refitting W_out
     on a quantized state trajectory, pass the new matrix here instead of
     mutating `exe`.
+
+    `lut_strategy` controls how tanh is evaluated in the kernel:
+      - `LUTStrategy.direct()`         — table of 2^storage_bits entries
+      - `LUTStrategy.linear_interp(n)` — interpolated n-entry table
+      - `LUTStrategy.polynomial()`     — Taylor-3 polynomial in fixed-point
+    Defaults to DIRECT when not specified.
     """
+    if lut_strategy is None:
+        lut_strategy = LUTStrategy.direct()
     W_out = exe.W_out if W_out_override is None else np.asarray(W_out_override)
     if W_out is None:
         raise ValueError("Readout has not been trained — call exe.fit() first")
@@ -195,8 +194,10 @@ def quantize_model_affine(
     M_in  = (config.W_in.scale  * config.u_pre.scale) / config.pre.scale
     M_res = (config.W_res.scale * config.state.scale) / config.pre.scale
 
-    # LUT
-    lut_q, lut_offset = _build_affine_tanh_lut(config)
+    # LUT / approximation artifacts per the chosen strategy.
+    lut_artifacts = build_lut_artifacts(config, lut_strategy)
+    lut_q = lut_artifacts.table
+    lut_offset = lut_artifacts.offset
 
     # Readout precomputed row sums (per block) and multipliers.
     s_y = config.output.scale
@@ -226,7 +227,9 @@ def quantize_model_affine(
     return AffineQuantizedModel(
         rc=rc, config=config,
         W_in_q=W_in_q, W_res_q=W_res_q, W_out_q=W_out_q,
+        lut_strategy=lut_strategy,
         lut_q=lut_q, lut_offset=lut_offset,
+        lut_artifacts=lut_artifacts,
         row_sum_W_in=row_sum_W_in, row_sum_W_res=row_sum_W_res,
         bias_pre=bias_pre,
         M_in=M_in, M_res=M_res,

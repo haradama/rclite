@@ -36,6 +36,7 @@ import numpy as np
 
 from .quantize import AffineQuantizedModel
 from .multiplier import apply_multiplier_array
+from .lut import LUTKind
 
 
 def _saturate(arr: np.ndarray, storage_bits: int) -> np.ndarray:
@@ -118,9 +119,8 @@ class AffineQuantizedExecutor:
         pre_q = zp_pre + q.bias_pre + rq_in + rq_res
         pre_q = _saturate(pre_q, sb).astype(np.int32)
 
-        # Direct LUT lookup (no interpolation): lut[q_pre - qmin]
-        idx = pre_q + q.lut_offset
-        activated_q = q.lut_q[idx].astype(np.int32)
+        # Activation: dispatch on the chosen strategy.
+        activated_q = self._activate(pre_q)
 
         # Leaky integration: new_h = h + leak * (activated - h), all centered
         # at zp_state. Integer (M0, n) leak multiplier keeps JIT parity.
@@ -131,6 +131,85 @@ class AffineQuantizedExecutor:
         new_h_centered = h_centered.astype(np.int64) + delta
         self.state_q = _saturate(new_h_centered + zp_state, sb).astype(np.int32)
         return self.state_q.copy()
+
+    # ------------------------------------------------------------------
+    # Activation (one of three strategies)
+
+    def _activate(self, pre_q: np.ndarray) -> np.ndarray:
+        """Compute q_act from q_pre using the model's LUTStrategy."""
+        q = self.qmodel
+        kind = q.lut_strategy.kind
+        if kind == LUTKind.DIRECT:
+            return self._activate_direct(pre_q)
+        if kind == LUTKind.LINEAR_INTERP:
+            return self._activate_linear_interp(pre_q)
+        if kind == LUTKind.POLYNOMIAL:
+            return self._activate_polynomial(pre_q)
+        raise ValueError(f"unknown LUTKind: {kind}")
+
+    def _activate_direct(self, pre_q: np.ndarray) -> np.ndarray:
+        q = self.qmodel
+        idx = pre_q + q.lut_offset
+        return q.lut_q[idx].astype(np.int32)
+
+    def _activate_linear_interp(self, pre_q: np.ndarray) -> np.ndarray:
+        """Subsampled table + linear interpolation, matching the JIT emit."""
+        q = self.qmodel
+        art = q.lut_artifacts
+        f = q.lut_strategy.interp_frac_bits
+        n = q.lut_strategy.n_entries
+        # t_q = (q_pre - qmin) * idx_M0 >> idx_n, in Q.f
+        # (apply_multiplier_array implements the M0,n requantize bit-exactly)
+        normalized = (pre_q.astype(np.int64) + art.offset)
+        t_q = apply_multiplier_array(normalized.astype(np.int32),
+                                       art.idx_M0, art.idx_n)
+        # Split into integer index and fractional remainder.
+        idx = (t_q >> f).astype(np.int64)
+        idx = np.clip(idx, 0, n - 2)
+        frac_q = t_q - (idx << f)
+        # Lerp between adjacent table entries, in i64 to be safe.
+        y0 = q.lut_q[idx].astype(np.int64)
+        y1 = q.lut_q[idx + 1].astype(np.int64)
+        dy = y1 - y0
+        interp = y0 + ((dy * frac_q) >> f)
+        return _saturate(interp, self.storage_bits).astype(np.int32)
+
+    def _activate_polynomial(self, pre_q: np.ndarray) -> np.ndarray:
+        """Taylor-3 polynomial in Q.qf_bits, clamped to ±1.
+
+        Computes  tanh(x) ≈ x − x³/3  for |x| ≤ poly_clip and ±1 outside.
+        The same integer ops the JIT will emit (Q.qf intermediates) keep
+        Python and JIT bit-exact.
+        """
+        q = self.qmodel
+        art = q.lut_artifacts
+        qf = q.lut_strategy.poly_qf_bits
+        cfg = self.cfg
+        zp_pre = cfg.pre.zero_point
+        zp_state = cfg.state.zero_point
+
+        # 1) Convert q_pre to x in Q.qf
+        centered = (pre_q.astype(np.int64) - zp_pre).astype(np.int32)
+        x_qf = apply_multiplier_array(centered, art.x_to_qf_M0,
+                                        art.x_to_qf_n).astype(np.int64)
+        # 2) Clamp |x| ≤ x_clip_qf
+        x_qf = np.clip(x_qf, -art.x_clip_qf, art.x_clip_qf)
+        # 3) Polynomial:  y_qf = x - x³/3, all in Q.qf
+        #    Use integer constant 1/3 ≈ round(2^qf / 3) for the divide.
+        third_qf = (1 << qf) // 3 + ((1 << qf) % 3 >= 2)  # round-to-nearest
+        x2_qf = (x_qf * x_qf) >> qf
+        x3_qf = (x_qf * x2_qf) >> qf
+        x3_div3_qf = (x3_qf * third_qf) >> qf
+        y_qf = x_qf - x3_div3_qf
+        # 4) Clamp tanh value to ±1 (= ±one_qf)
+        y_qf = np.clip(y_qf, -art.one_qf, art.one_qf)
+        # 5) Map y_qf → Δq_state (= q_state - zp_state) via the back multiplier
+        delta = apply_multiplier_array(y_qf.astype(np.int32),
+                                         art.qf_to_state_M0,
+                                         art.qf_to_state_n)
+        # Final q_state, saturated to storage range.
+        out = (delta + zp_state).astype(np.int64)
+        return _saturate(out, self.storage_bits).astype(np.int32)
 
     # ------------------------------------------------------------------
     # Readout

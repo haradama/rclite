@@ -1087,6 +1087,22 @@ class _AffineLowerer:
         self.lut_offset = int(md["lut_offset"])
         self.bias_pre   = int(md["bias_pre"])
 
+        # LUT strategy and per-strategy precomputed.
+        self.lut_kind = md.get("lut_kind", "direct")
+        if self.lut_kind == "linear_interp":
+            self.lut_n_entries        = int(md["lut_n_entries"])
+            self.lut_interp_frac_bits = int(md["lut_interp_frac_bits"])
+            self.lut_idx_M0           = int(md["lut_idx_M0"])
+            self.lut_idx_n            = int(md["lut_idx_n"])
+        elif self.lut_kind == "polynomial":
+            self.poly_qf_bits = int(md["poly_qf_bits"])
+            self.poly_x_M0    = int(md["poly_x_M0"])
+            self.poly_x_n     = int(md["poly_x_n"])
+            self.poly_back_M0 = int(md["poly_back_M0"])
+            self.poly_back_n  = int(md["poly_back_n"])
+            self.poly_clip_qf = int(md["poly_clip_qf"])
+            self.poly_one_qf  = int(md["poly_one_qf"])
+
         # Requantize multipliers (M0, n)
         self.M_in_M0,  self.M_in_n  = int(md["M_in_M0"]),  int(md["M_in_n"])
         self.M_res_M0, self.M_res_n = int(md["M_res_M0"]), int(md["M_res_n"])
@@ -1265,7 +1281,6 @@ class _AffineLowerer:
     def _lower_reservoir_step(self, op):
         g_Win  = self.globals["W_in"]
         g_Wres = self.globals["W_res"]
-        g_lut  = self.globals["lut_table"]
         g_rs_in  = self.globals["row_sum_W_in"]
         g_rs_res = self.globals["row_sum_W_res"]
         K, N = op.K, op.N
@@ -1335,11 +1350,7 @@ class _AffineLowerer:
         # ---- Activation + leaky integration ----
         with _loop(self.b, _ci(N), "iact") as i:
             p = _load1d(self.b, self.pre_buf, i)  # storage_ty
-            # LUT index: sext(p, i32) + lut_offset, then sext to i64 for GEP
-            idx_i32 = self.b.add(self.b.sext(p, _I32),
-                                   self._ci32(self.lut_offset))
-            idx_i64 = self.b.sext(idx_i32, _I64)
-            a = _load1d_global(self.b, g_lut, idx_i64)  # storage_ty
+            a = self._emit_activation(p)          # storage_ty
 
             h_old = _load1d(self.b, self.h_buf, i)
             h_c = self.b.sub(self.b.sext(h_old, _I32),
@@ -1352,6 +1363,111 @@ class _AffineLowerer:
             new_h_total = self.b.add(new_h_c, self._ci32(self.zp_state))
             new_h_q = self._emit_saturate_to_storage(new_h_total)
             _store1d(self.b, self.h_buf, i, new_h_q)
+
+    # ------------------------------------------------------------------
+    # activation — dispatch on lut_kind
+
+    def _emit_activation(self, p_storage):
+        """Compute one tanh value from `p_storage` (storage_ty), return storage_ty."""
+        if self.lut_kind == "direct":
+            return self._emit_act_direct(p_storage)
+        if self.lut_kind == "linear_interp":
+            return self._emit_act_linear_interp(p_storage)
+        if self.lut_kind == "polynomial":
+            return self._emit_act_polynomial(p_storage)
+        raise ValueError(f"unknown lut_kind: {self.lut_kind}")
+
+    def _emit_act_direct(self, p_storage):
+        g_lut = self.globals["lut_table"]
+        idx_i32 = self.b.add(self.b.sext(p_storage, _I32),
+                              self._ci32(self.lut_offset))
+        idx_i64 = self.b.sext(idx_i32, _I64)
+        return _load1d_global(self.b, g_lut, idx_i64)
+
+    def _emit_act_linear_interp(self, p_storage):
+        """Subsampled table + linear interp, bit-exact mirror of Python ref."""
+        g_lut = self.globals["lut_table"]
+        f = self.lut_interp_frac_bits
+        n = self.lut_n_entries
+        # normalized = sext(p, i32) + offset, then t_q = requantize(normalized, idx_M0, idx_n)
+        normalized = self.b.add(self.b.sext(p_storage, _I32),
+                                  self._ci32(self.lut_offset))
+        t_q = self._emit_requantize_i32(normalized, self.lut_idx_M0,
+                                          self.lut_idx_n)
+        # idx = t_q >> f, clipped to [0, n-2]
+        idx_raw = self.b.ashr(t_q, self._ci32(f))
+        zero32 = self._ci32(0)
+        n_minus2 = self._ci32(n - 2)
+        idx_lo = self.b.select(
+            self.b.icmp_signed("<", idx_raw, zero32), zero32, idx_raw,
+        )
+        idx = self.b.select(
+            self.b.icmp_signed(">", idx_lo, n_minus2), n_minus2, idx_lo,
+        )
+        # frac = t_q - (idx << f)
+        frac_q = self.b.sub(t_q, self.b.shl(idx, self._ci32(f)))
+
+        # Load y0 = lut[idx], y1 = lut[idx + 1]; widen to i32 for the lerp math.
+        idx_i64 = self.b.sext(idx, _I64)
+        idx1_i64 = self.b.add(idx_i64, self._ci64(1))
+        y0_s = _load1d_global(self.b, g_lut, idx_i64)
+        y1_s = _load1d_global(self.b, g_lut, idx1_i64)
+        y0_i32 = self.b.sext(y0_s, _I32)
+        y1_i32 = self.b.sext(y1_s, _I32)
+
+        # Lerp in i64: y0 + ((y1 - y0) * frac_q) >> f.
+        dy_i32 = self.b.sub(y1_i32, y0_i32)
+        dy_64 = self.b.sext(dy_i32, _I64)
+        frac_64 = self.b.sext(frac_q, _I64)
+        scaled_64 = self.b.ashr(self.b.mul(dy_64, frac_64), self._ci64(f))
+        interp_i32 = self.b.add(y0_i32, self.b.trunc(scaled_64, _I32))
+        return self._emit_saturate_to_storage(interp_i32)
+
+    def _emit_act_polynomial(self, p_storage):
+        """Taylor degree-3 tanh in Q.qf, clamped to [-1, 1].
+
+        Mirrors `AffineQuantizedExecutor._activate_polynomial` step for step.
+        Computes  y = x - x³/3  for clamped x; both clamps applied in Q.qf.
+        """
+        qf = self.poly_qf_bits
+        # x_qf = requantize(sext(p) - zp_pre, x_M0, x_n), then widen to i64.
+        centered = self.b.sub(self.b.sext(p_storage, _I32),
+                                self._ci32(self.zp_pre))
+        x_qf_i32 = self._emit_requantize_i32(centered,
+                                               self.poly_x_M0, self.poly_x_n)
+        x_qf = self.b.sext(x_qf_i32, _I64)
+        # Clamp |x| <= x_clip_qf
+        clip_pos = self._ci64(self.poly_clip_qf)
+        clip_neg = self._ci64(-self.poly_clip_qf)
+        x_qf = self.b.select(self.b.icmp_signed("<", x_qf, clip_neg),
+                               clip_neg, x_qf)
+        x_qf = self.b.select(self.b.icmp_signed(">", x_qf, clip_pos),
+                               clip_pos, x_qf)
+        # 1/3 in Q.qf (rounded to nearest)
+        third_qf = ((1 << qf) // 3) + (1 if ((1 << qf) % 3) >= 2 else 0)
+        third_const = self._ci64(third_qf)
+        qf_const = self._ci64(qf)
+        # x² = (x*x) >> qf
+        x2_qf = self.b.ashr(self.b.mul(x_qf, x_qf), qf_const)
+        # x³ = (x * x²) >> qf
+        x3_qf = self.b.ashr(self.b.mul(x_qf, x2_qf), qf_const)
+        # x³/3 = (x³ * third) >> qf
+        x3_div3_qf = self.b.ashr(self.b.mul(x3_qf, third_const), qf_const)
+        # y = x - x³/3
+        y_qf = self.b.sub(x_qf, x3_div3_qf)
+        # Clamp y to ±one_qf
+        one_pos = self._ci64(self.poly_one_qf)
+        one_neg = self._ci64(-self.poly_one_qf)
+        y_qf = self.b.select(self.b.icmp_signed("<", y_qf, one_neg),
+                               one_neg, y_qf)
+        y_qf = self.b.select(self.b.icmp_signed(">", y_qf, one_pos),
+                               one_pos, y_qf)
+        # Δq_state = requantize(y_qf -> state scale), then +zp_state
+        y_qf_i32 = self.b.trunc(y_qf, _I32)
+        delta = self._emit_requantize_i32(y_qf_i32,
+                                            self.poly_back_M0, self.poly_back_n)
+        total = self.b.add(delta, self._ci32(self.zp_state))
+        return self._emit_saturate_to_storage(total)
 
     # ------------------------------------------------------------------
     # readout

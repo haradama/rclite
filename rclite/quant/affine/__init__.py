@@ -27,6 +27,7 @@ Public API:
 """
 from .types import AffineParams, AffineQuantConfig
 from .calibrate import calibrate_from_data
+from .lut import LUTStrategy, LUTKind, LUTArtifacts, build_lut_artifacts
 from .quantize import AffineQuantizedModel, quantize_model_affine
 from .executor import AffineQuantizedExecutor
 from .search import search_quantization_affine, AffineSearchResult
@@ -37,6 +38,7 @@ __all__ = [
     "AffineParams",
     "AffineQuantConfig",
     "calibrate_from_data",
+    "LUTStrategy", "LUTKind", "LUTArtifacts", "build_lut_artifacts",
     "AffineQuantizedModel",
     "quantize_model_affine",
     "AffineQuantizedExecutor",
