@@ -124,6 +124,7 @@ def search_quantization_affine(
     *,
     storage_bits: int = 8,
     w_out_storage_bits: Optional[int] = None,
+    lut_strategy=None,
     n_iterations: int = 1,
     calibration_X: Optional[np.ndarray] = None,
     ridge_lambda: Optional[float] = None,
@@ -137,7 +138,10 @@ def search_quantization_affine(
     `calibration_X` defaults to `train_X`. `w_out_storage_bits` selects a
     wider readout-weight width (mixed precision); the QAT refit then fits
     that wider W_out to the quantized state trajectory — the combination
-    that recovers single-output i8 accuracy.
+    that recovers single-output i8 accuracy. `lut_strategy` (a
+    `LUTStrategy`) is passed through to every model built during the
+    search, so the returned `best_qmodel` already uses the chosen tanh
+    approximation.
     """
     if exe.W_out is None:
         raise ValueError("exe has no trained readout — call exe.fit() first")
@@ -161,7 +165,8 @@ def search_quantization_affine(
 
     for it in range(n_iterations + 1):
         # Build the quantized model with the current cfg + W_out
-        qm = quantize_model_affine(rc, exe, cfg, W_out_override=W_out_current)
+        qm = quantize_model_affine(rc, exe, cfg, W_out_override=W_out_current,
+                                    lut_strategy=lut_strategy)
 
         # Held-out evaluation: warm up with train_X, then measure on eval_X.
         qexe_eval = AffineQuantizedExecutor(qm)
