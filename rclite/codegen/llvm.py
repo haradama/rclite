@@ -464,16 +464,17 @@ def emit_module(rc: ReservoirComputer, exe: RCExecutor,
 
 def emit_quantized_module(qmodel, *, passes=None,
                             saturating: bool = True) -> ir.Module:
-    """Build LLVM IR for the integer quantized path (i32 or i16).
+    """Build LLVM IR for the integer quantized path (i32, i16, or i8).
 
     Function signature:
         void rc_predict(int64_t T, storage_t* X, storage_t* Y);
-    where storage_t = int32_t for `I32FixedPoint` and int16_t for `I16FixedPoint`.
+    where storage_t is int32_t / int16_t / int8_t for the corresponding
+    `I32FixedPoint` / `I16FixedPoint` / `I8Symmetric` target.
 
     `saturating=True` wraps inner-loop accumulations and the final
     truncation with `@llvm.sadd.sat.*` and clamping selects, so overflow
-    saturates instead of wrapping. Recommended for i16 (narrow range);
-    cheap to leave on for i32 as well.
+    saturates instead of wrapping. Strongly recommended for i16 / i8
+    (narrow range); cheap to leave on for i32 as well.
     """
     from rclite.quant.ir_builder import build_ir_from_quantized
 
@@ -495,11 +496,12 @@ def _load1d_global(b: ir.IRBuilder, g, idx):
 
 
 class _IntLowerer:
-    """Lower an rclite IR module under `dtype` in {'i32', 'i16'} to LLVM IR.
+    """Lower an rclite IR module under `dtype` in {'i32', 'i16', 'i8'} to LLVM IR.
 
     Parameterized over storage_ty / accum_ty:
         i32 storage : accumulator i64    (mirage default)
         i16 storage : accumulator i32    (-OS / size-constrained)
+        i8  storage : accumulator i32    (smallest footprint; symmetric Q-format)
 
     Fixed-point multiply pattern:
         a:storage * b:storage -> sext to accum -> mul -> ashr -> trunc storage
@@ -513,7 +515,7 @@ class _IntLowerer:
     can exceed i16 range).
 
     `saturating=True` swaps plain integer add for `@llvm.sadd.sat.*` in the
-    matmul accumulators (mostly relevant for i16 where overflow is realistic).
+    matmul accumulators (essential for i8/i16 where overflow is realistic).
     """
 
     def __init__(self, ir_module, *, saturating: bool = True):
@@ -540,9 +542,18 @@ class _IntLowerer:
             self.product_ty = _I32
             self.storage_bits = 16
             self.accum_bits = 32
+        elif dtype == "i8":
+            # i8 storage with i32 accumulator. The product i8*i8 fits in
+            # i16, but we widen to i32 so post-shift accumulation has
+            # plenty of headroom — the per-row matmul sums N terms.
+            self.storage_ty = ir.IntType(8)
+            self.accum_ty = _I32
+            self.product_ty = _I32
+            self.storage_bits = 8
+            self.accum_bits = 32
         else:
             raise ValueError(
-                f"_IntLowerer supports dtype in {{'i32', 'i16'}}, got {dtype!r}"
+                f"_IntLowerer supports dtype in {{'i32', 'i16', 'i8'}}, got {dtype!r}"
             )
         self.saturating = saturating
 
@@ -639,7 +650,12 @@ class _IntLowerer:
 
     def _emit_int_global(self, name, arr):
         import numpy as np
-        np_dtype = np.int16 if self.storage_bits == 16 else np.int32
+        if self.storage_bits == 8:
+            np_dtype = np.int8
+        elif self.storage_bits == 16:
+            np_dtype = np.int16
+        else:
+            np_dtype = np.int32
         flat = np.asarray(arr).reshape(-1).astype(np_dtype)
         ty = ir.ArrayType(self.storage_ty, flat.size)
         g = ir.GlobalVariable(self.module, ty, name=name)
@@ -1185,6 +1201,9 @@ class CompiledQuantizedRC:
         elif sw == 16:
             self._cstorage = ctypes.c_int16
             self._np_storage = np.int16
+        elif sw == 8:
+            self._cstorage = ctypes.c_int8
+            self._np_storage = np.int8
         else:
             raise NotImplementedError(f"storage width {sw} not supported in JIT")
 

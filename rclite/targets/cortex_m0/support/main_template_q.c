@@ -1,15 +1,16 @@
-/* Quantized (i32 fixed-point) demo for the cross-compiled rc_predict.
+/* Quantized fixed-point demo for the cross-compiled rc_predict.
  *
- * The kernel takes i32 inputs at input_scale and returns i32 outputs at
- * state_scale. Float values are never touched on-device — formatting is
- * pure integer arithmetic. Compared against the f64 host reference
- * embedded as state-scaled i32 constants.
+ * The kernel takes storage_t inputs at input_scale and returns storage_t
+ * outputs at state_scale. Float values are never touched on-device —
+ * formatting is pure integer arithmetic. Compared against the host
+ * reference embedded as state-scaled storage_t constants.
  *
- * Template placeholders (filled in by examples/build_microbit_q.py):
+ * Template placeholders (filled in by CortexM0Target.compile_quantized):
  *   @@T_LEN@@        — number of inference steps
  *   @@STATE_FRAC@@   — state Q-format fractional bits
- *   @@X_VALUES_Q@@   — comma-separated input samples (i32 at input_scale)
- *   @@Y_VALUES_Q@@   — comma-separated reference outputs (i32 at state_scale)
+ *   @@STORAGE_T@@    — kernel storage type (int8_t / int16_t / int32_t)
+ *   @@X_VALUES_Q@@   — comma-separated input samples (at input_scale)
+ *   @@Y_VALUES_Q@@   — comma-separated reference outputs (at state_scale)
  */
 #include <stdint.h>
 
@@ -17,10 +18,12 @@
 #define STATE_FRAC     @@STATE_FRAC@@
 #define STATE_SCALE    (1 << STATE_FRAC)
 
-static const int32_t X_q[T_LEN]        = { @@X_VALUES_Q@@ };
-static const int32_t Y_reference_q[T_LEN] = { @@Y_VALUES_Q@@ };
+typedef @@STORAGE_T@@ storage_t;
 
-extern void rc_predict(int64_t T, int32_t *X, int32_t *Y);
+static const storage_t X_q[T_LEN]           = { @@X_VALUES_Q@@ };
+static const storage_t Y_reference_q[T_LEN] = { @@Y_VALUES_Q@@ };
+
+extern void rc_predict(int64_t T, storage_t *X, storage_t *Y);
 
 /* ----------------------------------------------------------------------- *
  * Semihosting (Cortex-M variant: BKPT #0xAB).                             *
@@ -101,14 +104,14 @@ static int fmt_fixed(char *buf, int32_t v, int frac_bits, int decimals)
 
 int main(void)
 {
-    int32_t X[T_LEN];
-    int32_t Y[T_LEN] = {0};
+    storage_t X[T_LEN];
+    storage_t Y[T_LEN] = {0};
     char buf[40];
 
     for (int i = 0; i < T_LEN; i++) X[i] = X_q[i];
 
     sh_puts("==========================================\n");
-    sh_puts("rc_predict (Q-format i32) on micro:bit\n");
+    sh_puts("rc_predict (Q-format, storage=" "@@STORAGE_T@@" ") on micro:bit\n");
     sh_puts("STATE_FRAC = ");
     fmt_int(buf, STATE_FRAC);
     sh_puts(buf);
@@ -117,9 +120,8 @@ int main(void)
     rc_predict((int64_t)T_LEN, X, Y);
 
     int32_t max_abs_diff = 0;
-    int32_t sse_hi = 0;  /* placeholder; we just track max |diff| */
     for (int t = 0; t < T_LEN; t++) {
-        int32_t d = Y[t] - Y_reference_q[t];
+        int32_t d = (int32_t)Y[t] - (int32_t)Y_reference_q[t];
         int32_t ad = (d < 0) ? -d : d;
         if (ad > max_abs_diff) max_abs_diff = ad;
 
@@ -127,13 +129,13 @@ int main(void)
         fmt_int(buf, t);
         sh_puts(buf);
         sh_puts(": X_q=");
-        fmt_int(buf, X[t]);
+        fmt_int(buf, (int32_t)X[t]);
         sh_puts(buf);
         sh_puts("  Y_ref=");
-        fmt_fixed(buf, Y_reference_q[t], STATE_FRAC, 4);
+        fmt_fixed(buf, (int32_t)Y_reference_q[t], STATE_FRAC, 4);
         sh_puts(buf);
         sh_puts("  Y=");
-        fmt_fixed(buf, Y[t], STATE_FRAC, 4);
+        fmt_fixed(buf, (int32_t)Y[t], STATE_FRAC, 4);
         sh_puts(buf);
         sh_puts("\n");
     }

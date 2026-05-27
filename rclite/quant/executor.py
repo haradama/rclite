@@ -13,7 +13,7 @@ import numpy as np
 
 from rclite.core.profile import Topology
 from .model import QuantizedModel
-from ._intops import fixed_mul_i32, trunc_i32, tanh_lut_lookup
+from ._intops import fixed_mul_i32, trunc_i32, tanh_lut_lookup, wrap_to_storage
 
 
 class QuantizedExecutor:
@@ -32,14 +32,20 @@ class QuantizedExecutor:
                 "not available in the integer path"
             )
 
+        self.storage_bits = self.target.storage_bits
         self.shift_input = cfg.weight_frac + cfg.input_frac - cfg.state_frac
         self.shift_recurrent = cfg.weight_frac
         self.leak_q = self.target.quantize_state(qmodel.rc.reservoir.leak_rate, cfg)
         self.one_minus_leak_q = (1 << cfg.state_frac) - self.leak_q
         self.bias_q = self.target.quantize_state(qmodel.rc.reservoir.bias, cfg)
 
-        self.xmin_q = self.target.quantize_state(self.lut.xmin, cfg)
-        self.xmax_q = self.target.quantize_state(self.lut.xmax, cfg)
+        # LUT domain endpoints are kept at full integer precision (not
+        # storage-saturated): with i8 storage and `xmin * state_scale`
+        # potentially exceeding ±128, saturating here would shrink the
+        # LUT lookup's effective domain and diverge from the JIT, which
+        # reads these from module metadata as plain int32.
+        self.xmin_q = int(self.lut.xmin * cfg.state_scale)
+        self.xmax_q = int(self.lut.xmax * cfg.state_scale)
 
         # CSR sparsity for the recurrent matrix (skip zeros). Always built
         # from the full dense W_res_q, since structured topologies (DLR/SCR/DLRB)
@@ -95,27 +101,46 @@ class QuantizedExecutor:
                 acc = int(trunc_i32(np.int64(acc + int(t))))
             pre_q[i] = acc
 
-        # Activation via LUT
-        activated_q = tanh_lut_lookup(
-            pre_q,
-            self.qmodel.lut_table_q,
-            self.xmin_q,
-            self.xmax_q,
-            cfg.state_frac,
+        # JIT narrows the accumulator to storage_ty before storing to pre_arr.
+        # Mirror that narrow so the LUT lookup sees identical bits.
+        pre_q = wrap_to_storage(pre_q, self.storage_bits)
+
+        # Activation via LUT — JIT returns storage_ty from _emit_lut_lookup,
+        # so re-narrow here for parity (no-op when tanh values fit easily).
+        activated_q = wrap_to_storage(
+            tanh_lut_lookup(
+                pre_q,
+                self.qmodel.lut_table_q,
+                self.xmin_q,
+                self.xmax_q,
+                cfg.state_frac,
+            ),
+            self.storage_bits,
         )
 
-        # Leaky integration: state = (1-leak)*state + leak*activated  (state scale)
-        t1 = fixed_mul_i32(
-            self.state_q,
-            np.full_like(self.state_q, self.one_minus_leak_q),
-            cfg.state_frac,
+        # Leaky integration: state = (1-leak)*state + leak*activated  (state scale).
+        # JIT does fixed_mul_to_storage on each side (narrow to storage_ty),
+        # then adds in storage_ty (wraps), then stores to h[i] as storage_ty.
+        t1 = wrap_to_storage(
+            fixed_mul_i32(
+                self.state_q,
+                np.full_like(self.state_q, self.one_minus_leak_q),
+                cfg.state_frac,
+            ),
+            self.storage_bits,
         )
-        t2 = fixed_mul_i32(
-            activated_q,
-            np.full_like(activated_q, self.leak_q),
-            cfg.state_frac,
+        t2 = wrap_to_storage(
+            fixed_mul_i32(
+                activated_q,
+                np.full_like(activated_q, self.leak_q),
+                cfg.state_frac,
+            ),
+            self.storage_bits,
         )
-        self.state_q = trunc_i32(t1.astype(np.int64) + t2.astype(np.int64))
+        self.state_q = wrap_to_storage(
+            t1.astype(np.int64) + t2.astype(np.int64),
+            self.storage_bits,
+        )
         return self.state_q.copy()
 
     # ------------------------------------------------------------------
@@ -143,8 +168,12 @@ class QuantizedExecutor:
             off += q.K
         out += (q.W_out_q[:, off:off + q.N].astype(np.int64)
                  @ state_q.astype(np.int64))
-        # Shift back to state scale and truncate
-        return trunc_i32(out >> cfg.state_frac)
+        # Shift back to state scale, then saturate-truncate to storage range
+        # to mirror JIT's `clamp → trunc` at the end of _lower_readout_linear.
+        shifted = out >> cfg.state_frac
+        lo = -(1 << (self.storage_bits - 1))
+        hi = (1 << (self.storage_bits - 1)) - 1
+        return np.clip(shifted, lo, hi).astype(np.int32)
 
     # ------------------------------------------------------------------
     # Convenience wrappers operating on float arrays
@@ -162,7 +191,9 @@ class QuantizedExecutor:
         scaling_q = int(round(rc.input.input_scaling * cfg.weight_scale))
         diff = u_raw_q.astype(np.int64) - offset_q
         u_pre_64 = (diff * scaling_q) >> cfg.weight_frac
-        return trunc_i32(u_pre_64)
+        # JIT stores u_pre as storage_ty (i8/i16/i32) and reads it back the
+        # same width before the W_in matmul; narrow here to match.
+        return wrap_to_storage(u_pre_64, self.storage_bits)
 
     def predict(self, X: np.ndarray) -> np.ndarray:
         """Run the entire trajectory; X is a (T, K) float array."""

@@ -9,7 +9,9 @@
   - `search_quantization()` — QAT search over state_frac
 """
 from .config import QuantConfig
-from .target import QuantTarget, I32FixedPoint, I16FixedPoint, I8Affine
+from .target import (
+    QuantTarget, I32FixedPoint, I16FixedPoint, I8Symmetric, I8Affine,
+)
 from .tanh_lut import TanhLUTSpec
 from .model import QuantizedModel
 from .quantize import quantize_model, quantize_W_out
@@ -20,7 +22,7 @@ from .online import IntegerLMSLearner
 
 __all__ = [
     "QuantConfig",
-    "QuantTarget", "I32FixedPoint", "I16FixedPoint", "I8Affine",
+    "QuantTarget", "I32FixedPoint", "I16FixedPoint", "I8Symmetric", "I8Affine",
     "TanhLUTSpec",
     "QuantizedModel",
     "quantize_model", "quantize_W_out",

@@ -25,6 +25,23 @@ def fixed_mul_i32(a: np.ndarray, b: np.ndarray, shift: int) -> np.ndarray:
     return trunc_i32(prod >> shift)
 
 
+def wrap_to_storage(x: np.ndarray, storage_bits: int) -> np.ndarray:
+    """Wrap an integer array to signed `storage_bits` two's-complement, return i32.
+
+    Mirrors what the LLVM kernel does at every `trunc(value, storage_ty)`:
+    take the low `storage_bits` bits and re-interpret as a signed value.
+    The result is returned as int32 so downstream NumPy arithmetic still
+    has headroom (matching how the JIT sign-extends the loaded storage
+    value back to the accumulator width).
+    """
+    if storage_bits >= 32:
+        return trunc_i32(x.astype(np.int64))
+    mask = (1 << storage_bits) - 1
+    sign_bit = 1 << (storage_bits - 1)
+    u = x.astype(np.int64) & mask
+    return ((u ^ sign_bit) - sign_bit).astype(np.int32)
+
+
 def fixed_mul_scalar_i32(a: int, b: int, shift: int) -> int:
     prod = (int(a) * int(b)) >> shift
     return _wrap_i32_scalar(prod)

@@ -1,9 +1,11 @@
 """Quantization target — encodes the storage type, accumulator type, and the
 fixed-point arithmetic rules used by a particular hardware target.
 
-`I32FixedPoint` is the only concrete target shipped today (mirage-style:
-i32 storage, i64 accumulator, Q-format with per-quantity fractional bits).
-Adding `I16FixedPoint` or `I8Affine` is an exercise in subclassing this.
+Concrete targets:
+  - `I32FixedPoint` — mirage-style i32 storage, i64 accumulator.
+  - `I16FixedPoint` — i16 storage, i32 accumulator.
+  - `I8Symmetric`   — i8 storage, i32 accumulator (symmetric Q-format).
+  - `I8Affine`      — skeleton-only; see class docstring for the roadmap.
 """
 from __future__ import annotations
 from abc import ABC, abstractmethod
@@ -102,6 +104,37 @@ class I16FixedPoint(QuantTarget):
     name: ClassVar[str] = "i16"
     storage_bits: ClassVar[int] = 16
     accum_bits: ClassVar[int] = 32
+
+
+@dataclass(frozen=True)
+class I8Symmetric(QuantTarget):
+    """i8 storage, i32 accumulator. Symmetric Q-format (zero_point = 0).
+
+    A stepping stone between `I16FixedPoint` and the asymmetric `I8Affine`.
+    Reuses the existing `QuantConfig` and codegen path; only the storage
+    width shrinks. The per-row matmul accumulator widens to i32 to survive
+    sums over N terms.
+
+    State range constraint: with leak rate in [0, 1] the leaky-integration
+    constant `(1 << state_frac) - leak_q` must fit in signed i8, i.e.
+    `state_frac <= 6`. Activation and weight values are also clamped to
+    [-128, 127] at quantize-time; choose Q-format so peak magnitudes
+    stay in this range. For TFLM-class footprint with asymmetric scales
+    and per-tensor zero points, use `I8Affine` instead (when implemented).
+    """
+    name: ClassVar[str] = "i8"
+    storage_bits: ClassVar[int] = 8
+    accum_bits: ClassVar[int] = 32
+
+    MAX_STATE_FRAC: ClassVar[int] = 6
+
+    def validate_config(self, cfg: QuantConfig) -> None:
+        if cfg.state_frac > self.MAX_STATE_FRAC:
+            raise ValueError(
+                f"I8Symmetric requires state_frac <= {self.MAX_STATE_FRAC} "
+                f"(so (1<<state_frac) fits in signed i8), got "
+                f"state_frac={cfg.state_frac}"
+            )
 
 
 @dataclass(frozen=True)
