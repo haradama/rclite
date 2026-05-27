@@ -18,6 +18,7 @@ from rclite.runtime import RCExecutor
 from rclite.targets import (
     Target, CompiledArtifact, RunResult,
     HostTarget, CortexM0Target, MicrobitV1, Microbit,
+    WasmTarget, Wasmtime,
 )
 
 
@@ -117,6 +118,73 @@ def test_microbit_v1_board_constants():
     assert board.ram_kb == 16
     assert board.qemu_machine == "microbit"
     assert board.linker_script == "nrf51.ld"
+
+
+def test_wasmtime_class_inherits_wasm_target():
+    assert issubclass(Wasmtime, WasmTarget)
+    wt = Wasmtime()
+    assert wt.triple == "wasm32-wasip1"
+    assert wt.rust_target == "wasm32-wasip1"
+    assert wt.dtype == "f32"
+    assert wt.simd is True
+    assert wt.name.endswith("+simd128")
+
+
+def test_wasm_target_simd_off_drops_feature():
+    wt = Wasmtime(simd=False)
+    assert wt.simd is False
+    assert wt._features() == ""
+    assert "simd128" not in wt.name
+
+
+def test_wasm_target_rejects_non_f32():
+    expect_raises(ValueError, WasmTarget, dtype="f64")
+
+
+def test_wasm_target_requires_test_inputs():
+    rc, exe, _ = _build()
+    with tempfile.TemporaryDirectory() as td:
+        expect_raises(ValueError, Wasmtime().compile, rc, exe,
+                      output_dir=td)
+
+
+def test_wasmtime_full_pipeline_simd():
+    if shutil.which("rustc") is None:
+        return  # skip
+    if shutil.which("wasmtime") is None:
+        return  # skip
+    rc, exe, sample = _build()
+    with tempfile.TemporaryDirectory() as td:
+        target = Wasmtime(simd=True)
+        artifact = target.compile(rc, exe, output_dir=td, test_inputs=sample)
+        assert artifact.binary is not None and artifact.binary.exists()
+        assert artifact.binary.suffix == ".wasm"
+        assert artifact.metadata["simd"] is True
+        assert artifact.metadata["features"] == "+simd128"
+        # The wasm32 assembly should contain v128 ops when SIMD is on.
+        asm = (artifact.output_dir / "rc_predict.s").read_text()
+        assert "v128" in asm or "f32x4" in asm, \
+            "expected SIMD instructions in rc_predict.s with simd=True"
+        result = target.run(artifact)
+        assert result.success, f"wasmtime output:\n{result.output}"
+
+
+def test_wasmtime_full_pipeline_scalar():
+    if shutil.which("rustc") is None:
+        return  # skip
+    if shutil.which("wasmtime") is None:
+        return  # skip
+    rc, exe, sample = _build()
+    with tempfile.TemporaryDirectory() as td:
+        target = Wasmtime(simd=False)
+        artifact = target.compile(rc, exe, output_dir=td, test_inputs=sample)
+        assert artifact.metadata["simd"] is False
+        # Scalar build must not emit v128 ops.
+        asm = (artifact.output_dir / "rc_predict.s").read_text()
+        assert "v128" not in asm and "f32x4" not in asm, \
+            "unexpected SIMD instructions in scalar build"
+        result = target.run(artifact)
+        assert result.success, f"wasmtime output:\n{result.output}"
 
 
 def test_target_run_result_failure_path():
