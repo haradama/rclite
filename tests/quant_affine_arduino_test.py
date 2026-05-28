@@ -71,13 +71,14 @@ def _python_qy(qm, X_float):
     return out
 
 
-def _host_c_qy(qm, X_float, tmp: pathlib.Path):
+def _host_c_qy(qm, X_float, tmp: pathlib.Path, allow_i32_accum=False):
     """Compile the emitted C kernel with host gcc and return its q_y."""
     cfg = qm.config
     ctype = "int8_t" if qm.storage_bits == 8 else "int16_t"
     q_x = cfg.input.quantize_array(X_float).astype(np.int64).reshape(-1)
     T = X_float.shape[0]
-    (tmp / "kernel.c").write_text(emit_affine_kernel_c(qm))
+    (tmp / "kernel.c").write_text(
+        emit_affine_kernel_c(qm, allow_i32_accum=allow_i32_accum))
     main = "\n".join([
         "#include <stdint.h>", "#include <stdio.h>",
         f'extern void rc_predict(int32_t, const {ctype}*, {ctype}*);',
@@ -104,11 +105,16 @@ def _host_c_qy(qm, X_float, tmp: pathlib.Path):
 def _assert_host_parity(qm, X_eval):
     if not _HAVE_GCC:
         return  # no host compiler; skip
-    with tempfile.TemporaryDirectory() as td:
-        a = _python_qy(qm, X_eval)
-        b = _host_c_qy(qm, X_eval, pathlib.Path(td))
-        diff = int(np.max(np.abs(a - b)))
-        assert diff == 0, f"host C vs Python q_y diff = {diff}"
+    a = _python_qy(qm, X_eval)
+    # Both accumulator modes must be bit-exact with the Python reference:
+    # the default i64 path (used by the Arduino target) and the i32-accum
+    # path (faster, used where the compiler handles it).
+    for allow_i32 in (False, True):
+        with tempfile.TemporaryDirectory() as td:
+            b = _host_c_qy(qm, X_eval, pathlib.Path(td), allow_i32_accum=allow_i32)
+            diff = int(np.max(np.abs(a - b)))
+            assert diff == 0, \
+                f"host C vs Python q_y diff = {diff} (allow_i32_accum={allow_i32})"
 
 
 # ---------------------------------------------------------------- C emitter shape

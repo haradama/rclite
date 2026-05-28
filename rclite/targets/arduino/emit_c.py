@@ -43,7 +43,19 @@ def _arr(name: str, ctype: str, values, rd_macro: str) -> str:
 
 
 def emit_affine_kernel_c(qmodel: AffineQuantizedModel,
-                          fn_name: str = "rc_predict") -> str:
+                          fn_name: str = "rc_predict",
+                          *, allow_i32_accum: bool = False) -> str:
+    """Emit the affine kernel as portable C.
+
+    `allow_i32_accum` enables i32 (instead of i64) matmul accumulators
+    wherever the worst-case magnitude provably fits — cheaper MACs
+    (__mulhisi3 vs __muldi3) on 8-bit targets. It is **off by default**
+    because avr-gcc 7.x miscompiles the i32 widening-MAC loop into a hang
+    (the code is bit-exact on modern host gcc / newer avr-gcc, so the
+    Arduino target keeps it off and the host parity tests exercise it on).
+    The requantize always uses the union high-word trick, which is safe
+    everywhere and removes the libgcc __ashrdi3 64-bit-shift loop.
+    """
     rc = qmodel.rc
     cfg = qmodel.config
     sb = qmodel.storage_bits
@@ -132,11 +144,24 @@ def emit_affine_kernel_c(qmodel: AffineQuantizedModel,
     a("")
 
     # ---- helpers ----
-    a("static int32_t rc_rq(int32_t x, int32_t M0, uint8_t n){")
-    a("    int64_t p = (int64_t)x * (int64_t)M0;")
-    a("    if (n) p += ((int64_t)1 << (n - 1));")
-    a("    return (int32_t)(p >> n);")
+    # Requantize = round(x * M0 / 2^n). Two AVR-specific tricks:
+    #   * int32 operands keep gcc's widening-multiply detection
+    #     (32x32->64 = __mulsidi3, ~13 instr) instead of a full __muldi3.
+    #   * The final 64-bit `>> n` is done by hand: avr-gcc (7.x) routes ALL
+    #     64-bit shifts — even constant ones — to the libgcc __ashrdi3 loop,
+    #     so instead we grab the high 32-bit word through a union (free
+    #     register access on little-endian AVR/x86) and finish with a single
+    #     32-bit shift, which gcc *does* inline. always_inline + the constant
+    #     n at each call site fold the rounding add and the branch away.
+    a("typedef union { int64_t q; struct { uint32_t lo; int32_t hi; } w; } rc_i64u;")
+    a("static inline __attribute__((always_inline)) "
+      "int32_t rc_rq_(int32_t x, int32_t M0, uint8_t n){")
+    a("    rc_i64u u;")
+    a("    u.q = (int64_t)x * (int64_t)M0 + ((int64_t)1 << (n - 1));")
+    a("    if (n >= 32) return u.w.hi >> (n - 32);")
+    a("    return (int32_t)((u.w.lo >> n) | ((uint32_t)u.w.hi << (32 - n)));")
     a("}")
+    a("#define RC_RQ(x, M0, N) rc_rq_((x), (M0), (N))")
     a("static int32_t rc_clamp32(int64_t v){")
     a("    if (v < (int64_t)(-2147483647-1)) return (-2147483647-1);")
     a("    if (v > (int64_t)2147483647) return 2147483647;")
@@ -158,7 +183,7 @@ def emit_affine_kernel_c(qmodel: AffineQuantizedModel,
         f = strat.interp_frac_bits
         n = strat.n_entries
         a(f"    int32_t norm = pre + {qmodel.lut_offset};")
-        a(f"    int32_t tq = rc_rq(norm, {art.idx_M0}, {art.idx_n});")
+        a(f"    int32_t tq = RC_RQ(norm, {art.idx_M0}, {art.idx_n});")
         a(f"    int32_t idx = tq >> {f};")
         a(f"    if (idx < 0) idx = 0; if (idx > {n - 2}) idx = {n - 2};")
         a(f"    int32_t frac = tq - (idx << {f});")
@@ -169,7 +194,7 @@ def emit_affine_kernel_c(qmodel: AffineQuantizedModel,
     elif strat.kind == LUTKind.POLYNOMIAL:
         qf = strat.poly_qf_bits
         a(f"    int32_t cx = pre - {cfg.pre.zero_point};")
-        a(f"    int64_t x = (int64_t)rc_rq(cx, {art.x_to_qf_M0}, {art.x_to_qf_n});")
+        a(f"    int64_t x = (int64_t)RC_RQ(cx, {art.x_to_qf_M0}, {art.x_to_qf_n});")
         a(f"    if (x < {-art.x_clip_qf}) x = {-art.x_clip_qf};")
         a(f"    if (x > {art.x_clip_qf}) x = {art.x_clip_qf};")
         a(f"    int64_t x2 = (x * x) >> {qf};")
@@ -178,7 +203,7 @@ def emit_affine_kernel_c(qmodel: AffineQuantizedModel,
         a(f"    int64_t y = (x * outer) >> {qf};")
         a(f"    if (y < {-art.one_qf}) y = {-art.one_qf};")
         a(f"    if (y > {art.one_qf}) y = {art.one_qf};")
-        a(f"    int32_t d = rc_rq((int32_t)y, {art.qf_to_state_M0}, {art.qf_to_state_n});")
+        a(f"    int32_t d = RC_RQ((int32_t)y, {art.qf_to_state_M0}, {art.qf_to_state_n});")
         a(f"    return rc_sat(d + {cfg.state.zero_point});")
     a("}")
     a("")
@@ -199,12 +224,29 @@ def emit_affine_kernel_c(qmodel: AffineQuantizedModel,
     if qmodel.has_integer_preprocess:
         a("        for (k = 0; k < RC_K; k++) {")
         a(f"            int32_t cx = (int32_t)X[t*RC_K + k] - {zp_input};")
-        a(f"            int32_t up = rc_rq(cx, {qmodel.pre_M0}, {qmodel.pre_n}) + {qmodel.pre_const};")
+        a(f"            int32_t up = RC_RQ(cx, {qmodel.pre_M0}, {qmodel.pre_n}) + {qmodel.pre_const};")
         a("            rc_u[k] = rc_sat(up);")
         a("        }")
         u_expr = "rc_u[k]"
     else:
         u_expr = "X[t*RC_K + k]"
+
+    # Accumulator widths: i32 where products+sums provably fit (i8 models,
+    # bounded N) → cheap MACs (__mulhisi3/__mulsi3) instead of i64 __muldi3;
+    # i64 only when an accumulator could overflow (i16 reservoirs). Values are
+    # identical to the i64 path within the safe range, so parity is preserved.
+    if allow_i32_accum:
+        res_bits, ro_bits = _accum_bits(qmodel, is_structured,
+                                         chain_weight_q, chain_feedback_q)
+    else:
+        res_bits, ro_bits = 64, 64   # safe everywhere (avr-gcc 7.x)
+    res_t = "int32_t" if res_bits == 32 else "int64_t"
+    ro_t = "int32_t" if ro_bits == 32 else "int64_t"
+    res_cast = "(int32_t)" if res_bits == 32 else "(int64_t)"
+    ro_cast = "(int32_t)" if ro_bits == 32 else "(int64_t)"
+
+    def _clamp(expr, bits):
+        return expr if bits == 32 else f"rc_clamp32({expr})"
 
     # reservoir pre-activation
     a("        for (i = 0; i < RC_N; i++) {")
@@ -212,16 +254,18 @@ def emit_affine_kernel_c(qmodel: AffineQuantizedModel,
     a("            for (k = 0; k < RC_K; k++)")
     a(f"                acc_in += (int32_t){rd_s}(&rc_W_in[i*RC_K + k]) * (int32_t)({u_expr});")
     a(f"            acc_in -= {zp_upre} * RC_RD32(&rc_row_sum_W_in[i]);")
-    a(f"            int32_t rq_in = rc_rq(rc_clamp32(acc_in), {qmodel.M_in_M0}, {qmodel.M_in_n});")
+    a(f"            int32_t rq_in = RC_RQ(acc_in, {qmodel.M_in_M0}, {qmodel.M_in_n});")
     # W_res contribution
     if is_structured:
-        _emit_chain_c(a, topo, N, chain_weight_q, chain_feedback_q, zp_state, rd_s)
+        _emit_chain_c(a, topo, N, chain_weight_q, chain_feedback_q,
+                       zp_state, rd_s, res_t, res_cast)
     else:
-        a("            int64_t acc_res = 0;")
+        a(f"            {res_t} acc_res = 0;")
         a("            for (j = 0; j < RC_N; j++)")
-        a(f"                acc_res += (int64_t){rd_s}(&rc_W_res[i*RC_N + j]) * (int64_t)rc_h[j];")
-        a(f"            acc_res -= (int64_t){zp_state} * (int64_t)RC_RD32(&rc_row_sum_W_res[i]);")
-    a(f"            int32_t rq_res = rc_rq(rc_clamp32(acc_res), {qmodel.M_res_M0}, {qmodel.M_res_n});")
+        a(f"                acc_res += {res_cast}{rd_s}(&rc_W_res[i*RC_N + j]) * {res_cast}rc_h[j];")
+        a(f"            acc_res -= {res_cast}{zp_state} * {res_cast}RC_RD32(&rc_row_sum_W_res[i]);")
+    a(f"            int32_t rq_res = RC_RQ({_clamp('acc_res', res_bits)}, "
+      f"{qmodel.M_res_M0}, {qmodel.M_res_n});")
     a(f"            rc_pre[i] = rc_sat({zp_pre + qmodel.bias_pre} + rq_in + rq_res);")
     a("        }")
 
@@ -230,7 +274,7 @@ def emit_affine_kernel_c(qmodel: AffineQuantizedModel,
     a("            int32_t act = rc_activate((int32_t)rc_pre[i]);")
     a(f"            int32_t hc = (int32_t)rc_h[i] - {zp_state};")
     a(f"            int32_t ac = act - {zp_state};")
-    a(f"            int32_t d = rc_rq(ac - hc, {qmodel.leak_M0}, {qmodel.leak_n});")
+    a(f"            int32_t d = RC_RQ(ac - hc, {qmodel.leak_M0}, {qmodel.leak_n});")
     a(f"            rc_h[i] = rc_sat({zp_state} + hc + d);")
     a("        }")
 
@@ -241,21 +285,23 @@ def emit_affine_kernel_c(qmodel: AffineQuantizedModel,
     a("        for (m = 0; m < RC_M; m++) {")
     a(f"            int32_t y = {zp_output};")
     if rc.readout.include_bias:
-        a(f"            y += rc_rq(rc_clamp32((int64_t){rd_w}(&rc_W_out[m*RC_F + {off_bias}])), "
+        a(f"            y += RC_RQ((int32_t){rd_w}(&rc_W_out[m*RC_F + {off_bias}]), "
           f"{qmodel.M_out_bias_M0}, {qmodel.M_out_bias_n});")
     if rc.readout.include_input:
-        a("            int64_t acc_i = 0;")
+        a(f"            {ro_t} acc_i = 0;")
         a("            for (k = 0; k < RC_K; k++)")
-        a(f"                acc_i += (int64_t){rd_w}(&rc_W_out[m*RC_F + {off_input} + k]) "
-          f"* (int64_t)X[t*RC_K + k];")
-        a(f"            acc_i -= (int64_t){zp_input} * (int64_t)RC_RD32(&rc_row_sum_Wout_input[m]);")
-        a(f"            y += rc_rq(rc_clamp32(acc_i), {qmodel.M_out_input_M0}, {qmodel.M_out_input_n});")
-    a("            int64_t acc_s = 0;")
+        a(f"                acc_i += {ro_cast}{rd_w}(&rc_W_out[m*RC_F + {off_input} + k]) "
+          f"* {ro_cast}X[t*RC_K + k];")
+        a(f"            acc_i -= {ro_cast}{zp_input} * {ro_cast}RC_RD32(&rc_row_sum_Wout_input[m]);")
+        a(f"            y += RC_RQ({_clamp('acc_i', ro_bits)}, "
+          f"{qmodel.M_out_input_M0}, {qmodel.M_out_input_n});")
+    a(f"            {ro_t} acc_s = 0;")
     a("            for (j = 0; j < RC_N; j++)")
-    a(f"                acc_s += (int64_t){rd_w}(&rc_W_out[m*RC_F + {off_state} + j]) "
-      f"* (int64_t)rc_h[j];")
-    a(f"            acc_s -= (int64_t){zp_state} * (int64_t)RC_RD32(&rc_row_sum_Wout_state[m]);")
-    a(f"            y += rc_rq(rc_clamp32(acc_s), {qmodel.M_out_state_M0}, {qmodel.M_out_state_n});")
+    a(f"                acc_s += {ro_cast}{rd_w}(&rc_W_out[m*RC_F + {off_state} + j]) "
+      f"* {ro_cast}rc_h[j];")
+    a(f"            acc_s -= {ro_cast}{zp_state} * {ro_cast}RC_RD32(&rc_row_sum_Wout_state[m]);")
+    a(f"            y += RC_RQ({_clamp('acc_s', ro_bits)}, "
+      f"{qmodel.M_out_state_M0}, {qmodel.M_out_state_n});")
     a("            Y[t*RC_M + m] = rc_sat(y);")
     a("        }")
     a("    }")
@@ -264,19 +310,60 @@ def emit_affine_kernel_c(qmodel: AffineQuantizedModel,
     return "\n".join(L)
 
 
-def _emit_chain_c(a, topo, N, cw_q, cf_q, zp_state, rd_s):
-    """Emit the structured-topology W_res contribution into `acc_res` (int64)."""
-    a("            int64_t acc_res = 0;")
+def _accum_bits(qmodel, is_structured, chain_weight_q, chain_feedback_q):
+    """Pick i32 (32) or i64 (64) accumulator widths for the reservoir matmul
+    and the readout, choosing i32 only when the worst-case magnitude provably
+    fits a signed i32 with margin. i32 is exact-equal to i64 in that range, so
+    bit-exactness with the Python/JIT reference is preserved."""
+    cfg = qmodel.config
+    rc = qmodel.rc
+    sb = qmodel.storage_bits
+    zp_state = abs(cfg.state.zero_point)
+    MARGIN = 1 << 30                 # leave a bit of headroom under 2^31
+    hmag = 1 << sb                   # bound on |h_q - zp_state|
+
+    # --- reservoir ---
+    if sb != 8:
+        res_bits = 64
+    elif is_structured:
+        # at most two chain terms per row
+        res_max = (abs(chain_weight_q) + abs(chain_feedback_q)) * hmag
+        res_bits = 32 if res_max < MARGIN else 64
+    else:
+        row_abs = int(np.abs(qmodel.W_res_q.astype(np.int64)).sum(axis=1).max())
+        rs_abs = int(np.abs(qmodel.row_sum_W_res).max())
+        res_max = row_abs * hmag + zp_state * rs_abs
+        res_bits = 32 if res_max < MARGIN else 64
+
+    # --- readout (state block dominates) ---
+    if sb != 8:
+        ro_bits = 64
+    else:
+        K, N = qmodel.K, qmodel.N
+        off = 1 if rc.readout.include_bias else 0
+        if rc.readout.include_input:
+            off += K
+        Wstate = qmodel.W_out_q[:, off:off + N].astype(np.int64)
+        row_abs = int(np.abs(Wstate).sum(axis=1).max())
+        rs_abs = int(np.abs(qmodel.row_sum_Wout_state).max())
+        ro_max = row_abs * hmag + zp_state * rs_abs
+        ro_bits = 32 if ro_max < MARGIN else 64
+    return res_bits, ro_bits
+
+
+def _emit_chain_c(a, topo, N, cw_q, cf_q, zp_state, rd_s, res_t, cast):
+    """Emit the structured-topology W_res contribution into `acc_res`."""
+    a(f"            {res_t} acc_res = 0;")
     if topo == "SCR":
         a(f"            {{ int32_t ip = (i == 0) ? {N - 1} : (i - 1);")
-        a(f"              acc_res = (int64_t){cw_q} * ((int32_t)rc_h[ip] - {zp_state}); }}")
+        a(f"              acc_res = {cast}{cw_q} * {cast}((int32_t)rc_h[ip] - {zp_state}); }}")
     elif topo == "DLR":
         a("            if (i > 0)")
-        a(f"                acc_res = (int64_t){cw_q} * ((int32_t)rc_h[i-1] - {zp_state});")
+        a(f"                acc_res = {cast}{cw_q} * {cast}((int32_t)rc_h[i-1] - {zp_state});")
     elif topo == "DLRB":
         a("            if (i > 0)")
-        a(f"                acc_res += (int64_t){cw_q} * ((int32_t)rc_h[i-1] - {zp_state});")
+        a(f"                acc_res += {cast}{cw_q} * {cast}((int32_t)rc_h[i-1] - {zp_state});")
         a("            if (i < RC_N - 1)")
-        a(f"                acc_res += (int64_t){cf_q} * ((int32_t)rc_h[i+1] - {zp_state});")
+        a(f"                acc_res += {cast}{cf_q} * {cast}((int32_t)rc_h[i+1] - {zp_state});")
     else:
         raise ValueError(f"_emit_chain_c: unexpected topology {topo}")
