@@ -1,0 +1,8 @@
+# generated artifacts (reproducible via the scripts)
+out/*
+!out/RESULTS.md
+firmware/build/
+firmware/test_data.*
+firmware/esn_test_data.*
+firmware/rclite_i8/
+firmware/rclite_i16/

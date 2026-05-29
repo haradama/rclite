@@ -1,0 +1,5 @@
+# generated artifacts (reproducible via the scripts)
+out/*
+!out/RESULTS.md
+fvp/out/
+fvp/__pycache__/
