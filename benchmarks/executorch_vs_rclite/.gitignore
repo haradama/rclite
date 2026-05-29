@@ -3,3 +3,4 @@ out/*
 !out/RESULTS.md
 fvp/out/
 fvp/__pycache__/
+fvp/rclite_m55/build/

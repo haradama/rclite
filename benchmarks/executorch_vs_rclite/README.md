@@ -7,24 +7,33 @@ ExecuTorch and via rclite, so the numbers line up across all three stacks
 
 See **[out/RESULTS.md](out/RESULTS.md)** for the generated tables.
 
-## Headline
+## Headline — all three on the SAME Cortex-M55 (Corstone-300 FVP)
 
-* **Run in ExecuTorch's real environment.** ExecuTorch's MCU target is
-  **Cortex-M55 + Ethos-U NPU on the Arm Corstone FVP** (no 8-bit-AVR / Cortex-M0
-  path). We built that environment (Corstone-300 FVP + arm-gnu-toolchain + Vela
-  + TOSA tools) and ran the **same ESN through the full ExecuTorch arm flow onto
-  the FVP** — export → EthosU int8 quantize → Vela → `.pte` → `arm_executor_runner`
-  → FVP. It runs and verifies **bit-exact** vs the AOT reference.
-* **On-target footprint** (Cortex-M55 + Ethos-U55): ExecuTorch+Ethos-U **runtime
-  code ~418 KB**, `.pte` 7.6 KB, tensor arena 1.6 KB, NPU ~4.0 K cycles/step
-  (Vela est.).
-* **Contrast with rclite** (same ESN, bare **Cortex-M0, no NPU**): a complete
-  **3.4 KB** firmware / **364 B** RAM, bit-exact, 2.7% (i8) / 0.42% (i16) NRMSE.
-  ExecuTorch needs a Cortex-M55 **+ Ethos-U55 NPU** and a ~418 KB runtime;
-  rclite's *whole* firmware is ~3 KB of pure-CPU code.
-* int8 PTQ of the ESN is comparably lossy across stacks (ExecuTorch 41%, rclite
-  38%); rclite's cheap readout-only QAT recovers it to 2.7% (i8) / 0.42% (i16),
-  with no equivalent in the ExecuTorch flow.
+The identical 80-unit ESN on the identical M55 FVP, three ways (all bit-exact):
+
+| stack | engine | code (`.text`) | model + RAM | CPU cyc/step¹ | NRMSE |
+|---|---|--:|--:|--:|--:|
+| ExecuTorch + Ethos-U55 | NPU (int8) | 418 KB | .pte 7.6 KB + arena 1.6 KB | 4,640 (+6,329 NPU) | 41% PTQ |
+| ExecuTorch CPU-only | M55 CPU (float32) | 801 KB | .pte 30 KB + arena 28 KB | 536,229 | 0.30% (float32, **not** quantized) |
+| **rclite** | M55 CPU (int8) | **2.3 KB** *(whole fw)* | **364 B** | **848** | 2.7%/0.42% QAT |
+
+* On the **identical M55 CPU**, rclite is **~349× smaller code** and **~632× fewer
+  CPU cycles** than ExecuTorch CPU-only — and even vs the **NPU-accelerated**
+  ExecuTorch, rclite on the bare CPU uses **~5× fewer host CPU cycles** and
+  **~182× less code** (a tiny inference spends thousands of CPU cycles just
+  dispatching to the NPU through the interpreter).
+* The ESN runs **bit-exact** through ExecuTorch's full arm flow on the Corstone-300
+  FVP (export → EthosU int8 quantize → Vela → `.pte` → `arm_executor_runner`).
+* int8 PTQ is comparably lossy on both stacks (ExecuTorch 41%, rclite 38%);
+  rclite's cheap readout-only QAT recovers it to 2.7% (i8) / 0.42% (i16).
+* rclite is not limited to M55: the same ESN also runs on a bare **Cortex-M0**
+  (no FPU/NPU) in a complete **3.4 KB** firmware — below ExecuTorch's MCU floor.
+
+¹ FVP cycle model (rclite: M55 DWT CYCCNT; ExecuTorch: `arm_perf_monitor`) — same
+FVP, not silicon-cycle-accurate. Part of the gap is rclite exploiting the SCR
+structure (scalar chain vs dense 80×80), part is codegen vs interpreter + int8 vs
+float (ExecuTorch CPU-only is float32: its int8 portable path lacks per-channel
+quantized out-variants in this build).
 
 ## Files
 
@@ -34,7 +43,8 @@ See **[out/RESULTS.md](out/RESULTS.md)** for the generated tables.
 | `executorch_demo.py` | PyTorch/ET | build the same ESN; float/int8 (PT2E) host accuracy; export portable-float + XNNPACK-int8 `.pte`; host-runtime run |
 | `report_pt.py` | any | combine host + on-target FVP + rclite numbers → `out/RESULTS.md` |
 | `fvp/mg_esn.py` | ET | ESN cell model module for `aot_arm_compiler` |
-| `fvp/run_fvp.sh` | — | deploy + run the ESN on the Corstone-300 FVP (Cortex-M55 + Ethos-U55), write `out/fvp_result.json` |
+| `fvp/run_fvp.sh` | — | deploy + run the ESN on the Corstone-300 FVP (Cortex-M55 + Ethos-U55 NPU; also `--no_delegate` for CPU-only) |
+| `fvp/rclite_m55/` | — | bare-metal rclite ESN firmware for the **same** Cortex-M55 FVP (`build_run_m55.sh`, SSE-300 linker, DWT-cycle main) |
 | `run_all.sh` | — | chains the host steps |
 
 ## Reproduce
@@ -68,9 +78,15 @@ VIRTUAL_ENV=/tmp/ptenv uv pip install ethos-u-vela cmake ninja scikit-build-core
 # build tosa_serializer + tosa_reference_model from arm-scratch/tosa-tools
 # the FVP links libpython3.9 — provide one, e.g.  uv python install 3.9
 
-# deploy + run the ESN on the FVP (Cortex-M55 + Ethos-U55):
+# ExecuTorch on the FVP — NPU (Ethos-U) and CPU-only (float32, --no_delegate):
 bash benchmarks/executorch_vs_rclite/fvp/run_fvp.sh
-.venv/bin/python benchmarks/executorch_vs_rclite/report_pt.py   # picks up fvp/out/fvp_result.json
+( cd /tmp/executorch && bash examples/arm/run.sh --model_name=.../fvp/mg_esn.py \
+    --target=ethos-u55-128 --no_delegate --no_quantize --bundleio )   # CPU-only
+
+# rclite on the SAME Cortex-M55 FVP (CPU, int8), bit-exact, DWT cycle count:
+bash benchmarks/executorch_vs_rclite/fvp/rclite_m55/build_run_m55.sh
+
+.venv/bin/python benchmarks/executorch_vs_rclite/report_pt.py   # reads fvp/out/*.json
 ```
 
 `run_fvp.sh` documents every env quirk (PATH/LD_LIBRARY_PATH, the

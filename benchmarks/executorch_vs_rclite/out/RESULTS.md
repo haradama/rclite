@@ -4,19 +4,21 @@ Framework: **PyTorch + ExecuTorch** (torch 2.12.0+cu130). Task: Mackey-Glass one
 
 > **ExecuTorch's MCU target is Cortex-M55 + Ethos-U NPU on the Arm Corstone FVP** (it does not target 8-bit AVR or Cortex-M0). We built that environment (Corstone-300 FVP + arm-gnu-toolchain + Vela + TOSA tools) and ran the ESN through the full ExecuTorch arm flow — export → EthosU int8 quantize → Vela → `.pte` → `arm_executor_runner` → FVP. It runs and verifies **bit-exact** vs the AOT reference.
 
-## On-target: Arm Corstone-300 FVP (Cortex-M55 + Ethos-U55)
+## Same target — all three on one Cortex-M55 (Corstone-300 FVP)
 
-FVP: `FVP_Corstone_SSE-300_Ethos-U55 (Fast Models 11.27.42)`.
+Identical 80-unit ESN, identical FVP/CPU. ExecuTorch is shown both with the Ethos-U55 NPU and CPU-only (portable kernels); rclite is its codegen kernel on the same M55 core. All verify **bit-exact** vs the reference.
 
-| stack (same ESN) | target | runtime code | `.pte` | arena | NPU cyc/step¹ | int8 NRMSE |
-|---|---|--:|--:|--:|--:|--:|
-| **ExecuTorch** (Ethos-U int8) | Cortex-M55 **+ Ethos-U55 NPU** | ~418 KB | 7,632 B | 1626 B | 4,009 | 41% (PTQ)² |
-| **rclite** (affine i8) | bare **Cortex-M0** (no NPU) | 3.4 KB *(whole firmware)* | — | 364 B | 31,567 CPU instr | 38% PTQ / **2.7% QAT** |
-| **rclite** (affine i16) | bare **Cortex-M0** (no NPU) | 4.1 KB *(whole firmware)* | — | 724 B | 21,602 CPU instr | **0.42% QAT** |
+| stack (same ESN, same M55) | engine | code (`.text`) | model + working RAM | CPU cycles/step¹ | NRMSE |
+|---|---|--:|--:|--:|--:|
+| ExecuTorch + Ethos-U55 | **NPU** (int8) | 418 KB | `.pte` 7.5 KB + arena 1626 B | 4,640 (+6,329 NPU) | 41% (int8 PTQ) |
+| ExecuTorch CPU-only | M55 CPU (float32) | 801 KB | `.pte` 30 KB + arena 28 KB | 536,229 | 0.30% (float32, no quant) |
+| **rclite** | M55 CPU (int8) | **2.3 KB** *(whole firmware)* | **364 B** | **848** | 2.7% / 0.42% (QAT) |
 
-ExecuTorch needs a **Cortex-M55 + Ethos-U55 NPU** and a ~418 KB runtime (interpreter + kernels + NPU driver) plus the `.pte`; the ESN runs bit-exact on the NPU. rclite's **whole 3.4 KB firmware** is pure-CPU code on a bare Cortex-M0 — no NPU, no interpreter. (The example runner also reserves a 60 MB scratch pool — a demo default, excluded; the *used* arena is 1626 B.)
+On the **identical M55 CPU**, rclite is **~349× smaller code** and **~632× fewer CPU cycles** than ExecuTorch CPU-only. Even against the **NPU-accelerated** ExecuTorch, rclite on the bare CPU uses **~5× fewer host CPU cycles** and **~182× less code** — a tiny inference spends thousands of CPU cycles just dispatching to the NPU through the interpreter, while rclite's flat kernel finishes in ~848.
 
-¹ Vela's static estimate (the Corstone FVP is explicitly *not* cycle-accurate); rclite's is a qemu `-icount` instruction count — the two are not directly comparable (NPU cycles vs CPU instructions). ² the FVP runs one ESN cell step bit-exact; the sequence NRMSE is the host int8 figure (the recurrence is software-looped, not on the NPU).
+¹ FVP cycle model (rclite: M55 DWT CYCCNT; ExecuTorch: `arm_perf_monitor` *Inference runtime*) — the **same** FVP, *not* silicon-cycle-accurate, but a like-for-like relative measure. Part of the gap is rclite exploiting the SCR structure (scalar chain vs a dense 80×80 `W_res`), part is codegen vs interpreter + int8 vs float. ExecuTorch CPU-only is **float32** because its int8 portable path lacks the per-channel quantized out-variants in this build — so its NRMSE is the un-quantized float figure (0.30%, the best of the three) but at the largest `.pte`/arena and the slowest run; the NPU and rclite rows are int8.
+
+> rclite is not limited to the M55: the *same* ESN also runs on a bare **Cortex-M0** (no FPU/NPU) in a complete **3.4 KB** firmware (see ../tflm_vs_rclite) — below ExecuTorch's MCU floor entirely.
 
 ## Accuracy (host, identical held-out targets)
 
