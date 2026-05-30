@@ -42,7 +42,7 @@ def _sat_storage(v: int, sb: int) -> int:
 
 def emit_symmetric_kernel_c(qmodel: QuantizedModel,
                              fn_name: str = "rc_predict",
-                             *, head: str = None) -> str:
+                             *, head: str = None, sparse=None) -> str:
     if head not in (None, "logits", "classify", "proba"):
         raise NotImplementedError(
             f"symmetric C kernel supports head in (None, 'logits', "
@@ -100,6 +100,16 @@ def emit_symmetric_kernel_c(qmodel: QuantizedModel,
     chain_weight_q = int(Wr[1, 0]) if (is_structured and N > 1) else 0
     chain_feedback_q = int(Wr[0, 1]) if (is_structured and N > 1) else 0
 
+    # Sparse W_res (CSR) for dense topologies — bounded code size, so any
+    # requested strategy maps to CSR here. Bit-exact: skips exact-zero MACs
+    # in ascending column order.
+    use_sparse = bool(sparse) and not is_structured
+    if use_sparse:
+        from rclite.ir.passes.sparsify import build_csr
+        _wres_val, _wres_col, _wres_rowptr = build_csr(Wr)
+        col_t = "int16_t" if N <= 32767 else "int32_t"
+        rd_col = "RC_RD16" if N <= 32767 else "RC_RD32"
+
     off_bias = 0
     off_input = 1 if rc.readout.include_bias else 0
     off_state = off_input + (K if rc.readout.include_input else 0)
@@ -140,7 +150,12 @@ def emit_symmetric_kernel_c(qmodel: QuantizedModel,
     a(_arr("rc_W_out", storage_t, qmodel.W_out_q))
     a(_arr("rc_lut", storage_t, qmodel.lut_table_q))
     if not is_structured:
-        a(_arr("rc_W_res", storage_t, qmodel.W_res_q))
+        if use_sparse:
+            a(_arr("rc_W_res_val", storage_t, _wres_val))
+            a(_arr("rc_W_res_col", col_t, _wres_col))
+            a(_arr("rc_W_res_rowptr", "int32_t", _wres_rowptr))
+        else:
+            a(_arr("rc_W_res", storage_t, qmodel.W_res_q))
     if proba:
         from rclite.quant.softmax_lut import (
             SoftmaxLUTSpec, build_params as _build_sm,
@@ -207,6 +222,12 @@ def emit_symmetric_kernel_c(qmodel: QuantizedModel,
     a(f"                acc = rc_w32((int64_t)acc + rc_fmul({rd}(&rc_W_in[i*RC_K + k]), rc_u[k], RC_SHIFT_IN));")
     if is_structured:
         _emit_chain_sym(a, topo, N, chain_weight_q, chain_feedback_q, rd)
+    elif use_sparse:
+        a("            { int32_t rp = RC_RD32(&rc_W_res_rowptr[i]);")
+        a("              int32_t rpe = RC_RD32(&rc_W_res_rowptr[i+1]);")
+        a("              for (j = rp; j < rpe; j++)")
+        a(f"                acc = rc_w32((int64_t)acc + rc_fmul({rd}(&rc_W_res_val[j]), "
+          f"rc_h[{rd_col}(&rc_W_res_col[j])], RC_SHIFT_RES)); }}")
     else:
         a("            for (j = 0; j < RC_N; j++)")
         a(f"                acc = rc_w32((int64_t)acc + rc_fmul({rd}(&rc_W_res[i*RC_N + j]), rc_h[j], RC_SHIFT_RES));")

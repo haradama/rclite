@@ -19,6 +19,7 @@ import numpy as np
 
 from rclite.codegen import compile_rc, cross_compile_rc
 from rclite.codegen.llvm import emit_quantized_module, emit_quantized_affine_module
+from rclite.ir import sparse_passes
 from ..target import Target, CompiledArtifact, RunResult
 from .boards import CortexM0Board, MicrobitV1
 
@@ -56,6 +57,7 @@ class CortexM0Target(Target):
                 output_dir,
                 test_inputs: Optional[np.ndarray] = None,
                 expected_outputs: Optional[np.ndarray] = None,
+                sparse=False,
                 **_) -> CompiledArtifact:
         if test_inputs is None:
             raise ValueError(
@@ -72,6 +74,7 @@ class CortexM0Target(Target):
         # 1. Cross-compile rc_predict.o for Cortex-M0.
         cc_obj = cross_compile_rc(
             rc, exe, triple=self.triple, cpu=self.cpu, dtype=self.dtype,
+            passes=sparse_passes(sparse, include_structural=True),
         )
         rc_o = out / "rc_predict.o"
         cc_obj.emit_object(str(rc_o))
@@ -164,6 +167,7 @@ class CortexM0Target(Target):
     def compile_quantized(self, qmodel, *,
                             output_dir,
                             test_inputs: np.ndarray,
+                            sparse=False,
                             **_) -> CompiledArtifact:
         """Cross-compile a quantized model. The kernel takes storage_t inputs
         already at input_scale (preprocessed). main.c embeds the
@@ -192,7 +196,8 @@ class CortexM0Target(Target):
             )
 
         # Cross-compile the i32 kernel
-        ll_mod = emit_quantized_module(qmodel)
+        ll_mod = emit_quantized_module(
+            qmodel, passes=sparse_passes(sparse, include_structural=False))
         ll_mod.triple = self.triple
         from rclite.codegen.llvm import _ensure_all_targets
         _ensure_all_targets()
@@ -311,6 +316,7 @@ class CortexM0Target(Target):
     def compile_affine_quantized(self, qmodel, *,
                                    output_dir,
                                    test_inputs: np.ndarray,
+                                   sparse=False,
                                    **_) -> CompiledArtifact:
         """Cross-compile an `AffineQuantizedModel` to a Cortex-M0 ELF.
 
@@ -341,7 +347,8 @@ class CortexM0Target(Target):
             )
 
         # Cross-compile the affine kernel
-        ll_mod = emit_quantized_affine_module(qmodel)
+        ll_mod = emit_quantized_affine_module(
+            qmodel, passes=sparse_passes(sparse, include_structural=False))
         ll_mod.triple = self.triple
         from rclite.codegen.llvm import _ensure_all_targets
         _ensure_all_targets()

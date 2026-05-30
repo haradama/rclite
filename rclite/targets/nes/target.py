@@ -72,6 +72,7 @@ class NesTarget(Target):
                                  test_inputs: np.ndarray,
                                  tol: int = 1,
                                  build: Optional[bool] = None,
+                                 sparse=None,
                                  ) -> CompiledArtifact:
         """Emit the kernel + harness and link them into a `.nes` cartridge.
 
@@ -94,7 +95,8 @@ class NesTarget(Target):
         # Portable affine kernel. i32 accumulators where they provably fit:
         # llvm-mos is a modern clang (no avr-gcc 7.x widening-MAC bug), so this
         # is bit-exact and dodges the 6502's expensive 64-bit libcalls.
-        kernel_c = emit_affine_kernel_c(qmodel, allow_i32_accum=True)
+        kernel_c = emit_affine_kernel_c(qmodel, allow_i32_accum=True,
+                                        sparse=sparse)
         kernel_path = out / "rc_kernel.c"
         kernel_path.write_text(kernel_c)
 

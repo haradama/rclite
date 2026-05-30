@@ -24,18 +24,18 @@ from .c_header import emit_c_header
 from .rust import emit_rust_lib, emit_cargo_toml, emit_build_rs
 
 
-def _emit_kernel_and_info(qmodel, name: str, head=None):
+def _emit_kernel_and_info(qmodel, name: str, head=None, sparse=None):
     """Return (kernel_c_source, KernelInfo) for either quant family."""
     from rclite.quant.affine.quantize import AffineQuantizedModel
     from rclite.quant.model import QuantizedModel
 
     if isinstance(qmodel, AffineQuantizedModel):
         from rclite.targets.arduino.emit_c import emit_affine_kernel_c
-        return (emit_affine_kernel_c(qmodel, head=head),
+        return (emit_affine_kernel_c(qmodel, head=head, sparse=sparse),
                 info_from_affine(qmodel, name, head=head))
     if isinstance(qmodel, QuantizedModel):
         from .c_kernel_symmetric import emit_symmetric_kernel_c
-        return (emit_symmetric_kernel_c(qmodel, head=head),
+        return (emit_symmetric_kernel_c(qmodel, head=head, sparse=sparse),
                 info_from_symmetric(qmodel, name, head=head))
     raise TypeError(
         f"export_bundle expects an AffineQuantizedModel or QuantizedModel, "
@@ -123,19 +123,24 @@ def _readme(info: KernelInfo) -> str:
 
 
 def export_bundle(qmodel, out_dir, *, name: str = "rc_model",
-                  head=None) -> pathlib.Path:
+                  head=None, sparse=None) -> pathlib.Path:
     """Write the full C + header + Rust bundle for `qmodel` into `out_dir`.
 
     `head` selects the kernel's output: None / "logits" (raw scores), or for
     a classification readout "classify" (argmax class id, one int32 per step)
     or "proba" (M probabilities at Q.prob_frac per step).
 
+    `sparse` (None / "csr" / "auto" / "unroll") specializes the dense W_res
+    matvec to its nonzeros (CSR) for RANDOM/ESN_STANDARD topologies — bit-exact
+    and bounded code size. No effect on structured topologies.
+
     Returns the output directory path.
     """
     out = pathlib.Path(out_dir)
     (out / "src").mkdir(parents=True, exist_ok=True)
 
-    kernel_c, info = _emit_kernel_and_info(qmodel, name, head=head)
+    kernel_c, info = _emit_kernel_and_info(qmodel, name, head=head,
+                                           sparse=sparse)
 
     (out / "rc_kernel.c").write_text(kernel_c)
     (out / "rc_model.h").write_text(emit_c_header(info))

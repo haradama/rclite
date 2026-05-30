@@ -26,6 +26,7 @@ from typing import Optional
 import numpy as np
 
 from rclite.codegen import compile_rc, cross_compile_rc
+from rclite.ir import sparse_passes
 from ..target import Target, CompiledArtifact, RunResult
 
 
@@ -96,6 +97,7 @@ class WasmTarget(Target):
                 output_dir,
                 test_inputs: Optional[np.ndarray] = None,
                 expected_outputs: Optional[np.ndarray] = None,
+                sparse=False,
                 **_) -> CompiledArtifact:
         if test_inputs is None:
             raise ValueError(
@@ -114,6 +116,7 @@ class WasmTarget(Target):
         cc_obj = cross_compile_rc(
             rc, exe, triple=self.triple, dtype=self.dtype,
             features=self._features(), vectorize=self.simd,
+            passes=sparse_passes(sparse, include_structural=True),
         )
         rc_o = out / "rc_predict.o"
         cc_obj.emit_object(str(rc_o))
@@ -202,7 +205,8 @@ class WasmTarget(Target):
             metadata=metadata,
         )
 
-    def _compile_quantized_object(self, qmodel, out: pathlib.Path) -> pathlib.Path:
+    def _compile_quantized_object(self, qmodel, out: pathlib.Path,
+                                  sparse=False) -> pathlib.Path:
         """Cross-compile the integer (symmetric fixed-point) kernel to a
         wasm32 object.
 
@@ -215,7 +219,8 @@ class WasmTarget(Target):
         from rclite.codegen.llvm import (
             emit_quantized_module, _ensure_all_targets,
         )
-        ll_mod = emit_quantized_module(qmodel)
+        ll_mod = emit_quantized_module(
+            qmodel, passes=sparse_passes(sparse, include_structural=False))
         ll_mod.triple = self.triple
         _ensure_all_targets()
         mod = llvm.parse_assembly(str(ll_mod))
@@ -240,6 +245,7 @@ class WasmTarget(Target):
     def compile_quantized(self, qmodel, *,
                           output_dir,
                           test_inputs: np.ndarray,
+                          sparse=False,
                           **_) -> CompiledArtifact:
         """Cross-compile a *symmetric-quantized* (i8 / i16 / i32) model to a
         wasm32 module. The integer kernel takes storage_t inputs (at
@@ -273,7 +279,7 @@ class WasmTarget(Target):
                 f"(expected 8 / 16 / 32)"
             )
 
-        rc_o = self._compile_quantized_object(qmodel, out)
+        rc_o = self._compile_quantized_object(qmodel, out, sparse=sparse)
 
         # The kernel takes RAW input quantized at input_scale and applies the
         # `(u - offset) * scaling` preprocessing internally (PreprocessInput

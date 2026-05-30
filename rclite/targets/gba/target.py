@@ -27,6 +27,7 @@ import numpy as np
 
 from rclite.codegen import compile_rc, cross_compile_rc
 from rclite.codegen.llvm import emit_quantized_module, emit_quantized_affine_module
+from rclite.ir import sparse_passes
 from ..target import Target, CompiledArtifact, RunResult
 
 
@@ -168,6 +169,7 @@ class GbaTarget(Target):
                 test_inputs: Optional[np.ndarray] = None,
                 expected_outputs: Optional[np.ndarray] = None,
                 tol: float = 1e-2,
+                sparse=False,
                 **_) -> CompiledArtifact:
         """Cross-compile the f32 (soft-float) kernel to a GBA cartridge."""
         if test_inputs is None:
@@ -180,6 +182,7 @@ class GbaTarget(Target):
 
         cc_obj = cross_compile_rc(
             rc, exe, triple=self.triple, cpu=self.cpu, dtype=self.dtype,
+            passes=sparse_passes(sparse, include_structural=True),
         )
         rc_o = out / "rc_predict.o"
         cc_obj.emit_object(str(rc_o))
@@ -231,6 +234,7 @@ class GbaTarget(Target):
                           output_dir,
                           test_inputs: np.ndarray,
                           tol: int = 1,
+                          sparse=False,
                           **_) -> CompiledArtifact:
         """Cross-compile a symmetric (Q-format) quantized model to a .gba."""
         sw = qmodel.target.storage_bits
@@ -264,7 +268,8 @@ class GbaTarget(Target):
                 f"compile_quantized: storage_bits={sw} not supported"
             )
 
-        rc_o = self._cross_object(emit_quantized_module(qmodel), out)
+        rc_o = self._cross_object(emit_quantized_module(
+            qmodel, passes=sparse_passes(sparse, include_structural=False)), out)
 
         rc = qmodel.rc
         u_pre = (test_inputs - rc.input.input_offset) * rc.input.input_scaling
@@ -321,6 +326,7 @@ class GbaTarget(Target):
                                  output_dir,
                                  test_inputs: np.ndarray,
                                  tol: int = 1,
+                                 sparse=False,
                                  **_) -> CompiledArtifact:
         """Cross-compile an `AffineQuantizedModel` to a GBA cartridge.
 
@@ -340,7 +346,8 @@ class GbaTarget(Target):
                 f"compile_affine_quantized: storage_bits={sw} not supported"
             )
 
-        rc_o = self._cross_object(emit_quantized_affine_module(qmodel), out)
+        rc_o = self._cross_object(emit_quantized_affine_module(
+            qmodel, passes=sparse_passes(sparse, include_structural=False)), out)
 
         cfg = qmodel.config
         X_q = cfg.input.quantize_array(test_inputs).astype(np_storage)

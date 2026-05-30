@@ -45,7 +45,7 @@ def _arr(name: str, ctype: str, values, rd_macro: str) -> str:
 def emit_affine_kernel_c(qmodel: AffineQuantizedModel,
                           fn_name: str = "rc_predict",
                           *, allow_i32_accum: bool = False,
-                          head: str = None) -> str:
+                          head: str = None, sparse=None) -> str:
     """Emit the affine kernel as portable C.
 
     `allow_i32_accum` enables i32 (instead of i64) matmul accumulators
@@ -56,6 +56,13 @@ def emit_affine_kernel_c(qmodel: AffineQuantizedModel,
     Arduino target keeps it off and the host parity tests exercise it on).
     The requantize always uses the union high-word trick, which is safe
     everywhere and removes the libgcc __ashrdi3 64-bit-shift loop.
+
+    `sparse` (None / "csr" / "auto" / "unroll") specializes the dense W_res
+    matvec to its nonzeros for RANDOM/ESN_STANDARD topologies. The C path
+    emits a **CSR** kernel (bounded code size — the right choice for the
+    2KB-SRAM/Flash targets that use this template); "unroll"/"auto" resolve
+    to CSR here. Bit-exact with the dense kernel (skips exact-zero MACs in
+    ascending column order; the affine row-sum correction is unchanged).
     """
     rc = qmodel.rc
     cfg = qmodel.config
@@ -73,6 +80,15 @@ def emit_affine_kernel_c(qmodel: AffineQuantizedModel,
     is_structured = rc.reservoir.topology in (
         Topology.DLR, Topology.DLRB, Topology.SCR)
     topo = rc.reservoir.topology.name
+
+    # Sparse W_res (CSR) for dense topologies. Code size stays bounded, so
+    # any requested strategy maps to CSR on this code-size-constrained path.
+    use_sparse = bool(sparse) and not is_structured
+    if use_sparse:
+        from rclite.ir.passes.sparsify import build_csr
+        _wres_val, _wres_col, _wres_rowptr = build_csr(qmodel.W_res_q)
+        col_t = "int16_t" if N <= 32767 else "int32_t"
+        rd_col = "RC_RD16" if N <= 32767 else "RC_RD32"
 
     # Chain constants (match ir_builder)
     wqmin, wqmax = -(1 << (wob - 1)), (1 << (wob - 1)) - 1
@@ -131,7 +147,12 @@ def emit_affine_kernel_c(qmodel: AffineQuantizedModel,
         a(_arr("rc_row_sum_Wout_input", "int32_t",
                 qmodel.row_sum_Wout_input, "RC_RD32"))
     if not is_structured:
-        a(_arr("rc_W_res", storage_t, qmodel.W_res_q, rd_s))
+        if use_sparse:
+            a(_arr("rc_W_res_val", storage_t, _wres_val, rd_s))
+            a(_arr("rc_W_res_col", col_t, _wres_col, rd_col))
+            a(_arr("rc_W_res_rowptr", "int32_t", _wres_rowptr, "RC_RD32"))
+        else:
+            a(_arr("rc_W_res", storage_t, qmodel.W_res_q, rd_s))
         a(_arr("rc_row_sum_W_res", "int32_t", qmodel.row_sum_W_res, "RC_RD32"))
     if strat.kind in (LUTKind.DIRECT, LUTKind.LINEAR_INTERP):
         a(_arr("rc_lut", storage_t, qmodel.lut_q, rd_s))
@@ -286,6 +307,14 @@ def emit_affine_kernel_c(qmodel: AffineQuantizedModel,
     if is_structured:
         _emit_chain_c(a, topo, N, chain_weight_q, chain_feedback_q,
                        zp_state, rd_s, res_t, res_cast)
+    elif use_sparse:
+        a(f"            {res_t} acc_res = 0;")
+        a("            { int32_t rp = RC_RD32(&rc_W_res_rowptr[i]);")
+        a("              int32_t rpe = RC_RD32(&rc_W_res_rowptr[i+1]);")
+        a("              for (j = rp; j < rpe; j++)")
+        a(f"                acc_res += {res_cast}{rd_s}(&rc_W_res_val[j]) * "
+          f"{res_cast}rc_h[{rd_col}(&rc_W_res_col[j])]; }}")
+        a(f"            acc_res -= {res_cast}{zp_state} * {res_cast}RC_RD32(&rc_row_sum_W_res[i]);")
     else:
         a(f"            {res_t} acc_res = 0;")
         a("            for (j = 0; j < RC_N; j++)")

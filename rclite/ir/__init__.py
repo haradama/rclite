@@ -16,6 +16,7 @@ from .builder import build_ir
 from .printer import to_mlir_text
 from .passes import (
     StructuralSpecialize, FuseStepReadout, TimeUnroll, SparsifyReservoir,
+    sparse_passes,
 )
 
 __all__ = [
@@ -26,5 +27,5 @@ __all__ = [
     "Argmax", "Softmax", "AccumulateState", "FinalizeAggregate",
     "build_ir", "to_mlir_text",
     "StructuralSpecialize", "FuseStepReadout", "TimeUnroll",
-    "SparsifyReservoir",
+    "SparsifyReservoir", "sparse_passes",
 ]

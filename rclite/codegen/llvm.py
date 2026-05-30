@@ -865,6 +865,16 @@ class _IntLowerer:
 
     def _emit_int_global(self, name, arr):
         import numpy as np
+        # CSR index arrays (col / rowptr) are always i32 regardless of the
+        # storage width; only quantized weight/val arrays use storage_ty.
+        if name.endswith(("_col", "_rowptr")):
+            flat = np.asarray(arr).reshape(-1).astype(np.int32)
+            ty = ir.ArrayType(_I32, flat.size)
+            g = ir.GlobalVariable(self.module, ty, name=name)
+            g.linkage = "internal"
+            g.global_constant = True
+            g.initializer = ir.Constant(ty, [self._ci32(int(v)) for v in flat])
+            return g
         if self.storage_bits == 8:
             np_dtype = np.int8
         elif self.storage_bits == 16:
@@ -1059,25 +1069,14 @@ class _IntLowerer:
         g_lut = self.globals["lut_table"]
         K, N = op.K, op.N
 
-        with _loop(self.b, _ci(N), "ipre") as i:
-            # acc is accum_ty (i32 for i16 storage, i64 for i32 storage).
-            # bias_q is stored at state_scale, sext-widen it.
-            self.b.store(self._ca(self.bias_q), self.acc)
-            with _loop(self.b, _ci(K), "kin") as k:
-                w = _load2d_global(self.b, g_Win, K, i, k)
-                # u_pre lives in scratch (filled by _lower_preprocess); X_arg
-                # is the *raw* input — the readout in BuildPhi reads it.
-                u = _load1d(self.b, self.u_pre, k)
-                prod = self._fixed_mul_to_accum(w, u, self.shift_in)
-                self.b.store(
-                    self._accum_add(self.b.load(self.acc), prod), self.acc,
-                )
-            # Topology-aware reservoir contribution. For structured topologies
-            # this emits O(1) scalar work per row instead of an O(N) matmul.
-            self._emit_res_contrib_int(op, g_Wres, i)
-            # Truncate widened accumulator back to storage_ty for pre[i].
-            pre_val = self.b.trunc(self.b.load(self.acc), self.storage_ty)
-            _store1d(self.b, self.pre_arr, i, pre_val)
+        spec = op.res_sparse
+        if spec is not None and spec.kind == "unroll":
+            # Per-row nonzero sets differ → unroll the outer i-loop.
+            for i in range(N):
+                self._emit_int_row(op, g_Win, g_Wres, _ci(i), spec, i_py=i)
+        else:
+            with _loop(self.b, _ci(N), "ipre") as i:
+                self._emit_int_row(op, g_Win, g_Wres, i, spec, i_py=None)
 
         with _loop(self.b, _ci(N), "iupd") as i:
             pre_i = _load1d(self.b, self.pre_arr, i)
@@ -1089,6 +1088,49 @@ class _IntLowerer:
                                               self.state_frac)
             new_h = self.b.add(t1, t2)
             _store1d(self.b, self.h, i, new_h)
+
+    def _emit_int_row(self, op, g_Win, g_Wres, i, spec, i_py):
+        """Compute pre[row i] = trunc(bias + W_in·u + W_res·h) into pre_arr.
+
+        `i` is an SSA index (constant when unrolling). For the unrolled
+        kernel (`i_py` is the Python row index) the recurrent term is the
+        baked nonzeros in `spec.rows[i_py]`; otherwise the topology kernel
+        (dense / CSR / structured chain) runs inside the runtime i-loop.
+        """
+        b, K = self.b, op.K
+        b.store(self._ca(self.bias_q), self.acc)
+        with _loop(b, _ci(K), "kin") as k:
+            w = _load2d_global(b, g_Win, K, i, k)
+            u = _load1d(b, self.u_pre, k)
+            prod = self._fixed_mul_to_accum(w, u, self.shift_in)
+            b.store(self._accum_add(b.load(self.acc), prod), self.acc)
+        if i_py is not None:  # unrolled sparse
+            for j, wv in spec.rows[i_py]:
+                s = _load1d(b, self.h, _ci(j))
+                prod = self._fixed_mul_to_accum(self._cs(int(wv)), s,
+                                                self.shift_res)
+                b.store(self._accum_add(b.load(self.acc), prod), self.acc)
+        elif spec is not None:  # CSR
+            self._emit_res_contrib_int_csr(spec, i)
+        else:                   # dense / structured chain
+            self._emit_res_contrib_int(op, g_Wres, i)
+        pre_val = b.trunc(b.load(self.acc), self.storage_ty)
+        _store1d(b, self.pre_arr, i, pre_val)
+
+    def _emit_res_contrib_int_csr(self, spec, i):
+        """W_res·h over row i's nonzeros (CSR), fixed-point, ascending col."""
+        b = self.b
+        g_val = self.globals[spec.val_name]
+        g_col = self.globals[spec.col_name]
+        g_rowptr = self.globals[spec.rowptr_name]
+        start = b.sext(_load1d_global(b, g_rowptr, i), _I64)
+        end = b.sext(_load1d_global(b, g_rowptr, b.add(i, _ci(1))), _I64)
+        with _loop_strided(b, start, end, _ci(1), "csr") as p:
+            j = b.sext(_load1d_global(b, g_col, p), _I64)
+            w = _load1d_global(b, g_val, p)
+            s = _load1d(b, self.h, j)
+            prod = self._fixed_mul_to_accum(w, s, self.shift_res)
+            b.store(self._accum_add(b.load(self.acc), prod), self.acc)
 
     def _emit_res_contrib_int(self, op, g_Wres, i):
         """Add the W_res @ h contribution to `self.acc`, branching on topology.
@@ -1740,73 +1782,16 @@ class _AffineLowerer:
         t = self.t
 
         # ---- Pre-act loop ----
-        with _loop(self.b, _ci(N), "ipre") as i:
-            # acc_in
-            acc_in_var = self.b.alloca(self.accum_ty, name="acc_in")
-            self.b.store(self._ca(0), acc_in_var)
-            with _loop(self.b, _ci(K), "kin") as k:
-                w = _load2d_global(self.b, g_Win, K, i, k)
-                # Identity preprocess: read X directly (s_input == s_u_pre).
-                # Integer preprocess: read u_pre buffer populated by
-                # _lower_preprocess_affine at the top of this time step.
-                if self.has_int_preprocess:
-                    x = _load1d(self.b, self.u_pre_buf, k)
-                else:
-                    x = _load1d(self.b, self.X_arg,
-                                  self.b.add(self.b.mul(t, _ci(K)), k))
-                w_a = self.b.sext(w, self.accum_ty)
-                x_a = self.b.sext(x, self.accum_ty)
-                prod = self.b.mul(w_a, x_a)
-                self.b.store(
-                    self.b.add(self.b.load(acc_in_var), prod), acc_in_var,
-                )
-            # acc_in -= zp_u_pre * row_sum_W_in[i]
-            rs_in_i32 = _load1d_global(self.b, g_rs_in, i)
-            rs_in = (rs_in_i32 if self.accum_ty == _I32
-                     else self.b.sext(rs_in_i32, self.accum_ty))
-            acc_in_final = self.b.sub(
-                self.b.load(acc_in_var),
-                self.b.mul(self._ca(self.zp_u_pre), rs_in),
-            )
-            rq_in = self._emit_requantize_i32(
-                self._clamp_to_i32(acc_in_final),
-                self.M_in_M0, self.M_in_n,
-            )
-
-            # acc_res in i32 (after structured collapse OR dense matmul + clamp).
-            if self.structured:
-                acc_res_i32 = self._emit_chain_contribution(i, N)
-            else:
-                acc_res_var = self.b.alloca(self.accum_ty, name="acc_res")
-                self.b.store(self._ca(0), acc_res_var)
-                with _loop(self.b, _ci(N), "jres") as j:
-                    w = _load2d_global(self.b, g_Wres, N, i, j)
-                    h = _load1d(self.b, self.h_buf, j)
-                    w_a = self.b.sext(w, self.accum_ty)
-                    h_a = self.b.sext(h, self.accum_ty)
-                    prod = self.b.mul(w_a, h_a)
-                    self.b.store(
-                        self.b.add(self.b.load(acc_res_var), prod), acc_res_var,
-                    )
-                rs_res_i32 = _load1d_global(self.b, g_rs_res, i)
-                rs_res = (rs_res_i32 if self.accum_ty == _I32
-                          else self.b.sext(rs_res_i32, self.accum_ty))
-                acc_res_final = self.b.sub(
-                    self.b.load(acc_res_var),
-                    self.b.mul(self._ca(self.zp_state), rs_res),
-                )
-                acc_res_i32 = self._clamp_to_i32(acc_res_final)
-            rq_res = self._emit_requantize_i32(
-                acc_res_i32, self.M_res_M0, self.M_res_n,
-            )
-
-            # pre = zp_pre + bias_pre + rq_in + rq_res  (i32, then saturate)
-            pre_total = self.b.add(
-                self.b.add(self._ci32(self.zp_pre + self.bias_pre), rq_in),
-                rq_res,
-            )
-            pre_q = self._emit_saturate_to_storage(pre_total)
-            _store1d(self.b, self.pre_buf, i, pre_q)
+        spec = op.res_sparse
+        if spec is not None and spec.kind == "unroll":
+            # Per-row nonzero sets differ → unroll the outer i-loop.
+            for i in range(N):
+                self._emit_affine_row(op, _ci(i), g_Win, g_rs_in, g_Wres,
+                                      g_rs_res, spec, i_py=i)
+        else:
+            with _loop(self.b, _ci(N), "ipre") as i:
+                self._emit_affine_row(op, i, g_Win, g_rs_in, g_Wres,
+                                      g_rs_res, spec, i_py=None)
 
         # ---- Activation + leaky integration ----
         with _loop(self.b, _ci(N), "iact") as i:
@@ -1824,6 +1809,85 @@ class _AffineLowerer:
             new_h_total = self.b.add(new_h_c, self._ci32(self.zp_state))
             new_h_q = self._emit_saturate_to_storage(new_h_total)
             _store1d(self.b, self.h_buf, i, new_h_q)
+
+    def _emit_affine_row(self, op, i, g_Win, g_rs_in, g_Wres, g_rs_res,
+                          spec, i_py):
+        """Emit pre[row i] for the affine kernel (one body of the ipre loop).
+
+        `i` is an SSA index (a constant when unrolling). For the unrolled
+        sparse kernel `i_py` is the Python row index and the recurrent
+        accumulation uses the baked nonzeros in `spec.rows[i_py]`; the
+        affine zero-point correction `- zp_state * row_sum_W_res[i]` and the
+        requantize are unchanged (row_sum_W_res is preserved by the pass).
+        """
+        b, K, N, t = self.b, op.K, op.N, self.t
+        # acc_in
+        acc_in_var = b.alloca(self.accum_ty, name="acc_in")
+        b.store(self._ca(0), acc_in_var)
+        with _loop(b, _ci(K), "kin") as k:
+            w = _load2d_global(b, g_Win, K, i, k)
+            if self.has_int_preprocess:
+                x = _load1d(b, self.u_pre_buf, k)
+            else:
+                x = _load1d(b, self.X_arg, b.add(b.mul(t, _ci(K)), k))
+            prod = b.mul(b.sext(w, self.accum_ty), b.sext(x, self.accum_ty))
+            b.store(b.add(b.load(acc_in_var), prod), acc_in_var)
+        rs_in_i32 = _load1d_global(b, g_rs_in, i)
+        rs_in = (rs_in_i32 if self.accum_ty == _I32
+                 else b.sext(rs_in_i32, self.accum_ty))
+        acc_in_final = b.sub(b.load(acc_in_var),
+                             b.mul(self._ca(self.zp_u_pre), rs_in))
+        rq_in = self._emit_requantize_i32(
+            self._clamp_to_i32(acc_in_final), self.M_in_M0, self.M_in_n)
+
+        # acc_res
+        if self.structured:
+            acc_res_i32 = self._emit_chain_contribution(i, N)
+        else:
+            acc_res_var = b.alloca(self.accum_ty, name="acc_res")
+            b.store(self._ca(0), acc_res_var)
+            if i_py is not None:  # unrolled sparse
+                for j, wv in spec.rows[i_py]:
+                    h = _load1d(b, self.h_buf, _ci(j))
+                    prod = b.mul(self._ca(int(wv)), b.sext(h, self.accum_ty))
+                    b.store(b.add(b.load(acc_res_var), prod), acc_res_var)
+            elif spec is not None:  # CSR
+                self._emit_affine_res_csr(spec, acc_res_var, i)
+            else:                   # dense
+                with _loop(b, _ci(N), "jres") as j:
+                    w = _load2d_global(b, g_Wres, N, i, j)
+                    h = _load1d(b, self.h_buf, j)
+                    prod = b.mul(b.sext(w, self.accum_ty),
+                                 b.sext(h, self.accum_ty))
+                    b.store(b.add(b.load(acc_res_var), prod), acc_res_var)
+            rs_res_i32 = _load1d_global(b, g_rs_res, i)
+            rs_res = (rs_res_i32 if self.accum_ty == _I32
+                      else b.sext(rs_res_i32, self.accum_ty))
+            acc_res_final = b.sub(b.load(acc_res_var),
+                                  b.mul(self._ca(self.zp_state), rs_res))
+            acc_res_i32 = self._clamp_to_i32(acc_res_final)
+        rq_res = self._emit_requantize_i32(
+            acc_res_i32, self.M_res_M0, self.M_res_n)
+
+        pre_total = b.add(
+            b.add(self._ci32(self.zp_pre + self.bias_pre), rq_in), rq_res)
+        pre_q = self._emit_saturate_to_storage(pre_total)
+        _store1d(b, self.pre_buf, i, pre_q)
+
+    def _emit_affine_res_csr(self, spec, acc_res_var, i):
+        """Accumulate W_res·h over row i's nonzeros (CSR) into acc_res_var."""
+        b = self.b
+        g_val = self.globals[spec.val_name]
+        g_col = self.globals[spec.col_name]
+        g_rowptr = self.globals[spec.rowptr_name]
+        start = b.sext(_load1d_global(b, g_rowptr, i), _I64)
+        end = b.sext(_load1d_global(b, g_rowptr, b.add(i, _ci(1))), _I64)
+        with _loop_strided(b, start, end, _ci(1), "csr") as p:
+            j = b.sext(_load1d_global(b, g_col, p), _I64)
+            w = _load1d_global(b, g_val, p)
+            h = _load1d(b, self.h_buf, j)
+            prod = b.mul(b.sext(w, self.accum_ty), b.sext(h, self.accum_ty))
+            b.store(b.add(b.load(acc_res_var), prod), acc_res_var)
 
     # ------------------------------------------------------------------
     # structured-topology W_res contribution (SCR / DLR / DLRB)

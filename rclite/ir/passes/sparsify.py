@@ -36,9 +36,73 @@ from ..module import Module
 from ..ops import (
     Op, ReservoirStep, FusedStepReadout, SparseSpec, TimeLoop,
 )
+from .structural import StructuralSpecialize
 
 
 _DENSE = (Topology.RANDOM, Topology.ESN_STANDARD)
+
+
+def sparse_passes(sparse, *, include_structural: bool):
+    """Build a passes list for a target's `sparse` argument.
+
+    `sparse` accepts False/None (no sparsification → return None so callers
+    fall through to their default passes), True / "auto" / "unroll" / "csr".
+    `include_structural=True` prepends `StructuralSpecialize()` (needed on the
+    float cross-compile path, whose default passes include it); the quantized
+    paths default to no passes, so they pass include_structural=False.
+    """
+    if not sparse:
+        return None
+    strategy = "auto" if sparse is True else sparse
+    base = [StructuralSpecialize()] if include_structural else []
+    return base + [SparsifyReservoir(strategy=strategy)]
+
+
+def count_nonzeros(W, threshold: float = 0.0) -> int:
+    """Number of |entries| > threshold in the matrix W."""
+    return int((np.abs(np.asarray(W)) > threshold).sum())
+
+
+def pick_kind(nnz: int, strategy: str, max_unroll_nnz: int) -> str:
+    """Resolve 'auto' to 'unroll'/'csr' by the nnz threshold."""
+    if strategy == "auto":
+        return "unroll" if nnz <= max_unroll_nnz else "csr"
+    return strategy
+
+
+def build_unroll_rows(W, threshold: float = 0.0):
+    """Per-row nonzeros as a tuple of ((col_j, weight), ...) in ascending j.
+
+    `weight` keeps W's native dtype scalar (Python int for integer W_res_q,
+    float for float W_res), so callers can bake exact constants.
+    """
+    W = np.asarray(W)
+    mask = np.abs(W) > threshold
+    return tuple(
+        tuple((int(j), W[i, j].item()) for j in np.nonzero(mask[i])[0])
+        for i in range(W.shape[0])
+    )
+
+
+def build_csr(W, threshold: float = 0.0):
+    """Return (val, col, rowptr) CSR arrays in ascending column order per row.
+
+    `val` preserves W's dtype (int storage for quantized W_res_q, float for
+    the float path); `col`/`rowptr` are int32.
+    """
+    W = np.asarray(W)
+    N = W.shape[0]
+    mask = np.abs(W) > threshold
+    val, col, rowptr = [], [], [0]
+    for i in range(N):
+        cols = np.nonzero(mask[i])[0]
+        for j in cols:
+            col.append(int(j))
+            val.append(W[i, j])
+        rowptr.append(len(col))
+    return (np.asarray(val, dtype=W.dtype),
+            np.asarray(col, dtype=np.int32),
+            np.asarray(rowptr, dtype=np.int32))
 
 
 class SparsifyReservoir:
@@ -82,34 +146,19 @@ class SparsifyReservoir:
 
     def _build_spec(self, op) -> SparseSpec:
         W = np.asarray(self._weights[op.W_res_name])
-        N = W.shape[0]
-        mask = np.abs(W) > self.threshold
-        nnz = int(mask.sum())
-
-        kind = self.strategy
-        if kind == "auto":
-            kind = "unroll" if nnz <= self.max_unroll_nnz else "csr"
+        nnz = count_nonzeros(W, self.threshold)
+        kind = pick_kind(nnz, self.strategy, self.max_unroll_nnz)
 
         if kind == "unroll":
-            rows = tuple(
-                tuple((int(j), float(W[i, j]))
-                      for j in np.nonzero(mask[i])[0])
-                for i in range(N)
-            )
+            rows = build_unroll_rows(W, self.threshold)
             return SparseSpec(kind="unroll", nnz=nnz, rows=rows)
 
-        # CSR: build val / col / rowptr in ascending column order per row.
-        val, col, rowptr = [], [], [0]
-        for i in range(N):
-            cols = np.nonzero(mask[i])[0]
-            for j in cols:
-                col.append(int(j))
-                val.append(float(W[i, j]))
-            rowptr.append(len(col))
+        # CSR: arrays preserve W's dtype for val, int32 for indices.
+        val, col, rowptr = build_csr(W, self.threshold)
         base = op.W_res_name
-        self._weights[f"{base}_val"] = np.asarray(val, dtype=np.float64)
-        self._weights[f"{base}_col"] = np.asarray(col, dtype=np.int32)
-        self._weights[f"{base}_rowptr"] = np.asarray(rowptr, dtype=np.int32)
+        self._weights[f"{base}_val"] = val
+        self._weights[f"{base}_col"] = col
+        self._weights[f"{base}_rowptr"] = rowptr
         return SparseSpec(
             kind="csr", nnz=nnz,
             val_name=f"{base}_val", col_name=f"{base}_col",

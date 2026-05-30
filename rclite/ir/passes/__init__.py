@@ -6,9 +6,9 @@ in `lower_with_passes()`.
 from .structural import StructuralSpecialize
 from .fuse import FuseStepReadout
 from .unroll import TimeUnroll
-from .sparsify import SparsifyReservoir
+from .sparsify import SparsifyReservoir, sparse_passes
 
 __all__ = [
     "StructuralSpecialize", "FuseStepReadout", "TimeUnroll",
-    "SparsifyReservoir",
+    "SparsifyReservoir", "sparse_passes",
 ]
