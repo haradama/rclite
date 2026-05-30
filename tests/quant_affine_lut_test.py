@@ -296,7 +296,7 @@ def test_microbit_cross_compile_i16_interp_size_smaller_than_direct():
 def test_polynomial_degree_5_strictly_beats_degree_3_on_mackey_glass():
     """Degree-5 minimax should track tanh much more accurately than degree-3,
     so the resulting MG output MSE is substantially better at the same clip."""
-    from examples.mackey_glass_esn import mackey_glass
+    from examples.forecasting.mackey_glass_esn import mackey_glass
     from rclite import (InputNode, ReservoirNode, ReadoutNode,
                          ReservoirComputer, Activation,
                          Distribution, Topology, Trainer)

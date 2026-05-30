@@ -24,7 +24,7 @@ import subprocess
 import sys
 import time
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 
 import numpy as np
 
@@ -38,7 +38,7 @@ from rclite.targets import WasmTarget
 
 
 HERE = pathlib.Path(__file__).resolve().parent
-ROOT = HERE.parent
+ROOT = HERE.parents[1]
 BUILD = ROOT / "build" / "bench_wasm"
 
 
@@ -211,7 +211,7 @@ def main():
         sys.exit("error: wasmtime required on PATH")
     BUILD.mkdir(parents=True, exist_ok=True)
 
-    from examples.mackey_glass_esn import mackey_glass
+    from examples.forecasting.mackey_glass_esn import mackey_glass
     series = mackey_glass(n=3000)
     X, Y = series[:-1, None], series[1:, None]
     n_train = 2000

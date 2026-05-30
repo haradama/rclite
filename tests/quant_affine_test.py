@@ -464,7 +464,7 @@ def test_qat_strictly_improves_on_mackey_glass_i8():
     from rclite import (InputNode, ReservoirNode, ReadoutNode,
                          ReservoirComputer, Activation,
                          Distribution, Topology, Trainer)
-    from examples.mackey_glass_esn import mackey_glass
+    from examples.forecasting.mackey_glass_esn import mackey_glass
     series = mackey_glass(n=1500)
     X = series[:-1, None]; Y = series[1:, None]
     rc = ReservoirComputer(
@@ -617,7 +617,7 @@ def test_mixed_precision_qat_beats_pure_i8_on_mackey_glass():
     from rclite import (InputNode as IN, ReservoirNode as RN, ReadoutNode as RoN,
                          ReservoirComputer as RC2, Activation,
                          Distribution as D, Topology as Tp, Trainer as Tr)
-    from examples.mackey_glass_esn import mackey_glass
+    from examples.forecasting.mackey_glass_esn import mackey_glass
     series = mackey_glass(n=2000)
     X = series[:-1, None]; Y = series[1:, None]
     rc = RC2(

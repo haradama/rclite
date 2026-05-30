@@ -9,7 +9,7 @@ from __future__ import annotations
 import sys
 import pathlib
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 
 import numpy as np
 
@@ -19,7 +19,7 @@ from rclite import (
 )
 from rclite.runtime import RCExecutor
 
-from examples.mackey_glass_esn import mackey_glass, rmse
+from examples.forecasting.mackey_glass_esn import mackey_glass, rmse
 
 
 def build(trainer: Trainer, *, input_offset: float, seed: int = 42,

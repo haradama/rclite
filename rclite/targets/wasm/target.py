@@ -165,7 +165,7 @@ class WasmTarget(Target):
         `warmup` discarded ones) using the WASI `std::time::Instant` clock
         and prints best/median/mean wall-clock per inference plus a parity
         report against the embedded host reference. The Python driver in
-        `benchmarks/compare_wasm.py` parses the keyed `RCLITE_BENCH:` lines.
+        `benchmarks/host/compare_wasm.py` parses the keyed `RCLITE_BENCH:` lines.
         """
         if test_inputs is None:
             raise ValueError(

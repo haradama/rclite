@@ -23,7 +23,7 @@ RC_WASHOUT = 200     # reservoir settle-in before RC training targets count
 
 def mackey_glass(n: int = MG_N, tau: int = MG_TAU, beta: float = 0.2,
                  gamma: float = 0.1, n_init: int = 500) -> np.ndarray:
-    """Deterministic Mackey-Glass series (matches examples/mackey_glass_esn)."""
+    """Deterministic Mackey-Glass series (matches examples/forecasting/mackey_glass_esn)."""
     rng = np.random.default_rng(0)
     L = n + n_init
     x = np.zeros(L)

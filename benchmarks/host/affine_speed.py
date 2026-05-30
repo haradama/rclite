@@ -14,7 +14,7 @@ import pathlib
 import sys
 import time
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 
 import numpy as np
 
@@ -31,7 +31,7 @@ from rclite.quant import (
     search_quantization_affine,
 )
 from rclite.codegen.llvm import CompiledQuantizedRC, CompiledAffineRC
-from examples.mackey_glass_esn import mackey_glass
+from examples.forecasting.mackey_glass_esn import mackey_glass
 
 
 def time_call(fn, n_runs=5):

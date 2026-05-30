@@ -13,7 +13,7 @@ from __future__ import annotations
 import sys
 import pathlib
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 
 import numpy as np
 
@@ -29,7 +29,7 @@ from rclite.verification import (
     reservoir_singular_value,
 )
 
-from examples.mackey_glass_esn import mackey_glass
+from examples.forecasting.mackey_glass_esn import mackey_glass
 
 
 def build(spectral_radius: float, leak_rate: float, input_offset: float,

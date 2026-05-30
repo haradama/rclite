@@ -8,7 +8,7 @@ from __future__ import annotations
 import pathlib
 import sys
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 
 from rclite import (
     InputNode, ReservoirNode, ReadoutNode, ReservoirComputer,
@@ -17,10 +17,10 @@ from rclite import (
 from rclite.runtime import RCExecutor
 from rclite.targets import Microbit
 
-from examples.mackey_glass_esn import mackey_glass
+from examples.forecasting.mackey_glass_esn import mackey_glass
 
 
-BUILD = pathlib.Path(__file__).resolve().parent.parent / "build" / "microbit"
+BUILD = pathlib.Path(__file__).resolve().parents[2] / "build" / "microbit"
 
 
 def train_esn():

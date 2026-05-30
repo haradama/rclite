@@ -24,7 +24,7 @@ import subprocess
 import sys
 import time
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 
 import numpy as np
 
@@ -43,7 +43,7 @@ import llvmlite.binding as llvm
 
 
 HERE = pathlib.Path(__file__).resolve().parent
-ROOT = HERE.parent
+ROOT = HERE.parents[1]
 BUILD = ROOT / "build" / "bench_4way"
 TPL_F = HERE / "scratch_c" / "rc_naive_template.c"
 TPL_Q = HERE / "scratch_c" / "rc_naive_q_template.c"
@@ -388,7 +388,7 @@ def main():
     BUILD.mkdir(parents=True, exist_ok=True)
     driver_f, driver_q = build_drivers(BUILD)
 
-    from examples.mackey_glass_esn import mackey_glass
+    from examples.forecasting.mackey_glass_esn import mackey_glass
     series = mackey_glass(n=3000)
     X, Y = series[:-1, None], series[1:, None]
     n_train = 2000

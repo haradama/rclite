@@ -17,7 +17,7 @@ import subprocess
 import sys
 import textwrap
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 
 import numpy as np
 
@@ -28,11 +28,11 @@ from rclite import (
 from rclite.runtime import RCExecutor
 from rclite.targets import HostTarget
 
-from examples.mackey_glass_esn import mackey_glass
+from examples.forecasting.mackey_glass_esn import mackey_glass
 
 
 HERE = pathlib.Path(__file__).resolve().parent
-BUILD = HERE.parent / "build"
+BUILD = HERE.parents[1] / "build"
 
 
 def train_esn() -> tuple[ReservoirComputer, RCExecutor, np.ndarray]:
@@ -73,10 +73,10 @@ def main() -> None:
 
     Y_ref = artifact.metadata["jit"].predict(sample_X)
 
-    print(f"[1/4] emit shared library      -> {lib_path.relative_to(HERE.parent)}")
-    print(f"[2/4] emit C header            -> {hdr_path.relative_to(HERE.parent)}")
+    print(f"[1/4] emit shared library      -> {lib_path.relative_to(HERE.parents[1])}")
+    print(f"[2/4] emit C header            -> {hdr_path.relative_to(HERE.parents[1])}")
 
-    print(f"[3/4] write sample C program   -> {src_path.relative_to(HERE.parent)}")
+    print(f"[3/4] write sample C program   -> {src_path.relative_to(HERE.parents[1])}")
     flat = sample_X.ravel()
     x_literals = ",\n        ".join(f"{v:.17g}" for v in flat)
     src_path.write_text(textwrap.dedent(f"""\
@@ -107,7 +107,7 @@ def main() -> None:
         }}
         """))
 
-    print(f"[4/4] gcc compile + link       -> {exe_path.relative_to(HERE.parent)}")
+    print(f"[4/4] gcc compile + link       -> {exe_path.relative_to(HERE.parents[1])}")
     cmd = [
         "gcc", "-O2", "-Wall", "-o", str(exe_path), str(src_path),
         "-L", str(BUILD), "-lrc",
@@ -121,7 +121,7 @@ def main() -> None:
     for t in range(len(sample_X)):
         print(f"   t={t:2d}  x={sample_X[t, 0]:10.5f}  y={Y_ref[t, 0]:12.6f}")
 
-    print(f"\n--- C demo output (./{exe_path.relative_to(HERE.parent)}) ---")
+    print(f"\n--- C demo output (./{exe_path.relative_to(HERE.parents[1])}) ---")
     out = subprocess.run([str(exe_path)], capture_output=True, text=True,
                           check=True)
     print(out.stdout)

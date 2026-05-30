@@ -15,7 +15,7 @@ from __future__ import annotations
 import pathlib
 import sys
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 
 import numpy as np
 
@@ -31,7 +31,7 @@ from rclite.quant import (
     calibrate_from_data, quantize_model_affine, AffineQuantizedExecutor,
     search_quantization_affine, LUTStrategy,
 )
-from examples.mackey_glass_esn import mackey_glass
+from examples.forecasting.mackey_glass_esn import mackey_glass
 
 
 N_TRAIN = 2000

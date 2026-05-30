@@ -12,7 +12,7 @@ from __future__ import annotations
 import pathlib
 import sys
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 
 import numpy as np
 
@@ -26,10 +26,10 @@ from rclite.quant import (
 )
 from rclite.targets import Microbit
 
-from examples.mackey_glass_esn import mackey_glass
+from examples.forecasting.mackey_glass_esn import mackey_glass
 
 
-BUILD = pathlib.Path(__file__).resolve().parent.parent / "build" / "microbit_q"
+BUILD = pathlib.Path(__file__).resolve().parents[2] / "build" / "microbit_q"
 
 
 def train_esn():
