@@ -19,6 +19,33 @@ class Op:
 
 
 @dataclass(frozen=True)
+class SparseSpec:
+    """Compile-time sparsity plan for a dense W_res matvec.
+
+    Produced by the `SparsifyReservoir` pass when a RANDOM/ESN_STANDARD
+    reservoir's recurrent matrix has many exact zeros. The lowering skips
+    the zero MACs, preserving bit-exactness with the dense kernel because
+    nonzeros are visited in increasing column order and `acc + 0.0 == acc`.
+
+    kind == "unroll":
+        Weights are baked as constants. `rows[i]` is the tuple of
+        (col_j, weight) nonzeros for output row i, in ascending col_j.
+        No W_res global is emitted.
+
+    kind == "csr":
+        Compressed sparse row arrays are emitted as module weights and
+        referenced by name: `val_name` (float values), `col_name` (i32
+        column indices), `rowptr_name` (i32, length N+1).
+    """
+    kind: str  # "unroll" | "csr"
+    nnz: int
+    rows: Tuple[Tuple[Tuple[int, float], ...], ...] = ()
+    val_name: str = ""
+    col_name: str = ""
+    rowptr_name: str = ""
+
+
+@dataclass(frozen=True)
 class PreprocessInput(Op):
     """u_pre := (u_raw - offset) * scale"""
     offset: float
@@ -43,6 +70,7 @@ class ReservoirStep(Op):
     chain_feedback: float = 0.0
     W_in_name: str = "W_in"
     W_res_name: Optional[str] = "W_res"
+    res_sparse: Optional[SparseSpec] = None
 
 
 @dataclass(frozen=True)
@@ -90,6 +118,7 @@ class FusedStepReadout(Op):
     W_in_name: str = "W_in"
     W_res_name: Optional[str] = "W_res"
     W_out_name: str = "W_out"
+    res_sparse: Optional[SparseSpec] = None
 
 
 @dataclass(frozen=True)

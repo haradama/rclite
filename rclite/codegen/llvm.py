@@ -90,6 +90,11 @@ def _load2d_global(b: ir.IRBuilder, g, ncols: int, i, j):
     return b.load(b.gep(g, [_ci32(0), flat]))
 
 
+def _load1d_global(b: ir.IRBuilder, g, i):
+    """Load element i from a global array (pointer-to-[N x ty])."""
+    return b.load(b.gep(g, [_ci32(0), i]))
+
+
 @contextmanager
 def _loop(b: ir.IRBuilder, count, name: str = "i"):
     """Emit a 0..count-1 loop. Yields the loop index value (i64)."""
@@ -236,12 +241,20 @@ class _Lowerer:
         return ir.Constant(self.fty, float(v))
 
     def _emit_global(self, name, arr):
-        flat = np.ascontiguousarray(arr, dtype=self.np_dtype).reshape(-1)
-        ty = ir.ArrayType(self.fty, flat.size)
+        arr = np.asarray(arr)
+        if np.issubdtype(arr.dtype, np.integer):
+            # CSR index arrays (col_idx / row_ptr) are emitted as i32.
+            flat = np.ascontiguousarray(arr, dtype=np.int32).reshape(-1)
+            ty = ir.ArrayType(_I32, flat.size)
+            init = [_ci32(int(v)) for v in flat]
+        else:
+            flat = np.ascontiguousarray(arr, dtype=self.np_dtype).reshape(-1)
+            ty = ir.ArrayType(self.fty, flat.size)
+            init = [self._cf(float(v)) for v in flat]
         g = ir.GlobalVariable(self.module, ty, name=name)
         g.linkage = "internal"
         g.global_constant = True
-        g.initializer = ir.Constant(ty, [self._cf(float(v)) for v in flat])
+        g.initializer = ir.Constant(ty, init)
         return g
 
     def _flatten_ops(self):
@@ -329,18 +342,7 @@ class _Lowerer:
         g_Win = self.globals[op.W_in_name]
         g_Wres = self.globals.get(op.W_res_name) if op.W_res_name else None
 
-        with _loop(self.b, _ci(op.N), "ipre") as i:
-            self.b.store(self._cf(op.bias), self.acc)
-            with _loop(self.b, _ci(op.K), "kin") as k:
-                w = _load2d_global(self.b, g_Win, op.K, i, k)
-                u_val = _load1d(self.b, self.u_pre, k)
-                self.b.store(
-                    self.b.fadd(self.b.load(self.acc), self.b.fmul(w, u_val)),
-                    self.acc,
-                )
-            self._emit_res_contrib(op.topology, op.N, op.chain_weight,
-                                    op.chain_feedback, g_Wres, i)
-            _store1d(self.b, self.pre_arr, i, self.b.load(self.acc))
+        self._emit_preactivation(op, g_Win, g_Wres)
 
         with _loop(self.b, _ci(op.N), "iupd") as i:
             h_old = _load1d(self.b, self.h, i)
@@ -351,6 +353,60 @@ class _Lowerer:
                 self.b.fmul(self._cf(op.leak), tan),
             )
             _store1d(self.b, self.h, i, new_h)
+
+    def _emit_preactivation(self, op, g_Win, g_Wres):
+        """Write pre[i] = bias + W_in[i]·u_pre + (W_res·h)[i] for all rows i.
+
+        The recurrent term uses one of three kernels:
+          - dense:  runtime N×N matvec (op.res_sparse is None)
+          - csr:    runtime loop over each row's nonzeros (kind=='csr')
+          - unroll: Python-unrolled rows with the nonzero weights baked in
+                    as constants (kind=='unroll'); skips the W_res global.
+        """
+        b = self.b
+        spec = op.res_sparse
+        if spec is not None and spec.kind == "unroll":
+            # Each row has a distinct nonzero set, so unroll the i-loop too.
+            for i in range(op.N):
+                b.store(self._cf(op.bias), self.acc)
+                with _loop(b, _ci(op.K), "kin") as k:
+                    w = _load2d_global(b, g_Win, op.K, _ci(i), k)
+                    u_val = _load1d(b, self.u_pre, k)
+                    b.store(b.fadd(b.load(self.acc), b.fmul(w, u_val)),
+                            self.acc)
+                for j, wv in spec.rows[i]:
+                    hv = _load1d(b, self.h, _ci(j))
+                    b.store(b.fadd(b.load(self.acc),
+                                   b.fmul(self._cf(wv), hv)), self.acc)
+                _store1d(b, self.pre_arr, _ci(i), b.load(self.acc))
+            return
+
+        with _loop(b, _ci(op.N), "ipre") as i:
+            b.store(self._cf(op.bias), self.acc)
+            with _loop(b, _ci(op.K), "kin") as k:
+                w = _load2d_global(b, g_Win, op.K, i, k)
+                u_val = _load1d(b, self.u_pre, k)
+                b.store(b.fadd(b.load(self.acc), b.fmul(w, u_val)), self.acc)
+            if spec is not None:
+                self._emit_res_contrib_csr(spec, i)
+            else:
+                self._emit_res_contrib(op.topology, op.N, op.chain_weight,
+                                        op.chain_feedback, g_Wres, i)
+            _store1d(b, self.pre_arr, i, b.load(self.acc))
+
+    def _emit_res_contrib_csr(self, spec, i):
+        """acc += sum over row i's nonzeros of val[p] * h[col[p]] (CSR)."""
+        b = self.b
+        g_val = self.globals[spec.val_name]
+        g_col = self.globals[spec.col_name]
+        g_rowptr = self.globals[spec.rowptr_name]
+        start = b.sext(_load1d_global(b, g_rowptr, i), _I64)
+        end = b.sext(_load1d_global(b, g_rowptr, b.add(i, _ci(1))), _I64)
+        with _loop_strided(b, start, end, _ci(1), "csr") as p:
+            j = b.sext(_load1d_global(b, g_col, p), _I64)
+            w = _load1d_global(b, g_val, p)
+            hv = _load1d(b, self.h, j)
+            b.store(b.fadd(b.load(self.acc), b.fmul(w, hv)), self.acc)
 
     def _emit_res_contrib(self, topology, N, chain_weight, chain_feedback,
                            g_Wres, i):
@@ -435,15 +491,7 @@ class _Lowerer:
         cf = self._cf
 
         # Step (same as _lower_reservoir_step)
-        with _loop(b, _ci(op.N), "ipre") as i:
-            b.store(cf(op.bias), self.acc)
-            with _loop(b, _ci(op.K), "kin") as k:
-                w = _load2d_global(b, g_Win, op.K, i, k)
-                u_val = _load1d(b, self.u_pre, k)
-                b.store(b.fadd(b.load(self.acc), b.fmul(w, u_val)), self.acc)
-            self._emit_res_contrib(op.topology, op.N, op.chain_weight,
-                                    op.chain_feedback, g_Wres, i)
-            _store1d(b, self.pre_arr, i, b.load(self.acc))
+        self._emit_preactivation(op, g_Win, g_Wres)
         with _loop(b, _ci(op.N), "iupd") as i:
             h_old = _load1d(b, self.h, i)
             pre_i = _load1d(b, self.pre_arr, i)

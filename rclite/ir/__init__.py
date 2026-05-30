@@ -9,19 +9,22 @@ from .module import Module
 from .ops import (
     Op,
     PreprocessInput, ReservoirStep, BuildPhi, ReadoutLinear,
-    FusedStepReadout, TimeLoop,
+    FusedStepReadout, TimeLoop, SparseSpec,
     Argmax, Softmax, AccumulateState, FinalizeAggregate,
 )
 from .builder import build_ir
 from .printer import to_mlir_text
-from .passes import StructuralSpecialize, FuseStepReadout, TimeUnroll
+from .passes import (
+    StructuralSpecialize, FuseStepReadout, TimeUnroll, SparsifyReservoir,
+)
 
 __all__ = [
     "Module",
     "Op",
     "PreprocessInput", "ReservoirStep", "BuildPhi", "ReadoutLinear",
-    "FusedStepReadout", "TimeLoop",
+    "FusedStepReadout", "TimeLoop", "SparseSpec",
     "Argmax", "Softmax", "AccumulateState", "FinalizeAggregate",
     "build_ir", "to_mlir_text",
     "StructuralSpecialize", "FuseStepReadout", "TimeUnroll",
+    "SparsifyReservoir",
 ]

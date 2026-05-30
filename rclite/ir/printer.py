@@ -74,6 +74,9 @@ def _emit_op(op: Op, indent: int) -> List[str]:
         operands = "%h, %u_pre, @" + op.W_in_name
         if op.W_res_name is not None:
             operands += ", @" + op.W_res_name
+        if op.res_sparse is not None:
+            attrs += (f', sparse = "{op.res_sparse.kind}", '
+                      f"nnz = {op.res_sparse.nnz} : i64")
         return [f"{pad}rc.reservoir_step {operands} {{{attrs}}}"]
     if isinstance(op, BuildPhi):
         return [f"{pad}rc.build_phi %h, %X[%t], %phi "
@@ -95,6 +98,9 @@ def _emit_op(op: Op, indent: int) -> List[str]:
         if op.W_res_name is not None:
             operands += ", @" + op.W_res_name
         operands += ", @" + op.W_out_name
+        if op.res_sparse is not None:
+            attrs += (f', sparse = "{op.res_sparse.kind}", '
+                      f"nnz = {op.res_sparse.nnz} : i64")
         return [f"{pad}rc.fused_step_readout {operands}, %Y[%t] {{{attrs}}}"]
     if isinstance(op, AccumulateState):
         return [f'{pad}rc.accumulate_state %h {{mode = "{op.mode}"}}']
