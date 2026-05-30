@@ -11,12 +11,15 @@ Available targets:
     WasmTarget        — wasm32-wasip1 cross-compile (linked via rustc)
     Wasmtime          — convenience preset: WasmTarget runnable via wasmtime
     ArduinoUnoTarget  — 8-bit AVR (ATmega328P) affine kernel + .ino sketch
+    GbaTarget         — Game Boy Advance (ARM7TDMI / ARMv4T) cartridge
+    Gba               — convenience preset: GbaTarget runnable via mGBA
 """
 from .target import Target, CompiledArtifact, RunResult
 from .host import HostTarget
 from .cortex_m0 import CortexM0Target, CortexM0Board, MicrobitV1, Microbit
 from .wasm import WasmTarget, Wasmtime
 from .arduino import ArduinoUnoTarget
+from .gba import GbaTarget, Gba
 
 __all__ = [
     "Target", "CompiledArtifact", "RunResult",
@@ -24,4 +27,5 @@ __all__ = [
     "CortexM0Target", "CortexM0Board", "MicrobitV1", "Microbit",
     "WasmTarget", "Wasmtime",
     "ArduinoUnoTarget",
+    "GbaTarget", "Gba",
 ]

@@ -23,13 +23,14 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
 
-      - name: Install ARM cross-toolchain and QEMU
+      - name: Install ARM cross-toolchain, QEMU and mGBA
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             gcc-arm-none-eabi \
             libnewlib-arm-none-eabi \
-            qemu-system-arm
+            qemu-system-arm \
+            mgba-sdl
 
       - name: Install project + test dependencies
         run: |

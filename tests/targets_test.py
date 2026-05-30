@@ -19,6 +19,7 @@ from rclite.targets import (
     Target, CompiledArtifact, RunResult,
     HostTarget, CortexM0Target, MicrobitV1, Microbit,
     WasmTarget, Wasmtime,
+    GbaTarget, Gba,
 )
 
 
@@ -173,6 +174,68 @@ def test_target_run_result_failure_path():
         artifact.binary.write_bytes(b"\x00" * 64)  # invalid ELF
         result = target.run(artifact, timeout=10)
         assert not result.success
+
+
+def _build_affine_gba(units=24, T=200, seed=0):
+    """A small affine-quantized model for the GBA target tests."""
+    from rclite.quant import (calibrate_from_data, quantize_model_affine,
+                              LUTStrategy)
+    rc = ReservoirComputer(
+        input=InputNode(units=1, input_offset=0.0, input_scaling=1.0,
+                        input_distribution=Distribution.BERNOULLI, name="in"),
+        reservoir=ReservoirNode(units=units, topology=Topology.SCR,
+                                 chain_weight=0.9, chain_feedback=0.1,
+                                 leak_rate=0.3, seed=42, name="res"),
+        readout=ReadoutNode(units=1, trainer=Trainer.RIDGE,
+                            regularization=1e-6, washout=30,
+                            include_bias=True, include_input=True, name="out"),
+    )
+    exe = RCExecutor(rc)
+    rng = np.random.default_rng(seed)
+    X = rng.standard_normal((T, 1)) * 0.2
+    Y = np.sin(np.arange(T) * 0.1)[:, None]
+    exe.fit(X[:T - 50], Y[:T - 50])
+    cfg = calibrate_from_data(rc, exe, X[:T - 50], storage_bits=8)
+    qm = quantize_model_affine(rc, exe, cfg,
+                                lut_strategy=LUTStrategy.linear_interp(64))
+    return qm, X[T - 50:T - 40]
+
+
+def test_gba_class_attributes():
+    assert issubclass(Gba, GbaTarget)
+    g = Gba()
+    assert g.triple == "thumbv4t-none-eabi"
+    assert g.cpu == "arm7tdmi"
+    assert g.name == "gba/arm7tdmi"
+
+
+def test_gba_compile_affine_emits_rom():
+    if shutil.which("arm-none-eabi-gcc") is None:
+        return  # skip — no ARM toolchain
+    qm, sample = _build_affine_gba()
+    with tempfile.TemporaryDirectory() as td:
+        art = Gba().compile_affine_quantized(
+            qm, output_dir=pathlib.Path(td), test_inputs=sample)
+        assert art.binary is not None and art.binary.exists()
+        assert art.binary.suffix == ".gba"
+        assert art.metadata["triple"] == "thumbv4t-none-eabi"
+        assert art.metadata["affine"] is True
+
+
+def test_gba_full_pipeline_mgba():
+    if shutil.which("arm-none-eabi-gcc") is None:
+        return  # skip
+    if shutil.which("mgba") is None and shutil.which("/usr/games/mgba") is None:
+        return  # skip — no emulator
+    qm, sample = _build_affine_gba()
+    with tempfile.TemporaryDirectory() as td:
+        target = Gba()
+        art = target.compile_affine_quantized(
+            qm, output_dir=pathlib.Path(td), test_inputs=sample)
+        result = target.run(art, timeout=6)
+        assert result.success, f"mGBA output:\n{result.output}"
+        assert "TEST_PASS" in result.output
+        assert "TEST_FAIL" not in result.output
 
 
 TESTS = [v for k, v in list(globals().items())
