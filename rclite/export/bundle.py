@@ -24,17 +24,19 @@ from .c_header import emit_c_header
 from .rust import emit_rust_lib, emit_cargo_toml, emit_build_rs
 
 
-def _emit_kernel_and_info(qmodel, name: str):
+def _emit_kernel_and_info(qmodel, name: str, head=None):
     """Return (kernel_c_source, KernelInfo) for either quant family."""
     from rclite.quant.affine.quantize import AffineQuantizedModel
     from rclite.quant.model import QuantizedModel
 
     if isinstance(qmodel, AffineQuantizedModel):
         from rclite.targets.arduino.emit_c import emit_affine_kernel_c
-        return emit_affine_kernel_c(qmodel), info_from_affine(qmodel, name)
+        return (emit_affine_kernel_c(qmodel, head=head),
+                info_from_affine(qmodel, name, head=head))
     if isinstance(qmodel, QuantizedModel):
         from .c_kernel_symmetric import emit_symmetric_kernel_c
-        return emit_symmetric_kernel_c(qmodel), info_from_symmetric(qmodel, name)
+        return (emit_symmetric_kernel_c(qmodel, head=head),
+                info_from_symmetric(qmodel, name, head=head))
     raise TypeError(
         f"export_bundle expects an AffineQuantizedModel or QuantizedModel, "
         f"got {type(qmodel).__name__}"
@@ -42,23 +44,67 @@ def _emit_kernel_and_info(qmodel, name: str):
 
 
 def _readme(info: KernelInfo) -> str:
+    head_line = {
+        "classify": "Head: **classify** — `rc_predict` writes one int32 class "
+                    f"id per step (argmax over {info.n_classes} classes).",
+        "proba": "Head: **proba** — `rc_predict` writes "
+                 f"{info.M} probabilities/step at Q{info.prob_frac} "
+                 "(softmax via exp LUT).",
+        "logits": "Head: **logits** — `rc_predict` writes the raw quantized "
+                  "readout scores.",
+    }[info.head]
+
+    if info.is_classify:
+        c_block = [
+            "```c",
+            '#include "rc_model.h"',
+            "rc_storage_t X[T * RC_INPUT_DIM];   /* quantized inputs */",
+            "int32_t      Y[T];                  /* class id per step */",
+            "rc_predict(T, X, Y);",
+            "```",
+        ]
+        rust_block = [
+            "```rust",
+            f"use {info.name.replace('-', '_')}::*;",
+            "let classes = classify(&x_floats);     // std: Vec<u32>, one per step",
+            "// or, no_std / pure integer:",
+            "// classify_into(&x_q, &mut ids_i32);",
+            "```",
+        ]
+    else:
+        out_comment = ("/* float out: p = rc_dequantize_output(Y[i]); */"
+                       if info.is_proba
+                       else "/* float out: y_f = rc_dequantize_output(Y[i]); */")
+        c_block = [
+            "```c",
+            '#include "rc_model.h"',
+            "rc_storage_t X[T * RC_INPUT_DIM];   /* quantized inputs  */",
+            "rc_storage_t Y[T * RC_OUTPUT_DIM];  /* quantized outputs */",
+            "/* float in/out (host): X[i] = rc_quantize_input(x_f); */",
+            "rc_predict(T, X, Y);",
+            out_comment,
+            "```",
+        ]
+        rust_block = [
+            "```rust",
+            f"use {info.name.replace('-', '_')}::*;",
+            "let y = predict(&x_floats);            // std: quantize+run+dequant",
+            "// or, no_std / pure integer:",
+            "// predict_into(&x_q, &mut y_q);",
+            "```",
+        ]
+
     return "\n".join([
         f"# {info.name} — rclite portable reservoir kernel",
         "",
         f"Quantization: **{info.quant}**, storage: **i{info.storage_bits}**, "
         f"topology: **{info.topology}**.",
+        f"Task: **{info.task}**. {head_line}",
         f"Dimensions: K={info.K} (input), N={info.N} (reservoir), M={info.M} (output).",
         "",
         "## C",
         "",
-        "```c",
-        '#include "rc_model.h"',
-        "rc_storage_t X[T * RC_INPUT_DIM];   /* quantized inputs  */",
-        "rc_storage_t Y[T * RC_OUTPUT_DIM];  /* quantized outputs */",
-        "/* float in/out (host): X[i] = rc_quantize_input(x_f); */",
-        "rc_predict(T, X, Y);",
-        "/* float out: y_f = rc_dequantize_output(Y[i]); */",
-        "```",
+        *c_block,
         "",
         "Compile `rc_kernel.c` with any C99 compiler. On AVR define nothing",
         "extra — tables are placed in Flash via `PROGMEM` automatically.",
@@ -67,30 +113,29 @@ def _readme(info: KernelInfo) -> str:
         "",
         "## Rust",
         "",
-        "```rust",
-        f"use {info.name.replace('-', '_')}::*;",
-        "let y = predict(&x_floats);            // std: quantize+run+dequant",
-        "// or, no_std / pure integer:",
-        "// predict_into(&x_q, &mut y_q);",
-        "```",
+        *rust_block,
         "",
         "`cargo build` compiles the C kernel automatically (via `build.rs` +",
-        "the `cc` crate). For embedded: `cargo build --no-default-features`",
-        "(drops the float helpers, keeps `predict_into`).",
+        "the `cc` crate). For embedded: `cargo build --no-default-features`.",
         "",
         "_Generated by rclite._",
     ])
 
 
-def export_bundle(qmodel, out_dir, *, name: str = "rc_model") -> pathlib.Path:
+def export_bundle(qmodel, out_dir, *, name: str = "rc_model",
+                  head=None) -> pathlib.Path:
     """Write the full C + header + Rust bundle for `qmodel` into `out_dir`.
+
+    `head` selects the kernel's output: None / "logits" (raw scores), or for
+    a classification readout "classify" (argmax class id, one int32 per step)
+    or "proba" (M probabilities at Q.prob_frac per step).
 
     Returns the output directory path.
     """
     out = pathlib.Path(out_dir)
     (out / "src").mkdir(parents=True, exist_ok=True)
 
-    kernel_c, info = _emit_kernel_and_info(qmodel, name)
+    kernel_c, info = _emit_kernel_and_info(qmodel, name, head=head)
 
     (out / "rc_kernel.c").write_text(kernel_c)
     (out / "rc_model.h").write_text(emit_c_header(info))

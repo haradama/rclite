@@ -24,9 +24,15 @@ def emit_c_header(info: KernelInfo) -> str:
     a(f"#define RC_OUTPUT_DIM  {info.M}")
     a(f"#define RC_RES_UNITS   {info.N}")
     a(f"#define RC_STORAGE_BITS {info.storage_bits}")
-    a(f"/* topology: {info.topology}, quantization: {info.quant} */")
+    a(f"#define RC_NUM_CLASSES {info.n_classes}")
+    a(f"/* topology: {info.topology}, quantization: {info.quant}, "
+      f"task: {info.task}, head: {info.head} */")
     a("")
     a(f"typedef {info.storage_ctype} rc_storage_t;")
+    if info.is_proba:
+        a(f"/* probabilities are emitted at Q.{info.prob_frac} "
+          f"(divide by {1 << info.prob_frac} for float). */")
+        a(f"#define RC_PROB_FRAC {info.prob_frac}")
     a("")
     a("/* Affine (scale, zero_point) view of the I/O tensors:")
     a(" *   quantize(x)   = round(x / RC_IN_SCALE)  + RC_IN_ZP   (saturated)")
@@ -45,9 +51,14 @@ def emit_c_header(info: KernelInfo) -> str:
     a("")
     a("/* Run inference over a length-T sequence (pure integer, no libm).")
     a(" *   X: row-major (T x RC_INPUT_DIM)  quantized input,  caller-owned")
-    a(" *   Y: row-major (T x RC_OUTPUT_DIM) quantized output, caller-allocated")
+    if info.is_classify:
+        a(" *   Y: (T,) int32 class ids (argmax of the readout), caller-allocated")
+    elif info.is_proba:
+        a(" *   Y: row-major (T x RC_OUTPUT_DIM) probabilities at Q.RC_PROB_FRAC")
+    else:
+        a(" *   Y: row-major (T x RC_OUTPUT_DIM) quantized output, caller-allocated")
     a(" * State is reset at entry; each call is an independent run. */")
-    a("void rc_predict(int32_t T, const rc_storage_t *X, rc_storage_t *Y);")
+    a(f"void rc_predict(int32_t T, const rc_storage_t *X, {info.out_ctype} *Y);")
     a("")
     a("/* Optional float helpers (host/desktop). Require floating point. */")
     a("#ifndef RC_NO_FLOAT")
@@ -57,9 +68,14 @@ def emit_c_header(info: KernelInfo) -> str:
     a("    if (q > RC_Q_MAX) q = RC_Q_MAX;")
     a("    return (rc_storage_t)q;")
     a("}")
-    a("static inline float rc_dequantize_output(rc_storage_t q){")
-    a("    return ((float)q - (float)RC_OUT_ZP) * RC_OUT_SCALE;")
-    a("}")
+    if info.is_proba:
+        a("static inline float rc_dequantize_output(rc_storage_t q){")
+        a("    return (float)q / (float)(1 << RC_PROB_FRAC);")
+        a("}")
+    elif not info.is_classify:
+        a("static inline float rc_dequantize_output(rc_storage_t q){")
+        a("    return ((float)q - (float)RC_OUT_ZP) * RC_OUT_SCALE;")
+        a("}")
     a("#endif /* RC_NO_FLOAT */")
     a("")
     a("#ifdef __cplusplus")

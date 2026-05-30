@@ -33,6 +33,32 @@ class KernelInfo:
     # Output dequantization (q -> float y): y = (q - out_zp) * out_scale
     out_scale: float
     out_zp: int
+    # Classification head: "logits" (regression / raw scores), "classify"
+    # (argmax class id, one int32 per step), or "proba" (M probabilities at
+    # Q.prob_frac per step). `task`/`n_classes` describe the readout.
+    head: str = "logits"
+    task: str = "REGRESSION"
+    n_classes: int = 0
+
+    @property
+    def is_classify(self) -> bool:
+        return self.head == "classify"
+
+    @property
+    def is_proba(self) -> bool:
+        return self.head == "proba"
+
+    @property
+    def prob_frac(self) -> int:
+        return min(self.storage_bits - 1, 15)
+
+    @property
+    def out_ctype(self) -> str:
+        return "int32_t" if self.is_classify else self.storage_ctype
+
+    @property
+    def out_rust(self) -> str:
+        return "i32" if self.is_classify else self.storage_rust
 
     @property
     def storage_ctype(self) -> str:
@@ -51,8 +77,16 @@ class KernelInfo:
         return (1 << (self.storage_bits - 1)) - 1
 
 
-def info_from_affine(qmodel, name: str = "rc_model") -> KernelInfo:
+def _head_meta(qmodel):
+    ro = qmodel.rc.readout
+    task = ro.task.name
+    n_classes = ro.units if task == "CLASSIFICATION" else 0
+    return task, n_classes
+
+
+def info_from_affine(qmodel, name: str = "rc_model", *, head=None) -> KernelInfo:
     cfg = qmodel.config
+    task, n_classes = _head_meta(qmodel)
     return KernelInfo(
         name=name, quant="affine",
         storage_bits=qmodel.storage_bits,
@@ -60,11 +94,13 @@ def info_from_affine(qmodel, name: str = "rc_model") -> KernelInfo:
         topology=qmodel.rc.reservoir.topology.name,
         in_scale=float(cfg.input.scale), in_zp=int(cfg.input.zero_point),
         out_scale=float(cfg.output.scale), out_zp=int(cfg.output.zero_point),
+        head=head or "logits", task=task, n_classes=n_classes,
     )
 
 
-def info_from_symmetric(qmodel, name: str = "rc_model") -> KernelInfo:
+def info_from_symmetric(qmodel, name: str = "rc_model", *, head=None) -> KernelInfo:
     cfg = qmodel.config
+    task, n_classes = _head_meta(qmodel)
     return KernelInfo(
         name=name, quant="symmetric",
         storage_bits=qmodel.target.storage_bits,
@@ -74,4 +110,5 @@ def info_from_symmetric(qmodel, name: str = "rc_model") -> KernelInfo:
         in_scale=1.0 / float(1 << cfg.input_frac), in_zp=0,
         # output is reported at state scale = 2^state_frac
         out_scale=1.0 / float(1 << cfg.state_frac), out_zp=0,
+        head=head or "logits", task=task, n_classes=n_classes,
     )
