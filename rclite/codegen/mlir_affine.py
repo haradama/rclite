@@ -650,6 +650,49 @@ def build_shared_lib(mlir_text: str, out_dir: pathlib.Path) -> pathlib.Path:
     return so
 
 
+def cross_compile_object(mlir_text: str, *, triple: str, cpu: str = "",
+                         features: str = "") -> bytes:
+    """Cross-compile MLIR to a target object for `triple` (no host link).
+
+    Connects the MLIR path to the embedded targets — emits a relocatable
+    object for e.g. thumbv6m (Cortex-M0), thumbv4t (GBA), wasm32 (WASM),
+    the same triples the llvmlite path serves. Uses the same (working) host
+    lowering and only retargets `llc`; this proves the MLIR path reaches the
+    target backends (object emission), not a packaged firmware.
+
+    NOTE: the integer kernel is emitted scalar — saturating/wrapping
+    quantized arithmetic is non-associative, so SIMD vectorization would
+    break the host↔device bit-exactness (the existing WASM quantized target
+    disables vectorization for the same reason). `features` (e.g. "+simd128")
+    only selects the target ISA; the kernel stays scalar.
+    """
+    missing = [t for t in _TOOLS if shutil.which(t) is None]
+    if missing:
+        raise RuntimeError(f"MLIR cross-compile needs {missing} on PATH")
+    with tempfile.TemporaryDirectory() as td:
+        td = pathlib.Path(td)
+        (td / "rc.mlir").write_text(mlir_text)
+
+        def run(cmd):
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            if r.returncode != 0:
+                raise RuntimeError(f"{cmd[0]} failed:\n{r.stderr[:3000]}")
+            return r.stdout
+
+        (td / "rc.ll.mlir").write_text(
+            run(["mlir-opt", str(td / "rc.mlir"), *_LOWER_PASSES]))
+        (td / "rc.ll").write_text(
+            run(["mlir-translate", "--mlir-to-llvmir", str(td / "rc.ll.mlir")]))
+        llc = ["llc", "-O2", f"-mtriple={triple}", "-filetype=obj",
+               str(td / "rc.ll"), "-o", str(td / "rc.o")]
+        if cpu:
+            llc.append(f"-mcpu={cpu}")
+        if features:
+            llc.append(f"-mattr={features}")
+        run(llc)
+        return (td / "rc.o").read_bytes()
+
+
 class _MemRef1D(ctypes.Structure):
     _fields_ = [("alloc", ctypes.c_void_p), ("align", ctypes.c_void_p),
                 ("offset", ctypes.c_int64),
