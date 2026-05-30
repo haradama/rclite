@@ -81,3 +81,37 @@ def apply_multiplier_array(x_arr: np.ndarray, M0: int, n: int) -> np.ndarray:
         prod = prod + np.int64(1 << (n - 1))
     # NumPy's >> on signed ints is arithmetic
     return prod >> n
+
+
+def quantize_multiplier_array(M_arr: np.ndarray):
+    """Per-element `quantize_multiplier`: decompose each M[i] into (M0[i], n[i]).
+
+    Returns (M0: (N,) int32, n: (N,) int32). Used for per-channel requantize
+    where each output row carries its own multiplier.
+    """
+    M_arr = np.asarray(M_arr, dtype=np.float64)
+    M0 = np.zeros(M_arr.shape, dtype=np.int32)
+    n = np.zeros(M_arr.shape, dtype=np.int32)
+    flat_M0, flat_n = M0.reshape(-1), n.reshape(-1)
+    for i, m in enumerate(M_arr.reshape(-1)):
+        a, b = quantize_multiplier(float(m))
+        flat_M0[i], flat_n[i] = a, b
+    return M0, n
+
+
+def apply_multiplier_perrow(x_arr: np.ndarray, M0_arr: np.ndarray,
+                            n_arr: np.ndarray) -> np.ndarray:
+    """Per-row `apply_multiplier_scalar`: x[i] requantized by (M0[i], n[i]).
+
+    Same round-half-up `(x*M0 + (1<<(n-1))) >> n` as `apply_multiplier_array`,
+    but the multiplier and shift vary per element (per-channel requantize).
+    The per-element runtime shift mirrors the JIT/C dynamic-shift kernels
+    bit-for-bit. Operates on int64; returns int64.
+    """
+    x64 = np.asarray(x_arr, dtype=np.int64)
+    M0_64 = np.asarray(M0_arr, dtype=np.int64)
+    n64 = np.asarray(n_arr, dtype=np.int64)
+    prod = x64 * M0_64
+    bias = np.where(n64 > 0, np.int64(1) << np.maximum(n64 - 1, 0), np.int64(0))
+    prod = prod + bias
+    return prod >> n64

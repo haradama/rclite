@@ -78,6 +78,8 @@ def calibrate_from_data(
     storage_bits: int = 8,
     w_out_storage_bits: Optional[int] = None,
     washout: Optional[int] = None,
+    per_channel_W_res: bool = False,
+    per_channel_W_out: bool = False,
 ) -> AffineQuantConfig:
     """Build an `AffineQuantConfig` from float traces on calibration data.
 
@@ -126,6 +128,30 @@ def calibrate_from_data(
     W_out_state_p = AffineParams.symmetric_absmax(
         exe.W_out[:, off:off + N], w_out_storage_bits)
 
+    # Per-channel W_res: one symmetric scale per reservoir row (output axis).
+    # `W_res` param stays a valid per-tensor representative (unused on the
+    # per-channel path); `W_res_scales` carries the per-row scales.
+    W_res_scales = (
+        AffineParams.symmetric_absmax_peraxis(exe.W_res, storage_bits)
+        if per_channel_W_res else None
+    )
+
+    # Per-channel W_out: one symmetric scale per output row (output axis),
+    # computed per column block (mirror of the per-tensor block layout).
+    W_out_bias_scales = W_out_input_scales = W_out_state_scales = None
+    if per_channel_W_out:
+        offc = 0
+        if rc.readout.include_bias:
+            W_out_bias_scales = AffineParams.symmetric_absmax_peraxis(
+                exe.W_out[:, 0:1], w_out_storage_bits)
+            offc = 1
+        if rc.readout.include_input:
+            W_out_input_scales = AffineParams.symmetric_absmax_peraxis(
+                exe.W_out[:, offc:offc + K], w_out_storage_bits)
+            offc += K
+        W_out_state_scales = AffineParams.symmetric_absmax_peraxis(
+            exe.W_out[:, offc:offc + N], w_out_storage_bits)
+
     return AffineQuantConfig(
         input=AffineParams.asymmetric_minmax(X_eff, storage_bits),
         u_pre=AffineParams.asymmetric_minmax(U_pre_eff, storage_bits),
@@ -139,4 +165,8 @@ def calibrate_from_data(
         W_out_input=W_out_input_p,
         W_out_state=W_out_state_p,
         output=AffineParams.asymmetric_minmax(Y_eff, storage_bits),
+        W_res_scales=W_res_scales,
+        W_out_bias_scales=W_out_bias_scales,
+        W_out_input_scales=W_out_input_scales,
+        W_out_state_scales=W_out_state_scales,
     )

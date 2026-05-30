@@ -90,6 +90,11 @@ def emit_affine_kernel_c(qmodel: AffineQuantizedModel,
         col_t = "int16_t" if N <= 32767 else "int32_t"
         rd_col = "RC_RD16" if N <= 32767 else "RC_RD32"
 
+    # Per-channel reservoir-step multiplier (per-row M0/n) for dense topologies.
+    use_per_channel_res = (qmodel.M_res_M0_arr is not None) and not is_structured
+    # Per-channel readout multiplier (per output-row M0/n).
+    use_per_channel_out = qmodel.M_out_state_M0_arr is not None
+
     # Chain constants (match ir_builder)
     wqmin, wqmax = -(1 << (wob - 1)), (1 << (wob - 1)) - 1
 
@@ -146,6 +151,15 @@ def emit_affine_kernel_c(qmodel: AffineQuantizedModel,
     if rc.readout.include_input:
         a(_arr("rc_row_sum_Wout_input", "int32_t",
                 qmodel.row_sum_Wout_input, "RC_RD32"))
+    if use_per_channel_out:
+        a(_arr("rc_M_out_state_M0", "int32_t", qmodel.M_out_state_M0_arr, "RC_RD32"))
+        a(_arr("rc_M_out_state_n", "int32_t", qmodel.M_out_state_n_arr, "RC_RD32"))
+        if rc.readout.include_bias:
+            a(_arr("rc_M_out_bias_M0", "int32_t", qmodel.M_out_bias_M0_arr, "RC_RD32"))
+            a(_arr("rc_M_out_bias_n", "int32_t", qmodel.M_out_bias_n_arr, "RC_RD32"))
+        if rc.readout.include_input:
+            a(_arr("rc_M_out_input_M0", "int32_t", qmodel.M_out_input_M0_arr, "RC_RD32"))
+            a(_arr("rc_M_out_input_n", "int32_t", qmodel.M_out_input_n_arr, "RC_RD32"))
     if not is_structured:
         if use_sparse:
             a(_arr("rc_W_res_val", storage_t, _wres_val, rd_s))
@@ -154,6 +168,9 @@ def emit_affine_kernel_c(qmodel: AffineQuantizedModel,
         else:
             a(_arr("rc_W_res", storage_t, qmodel.W_res_q, rd_s))
         a(_arr("rc_row_sum_W_res", "int32_t", qmodel.row_sum_W_res, "RC_RD32"))
+        if use_per_channel_res:
+            a(_arr("rc_M_res_M0", "int32_t", qmodel.M_res_M0_arr, "RC_RD32"))
+            a(_arr("rc_M_res_n", "int32_t", qmodel.M_res_n_arr, "RC_RD32"))
     if strat.kind in (LUTKind.DIRECT, LUTKind.LINEAR_INTERP):
         a(_arr("rc_lut", storage_t, qmodel.lut_q, rd_s))
     if head == "proba":
@@ -320,8 +337,13 @@ def emit_affine_kernel_c(qmodel: AffineQuantizedModel,
         a("            for (j = 0; j < RC_N; j++)")
         a(f"                acc_res += {res_cast}{rd_s}(&rc_W_res[i*RC_N + j]) * {res_cast}rc_h[j];")
         a(f"            acc_res -= {res_cast}{zp_state} * {res_cast}RC_RD32(&rc_row_sum_W_res[i]);")
-    a(f"            int32_t rq_res = RC_RQ({_clamp('acc_res', res_bits)}, "
-      f"{qmodel.M_res_M0}, {qmodel.M_res_n});")
+    if use_per_channel_res:
+        # per-row (M0[i], n[i]) — reuse the same runtime requantize fn.
+        a(f"            int32_t rq_res = RC_RQ({_clamp('acc_res', res_bits)}, "
+          f"RC_RD32(&rc_M_res_M0[i]), RC_RD32(&rc_M_res_n[i]));")
+    else:
+        a(f"            int32_t rq_res = RC_RQ({_clamp('acc_res', res_bits)}, "
+          f"{qmodel.M_res_M0}, {qmodel.M_res_n});")
     a(f"            rc_pre[i] = rc_sat({zp_pre + qmodel.bias_pre} + rq_in + rq_res);")
     a("        }")
 
@@ -343,23 +365,30 @@ def emit_affine_kernel_c(qmodel: AffineQuantizedModel,
     a("        for (m = 0; m < RC_M; m++) {")
     a(f"            int32_t y = {zp_output};")
     if rc.readout.include_bias:
+        m_bias = ("RC_RD32(&rc_M_out_bias_M0[m]), RC_RD32(&rc_M_out_bias_n[m])"
+                  if use_per_channel_out
+                  else f"{qmodel.M_out_bias_M0}, {qmodel.M_out_bias_n}")
         a(f"            y += RC_RQ((int32_t){rd_w}(&rc_W_out[m*RC_F + {off_bias}]), "
-          f"{qmodel.M_out_bias_M0}, {qmodel.M_out_bias_n});")
+          f"{m_bias});")
     if rc.readout.include_input:
         a(f"            {ro_t} acc_i = 0;")
         a("            for (k = 0; k < RC_K; k++)")
         a(f"                acc_i += {ro_cast}{rd_w}(&rc_W_out[m*RC_F + {off_input} + k]) "
           f"* {ro_cast}X[t*RC_K + k];")
         a(f"            acc_i -= {ro_cast}{zp_input} * {ro_cast}RC_RD32(&rc_row_sum_Wout_input[m]);")
-        a(f"            y += RC_RQ({_clamp('acc_i', ro_bits)}, "
-          f"{qmodel.M_out_input_M0}, {qmodel.M_out_input_n});")
+        m_in = ("RC_RD32(&rc_M_out_input_M0[m]), RC_RD32(&rc_M_out_input_n[m])"
+                if use_per_channel_out
+                else f"{qmodel.M_out_input_M0}, {qmodel.M_out_input_n}")
+        a(f"            y += RC_RQ({_clamp('acc_i', ro_bits)}, {m_in});")
     a(f"            {ro_t} acc_s = 0;")
     a("            for (j = 0; j < RC_N; j++)")
     a(f"                acc_s += {ro_cast}{rd_w}(&rc_W_out[m*RC_F + {off_state} + j]) "
       f"* {ro_cast}rc_h[j];")
     a(f"            acc_s -= {ro_cast}{zp_state} * {ro_cast}RC_RD32(&rc_row_sum_Wout_state[m]);")
-    a(f"            y += RC_RQ({_clamp('acc_s', ro_bits)}, "
-      f"{qmodel.M_out_state_M0}, {qmodel.M_out_state_n});")
+    m_st = ("RC_RD32(&rc_M_out_state_M0[m]), RC_RD32(&rc_M_out_state_n[m])"
+            if use_per_channel_out
+            else f"{qmodel.M_out_state_M0}, {qmodel.M_out_state_n}")
+    a(f"            y += RC_RQ({_clamp('acc_s', ro_bits)}, {m_st});")
     if classify:
         # argmax over the saturated quantized scores (monotone in the logits).
         a("            int32_t yq = (int32_t)rc_sat(y);")

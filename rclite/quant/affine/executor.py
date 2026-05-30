@@ -35,7 +35,7 @@ from __future__ import annotations
 import numpy as np
 
 from .quantize import AffineQuantizedModel
-from .multiplier import apply_multiplier_array
+from .multiplier import apply_multiplier_array, apply_multiplier_perrow
 from .lut import LUTKind
 
 
@@ -135,7 +135,13 @@ class AffineQuantizedExecutor:
         # Uses integer (M0, n) multipliers so the JIT and this Python ref are
         # bit-exact on the requantize step.
         rq_in  = apply_multiplier_array(_clamp_i32(acc_in),  q.M_in_M0,  q.M_in_n)
-        rq_res = apply_multiplier_array(_clamp_i32(acc_res), q.M_res_M0, q.M_res_n)
+        if q.M_res_M0_arr is not None:
+            # per-channel: each reservoir row uses its own (M0[i], n[i]).
+            rq_res = apply_multiplier_perrow(
+                _clamp_i32(acc_res), q.M_res_M0_arr, q.M_res_n_arr)
+        else:
+            rq_res = apply_multiplier_array(
+                _clamp_i32(acc_res), q.M_res_M0, q.M_res_n)
         pre_q = zp_pre + q.bias_pre + rq_in + rq_res
         pre_q = _saturate(pre_q, sb).astype(np.int32)
 
@@ -259,25 +265,32 @@ class AffineQuantizedExecutor:
         zp_input = cfg.input.zero_point
         zp_state = cfg.state.zero_point
 
+        per_channel = q.M_out_state_M0_arr is not None
+
+        def _rq(x, M0_s, n_s, M0_a, n_a):
+            if per_channel:
+                return apply_multiplier_perrow(x, M0_a, n_a)
+            return apply_multiplier_array(x, M0_s, n_s)
+
         y_acc = np.full(M, zp_y, dtype=np.int64)
         off = 0
         if rc.readout.include_bias:
             bias_col = _clamp_i32(Wo[:, 0])  # (M,)
-            y_acc += apply_multiplier_array(bias_col, q.M_out_bias_M0,
-                                              q.M_out_bias_n)
+            y_acc += _rq(bias_col, q.M_out_bias_M0, q.M_out_bias_n,
+                         q.M_out_bias_M0_arr, q.M_out_bias_n_arr)
             off += 1
         if rc.readout.include_input:
             Wi = Wo[:, off:off + K]  # (M, K)
             dot_in = Wi @ x_raw_q.astype(np.int64)  # (M,)
             adj_in = dot_in - zp_input * q.row_sum_Wout_input.astype(np.int64)
-            y_acc += apply_multiplier_array(_clamp_i32(adj_in),
-                                              q.M_out_input_M0, q.M_out_input_n)
+            y_acc += _rq(_clamp_i32(adj_in), q.M_out_input_M0, q.M_out_input_n,
+                         q.M_out_input_M0_arr, q.M_out_input_n_arr)
             off += K
         Ws = Wo[:, off:off + N]  # (M, N)
         dot_st = Ws @ state_q.astype(np.int64)
         adj_st = dot_st - zp_state * q.row_sum_Wout_state.astype(np.int64)
-        y_acc += apply_multiplier_array(_clamp_i32(adj_st),
-                                          q.M_out_state_M0, q.M_out_state_n)
+        y_acc += _rq(_clamp_i32(adj_st), q.M_out_state_M0, q.M_out_state_n,
+                     q.M_out_state_M0_arr, q.M_out_state_n_arr)
 
         return _saturate(y_acc, self.storage_bits).astype(np.int32)
 

@@ -68,6 +68,21 @@ class AffineParams:
         max_q = (1 << (storage_bits - 1)) - 1
         return cls(scale=m / max_q, zero_point=0, storage_bits=storage_bits)
 
+    @staticmethod
+    def symmetric_absmax_peraxis(arr, storage_bits: int = 8,
+                                 eps: float = 1e-8) -> np.ndarray:
+        """Per-row symmetric scales: scale[i] = max|arr[i,:]| / qmax.
+
+        Returns a 1-D array of per-row scales (zero_point=0 throughout), the
+        per-channel analogue of `symmetric_absmax` along axis 0 (one scale per
+        output row). Used for per-channel weight quantization.
+        """
+        a = np.asarray(arr, dtype=np.float64)
+        m = np.abs(a).max(axis=1)
+        m = np.where(m < eps, eps, m)
+        max_q = (1 << (storage_bits - 1)) - 1
+        return (m / max_q).astype(np.float64)
+
     @classmethod
     def asymmetric_minmax(cls, arr, storage_bits: int = 8,
                            eps: float = 1e-8) -> "AffineParams":
@@ -127,6 +142,19 @@ class AffineQuantConfig:
     # Optional: present only when the readout has those phi components.
     W_out_bias: AffineParams | None = None    # symmetric (zp=0)
     W_out_input: AffineParams | None = None   # symmetric (zp=0)
+    # Optional per-channel (per reservoir-row) scales for W_res. When set
+    # (length N), W_res is quantized per output row instead of per-tensor
+    # and the reservoir-step requantize uses a per-row multiplier. `W_res`
+    # above stays a valid representative scalar but is unused on this path.
+    W_res_scales: "np.ndarray | None" = None
+    # Optional per-channel (per readout output-row) scales for the W_out
+    # column blocks. When `W_out_state_scales` is set (length M), each output
+    # channel gets its own block scales and the readout requantize uses a
+    # per-row multiplier. The block `W_out_*` params stay valid representatives
+    # but are unused on this path. bias/input arrays are None if absent.
+    W_out_bias_scales: "np.ndarray | None" = None
+    W_out_input_scales: "np.ndarray | None" = None
+    W_out_state_scales: "np.ndarray | None" = None
 
     def __post_init__(self):
         w_out_fields = ["W_out_state"]
