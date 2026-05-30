@@ -20,6 +20,7 @@ from rclite.targets import (
     HostTarget, CortexM0Target, MicrobitV1, Microbit,
     WasmTarget, Wasmtime,
     GbaTarget, Gba,
+    NesTarget, Nes,
 )
 
 
@@ -236,6 +237,66 @@ def test_gba_full_pipeline_mgba():
         assert result.success, f"mGBA output:\n{result.output}"
         assert "TEST_PASS" in result.output
         assert "TEST_FAIL" not in result.output
+
+
+def test_nes_class_attributes():
+    assert issubclass(Nes, NesTarget)
+    n = Nes()
+    assert n.name == "nes/6502"
+    assert n.mapper == "nrom"
+    assert n.cc == "mos-nes-nrom-clang"
+
+
+def test_nes_compile_emits_sources_without_toolchain():
+    # The C kernel + harness are emitted even when llvm-mos is absent;
+    # build=False skips the link step so this runs everywhere.
+    qm, sample = _build_affine_gba()
+    with tempfile.TemporaryDirectory() as td:
+        art = Nes().compile_affine_quantized(
+            qm, output_dir=pathlib.Path(td), test_inputs=sample, build=False)
+        assert art.binary is None
+        assert art.metadata["cpu"] == "6502"
+        assert art.metadata["affine"] is True
+        srcs = {p.name for p in art.sources}
+        assert {"main.c", "rc_kernel.c"} <= srcs
+        # harness embeds the blargg $6000 protocol signature
+        main_txt = (pathlib.Path(td) / "main.c").read_text()
+        assert "0x6000" in main_txt and "TEST_PASS" in main_txt
+
+
+def test_nes_compile_emits_rom():
+    if shutil.which("mos-nes-nrom-clang") is None:
+        return  # skip — no llvm-mos toolchain
+    qm, sample = _build_affine_gba()
+    with tempfile.TemporaryDirectory() as td:
+        art = Nes().compile_affine_quantized(
+            qm, output_dir=pathlib.Path(td), test_inputs=sample)
+        assert art.binary is not None and art.binary.exists()
+        assert art.binary.suffix == ".nes"
+
+
+def test_nes_full_pipeline_emulator():
+    if shutil.which("mos-nes-nrom-clang") is None:
+        return  # skip
+    has_mesen = any(shutil.which(b) for b in ("Mesen", "mesen", "Mesen2"))
+    has_fceux = shutil.which("fceux") or shutil.which("/usr/games/fceux")
+    if not has_mesen and not has_fceux:
+        return  # skip — no NES emulator (Mesen --testrunner or fceux+Lua)
+    qm, sample = _build_affine_gba()
+    with tempfile.TemporaryDirectory() as td:
+        target = Nes()
+        art = target.compile_affine_quantized(
+            qm, output_dir=pathlib.Path(td), test_inputs=sample)
+        result = target.run(art)  # auto: Mesen if present, else FCEUX
+        assert result.success, f"emulator output:\n{result.output}"
+        assert "TEST_PASS" in result.output
+        assert "TEST_FAIL" not in result.output
+
+
+def test_nes_compile_rejects_non_affine():
+    rc, exe, sample = _build()
+    expect_raises(NotImplementedError, Nes().compile, rc, exe,
+                  output_dir="/tmp/unused_nes")
 
 
 TESTS = [v for k, v in list(globals().items())

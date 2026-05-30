@@ -13,6 +13,8 @@ Available targets:
     ArduinoUnoTarget  — 8-bit AVR (ATmega328P) affine kernel + .ino sketch
     GbaTarget         — Game Boy Advance (ARM7TDMI / ARMv4T) cartridge
     Gba               — convenience preset: GbaTarget runnable via mGBA
+    NesTarget         — Nintendo Entertainment System (6502 / NROM) via llvm-mos
+    Nes               — convenience preset: NesTarget runnable via Mesen
 """
 from .target import Target, CompiledArtifact, RunResult
 from .host import HostTarget
@@ -20,6 +22,7 @@ from .cortex_m0 import CortexM0Target, CortexM0Board, MicrobitV1, Microbit
 from .wasm import WasmTarget, Wasmtime
 from .arduino import ArduinoUnoTarget
 from .gba import GbaTarget, Gba
+from .nes import NesTarget, Nes
 
 __all__ = [
     "Target", "CompiledArtifact", "RunResult",
@@ -28,4 +31,5 @@ __all__ = [
     "WasmTarget", "Wasmtime",
     "ArduinoUnoTarget",
     "GbaTarget", "Gba",
+    "NesTarget", "Nes",
 ]
