@@ -1448,6 +1448,8 @@ class _AffineLowerer:
         # Requantize multipliers (M0, n)
         self.M_in_M0,  self.M_in_n  = int(md["M_in_M0"]),  int(md["M_in_n"])
         self.M_res_M0, self.M_res_n = int(md["M_res_M0"]), int(md["M_res_n"])
+        self.per_channel_res = bool(md.get("per_channel_res", False))
+        self.per_channel_out = bool(md.get("per_channel_out", False))
         self.leak_M0,  self.leak_n  = int(md["leak_M0"]),  int(md["leak_n"])
         self.M_out_bias_M0  = int(md["M_out_bias_M0"])
         self.M_out_bias_n   = int(md["M_out_bias_n"])
@@ -1620,6 +1622,25 @@ class _AffineLowerer:
             prod = self.b.add(prod, self._ci64(1 << (n - 1)))
         shr = self.b.ashr(prod, self._ci64(n))
         return self.b.trunc(shr, _I32)
+
+    def _emit_requantize_i32_dynamic(self, acc_i32, M0_i32, n_i32):
+        """Runtime-shift requantize `(acc*M0 + (1<<(n-1)))>>n`, M0/n as SSA i32.
+
+        Per-channel variant: M0 and n are loaded per reservoir row, so the
+        shift amount is dynamic. Matches `apply_multiplier_perrow` bit-for-bit
+        (n==0 → no rounding bias, ashr by 0 is identity).
+        """
+        b = self.b
+        acc_64 = b.sext(acc_i32, _I64)
+        m0_64 = b.sext(M0_i32, _I64)
+        n_64 = b.sext(n_i32, _I64)
+        prod = b.mul(acc_64, m0_64)
+        nz = b.icmp_signed(">", n_64, self._ci64(0))
+        safe_sh = b.select(nz, b.sub(n_64, self._ci64(1)), self._ci64(0))
+        half = b.select(nz, b.shl(self._ci64(1), safe_sh), self._ci64(0))
+        prod = b.add(prod, half)
+        shr = b.ashr(prod, n_64)
+        return b.trunc(shr, _I32)
 
     def _emit_saturate_to_storage(self, val_i32):
         """Clamp i32 to signed storage range, then truncate to storage_ty."""
@@ -1866,8 +1887,14 @@ class _AffineLowerer:
             acc_res_final = b.sub(b.load(acc_res_var),
                                   b.mul(self._ca(self.zp_state), rs_res))
             acc_res_i32 = self._clamp_to_i32(acc_res_final)
-        rq_res = self._emit_requantize_i32(
-            acc_res_i32, self.M_res_M0, self.M_res_n)
+        if self.per_channel_res and not self.structured:
+            # per-row (M0[i], n[i]) loaded from i32 globals → dynamic shift.
+            m0_i = _load1d_global(b, self.globals["M_res_M0"], i)
+            n_i = _load1d_global(b, self.globals["M_res_n"], i)
+            rq_res = self._emit_requantize_i32_dynamic(acc_res_i32, m0_i, n_i)
+        else:
+            rq_res = self._emit_requantize_i32(
+                acc_res_i32, self.M_res_M0, self.M_res_n)
 
         pre_total = b.add(
             b.add(self._ci32(self.zp_pre + self.bias_pre), rq_in), rq_res)
@@ -2056,6 +2083,15 @@ class _AffineLowerer:
     # ------------------------------------------------------------------
     # readout
 
+    def _rq_out(self, x_i32, m, name, M0_scalar, n_scalar):
+        """Readout requantize: per-row (M0[m], n[m]) when per_channel_out,
+        else the scalar (M0, n). `m` is the output-row SSA index."""
+        if self.per_channel_out:
+            m0 = _load1d_global(self.b, self.globals[name + "_M0"], m)
+            nn = _load1d_global(self.b, self.globals[name + "_n"], m)
+            return self._emit_requantize_i32_dynamic(x_i32, m0, nn)
+        return self._emit_requantize_i32(x_i32, M0_scalar, n_scalar)
+
     def _lower_readout_linear(self, op):
         g_Wout = self.globals["W_out"]
         g_rs_state = self.globals["row_sum_Wout_state"]
@@ -2082,10 +2118,9 @@ class _AffineLowerer:
 
             if self.include_bias:
                 w0 = _load2d_global(self.b, g_Wout, F, m, _ci(off_bias))
-                rq_b = self._emit_requantize_i32(
-                    self._clamp_i64_to_i32(self.b.sext(w0, _I64)),
-                    self.M_out_bias_M0, self.M_out_bias_n,
-                )
+                clamped_b = self._clamp_i64_to_i32(self.b.sext(w0, _I64))
+                rq_b = self._rq_out(clamped_b, m, "M_out_bias",
+                                    self.M_out_bias_M0, self.M_out_bias_n)
                 self.b.store(self.b.add(self.b.load(y_var), rq_b), y_var)
 
             if self.include_input:
@@ -2106,10 +2141,9 @@ class _AffineLowerer:
                     self.b.load(acc_var),
                     self.b.mul(self._ci64(self.zp_input), rs),
                 )
-                rq_i = self._emit_requantize_i32(
-                    self._clamp_i64_to_i32(adj),
-                    self.M_out_input_M0, self.M_out_input_n,
-                )
+                rq_i = self._rq_out(self._clamp_i64_to_i32(adj), m,
+                                    "M_out_input",
+                                    self.M_out_input_M0, self.M_out_input_n)
                 self.b.store(self.b.add(self.b.load(y_var), rq_i), y_var)
 
             acc_var = self.b.alloca(_I64, name="acc_state_ro")
@@ -2128,10 +2162,8 @@ class _AffineLowerer:
                 self.b.load(acc_var),
                 self.b.mul(self._ci64(self.zp_state), rs),
             )
-            rq_s = self._emit_requantize_i32(
-                self._clamp_i64_to_i32(adj),
-                self.M_out_state_M0, self.M_out_state_n,
-            )
+            rq_s = self._rq_out(self._clamp_i64_to_i32(adj), m, "M_out_state",
+                                self.M_out_state_M0, self.M_out_state_n)
             self.b.store(self.b.add(self.b.load(y_var), rq_s), y_var)
 
             y_q = self._emit_saturate_to_storage(self.b.load(y_var))

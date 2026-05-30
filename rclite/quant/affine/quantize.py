@@ -34,7 +34,7 @@ from rclite.core.composite import ReservoirComputer
 from rclite.runtime.reference import RCExecutor
 
 from .types import AffineQuantConfig
-from .multiplier import quantize_multiplier
+from .multiplier import quantize_multiplier, quantize_multiplier_array
 from .lut import LUTStrategy, LUTKind, LUTArtifacts, build_lut_artifacts
 
 
@@ -72,6 +72,11 @@ class AffineQuantizedModel:
     M_in_n: int = 0
     M_res_M0: int = 0
     M_res_n: int = 0
+    # Per-channel (per reservoir-row) reservoir-step multiplier. When set
+    # (length N), the step requantize uses M_res_M0_arr[i]/M_res_n_arr[i]
+    # instead of the scalar M_res_M0/M_res_n (per-tensor stays the default).
+    M_res_M0_arr: Optional[np.ndarray] = None
+    M_res_n_arr: Optional[np.ndarray] = None
     # Integer preprocess (only meaningful when input_offset != 0 or
     # input_scaling != 1). For the identity case (the common case),
     # `has_integer_preprocess = False` and the kernel uses X directly as u_pre.
@@ -102,6 +107,15 @@ class AffineQuantizedModel:
     M_out_state_n: int = 0
     row_sum_Wout_input: Optional[np.ndarray] = None  # (M,) int32 (if include_input)
     row_sum_Wout_state: Optional[np.ndarray] = None  # (M,) int32
+    # Per-channel (per output-row) readout multipliers. When set (length M),
+    # the readout requantize uses these per-row (M0[m], n[m]) instead of the
+    # scalar M_out_*; per-tensor (None) stays the default.
+    M_out_bias_M0_arr: Optional[np.ndarray] = None
+    M_out_bias_n_arr: Optional[np.ndarray] = None
+    M_out_input_M0_arr: Optional[np.ndarray] = None
+    M_out_input_n_arr: Optional[np.ndarray] = None
+    M_out_state_M0_arr: Optional[np.ndarray] = None
+    M_out_state_n_arr: Optional[np.ndarray] = None
 
     state_init_q: Optional[np.ndarray] = field(default=None)
 
@@ -175,24 +189,61 @@ def quantize_model_affine(
 
     # Weight quantization (symmetric, zp=0).
     W_in_q  = config.W_in.quantize_array(exe.W_in)
-    W_res_q = config.W_res.quantize_array(exe.W_res)
+    # W_res: per-tensor (single scale) by default, or per-channel (per
+    # reservoir-row scale) when config.W_res_scales is set.
+    per_channel_res = config.W_res_scales is not None
+    if per_channel_res:
+        W_res_scales = np.asarray(config.W_res_scales, dtype=np.float64)
+        N_res = exe.W_res.shape[0]
+        if W_res_scales.shape != (N_res,):
+            raise ValueError(
+                f"W_res_scales shape {W_res_scales.shape} != ({N_res},)")
+        qmax = (1 << (config.W_res.storage_bits - 1)) - 1
+        qmin = -(1 << (config.W_res.storage_bits - 1))
+        W_res_q = np.clip(
+            np.rint(exe.W_res / W_res_scales[:, None]).astype(np.int64),
+            qmin, qmax).astype(config.W_res.storage_dtype)
+    else:
+        W_res_q = config.W_res.quantize_array(exe.W_res)
     # W_out: per-column-block scales (mirage-style). Each block is quantized
     # at its own scale so a tiny bias coef isn't crushed by a huge state coef.
     K = rc.input.units
     N = rc.reservoir.units
     # W_out uses its own (possibly wider) storage dtype — mixed precision.
     w_out_dtype = config.W_out_state.storage_dtype
+    per_channel_out = config.W_out_state_scales is not None
+    wo_bits = config.W_out_state.storage_bits
+    wo_qmax = (1 << (wo_bits - 1)) - 1
+    wo_qmin = -(1 << (wo_bits - 1))
+
+    def _q_block_perrow(block, scales):
+        """Quantize a (M, w) block per output row by scales (M,)."""
+        q = np.rint(block / np.asarray(scales)[:, None]).astype(np.int64)
+        return np.clip(q, wo_qmin, wo_qmax).astype(w_out_dtype)
+
     W_out_q = np.zeros_like(W_out, dtype=w_out_dtype)
     off = 0
     if rc.readout.include_bias:
-        W_out_q[:, 0:1] = config.W_out_bias.quantize_array(W_out[:, 0:1])
+        if per_channel_out:
+            W_out_q[:, 0:1] = _q_block_perrow(
+                W_out[:, 0:1], config.W_out_bias_scales)
+        else:
+            W_out_q[:, 0:1] = config.W_out_bias.quantize_array(W_out[:, 0:1])
         off = 1
     if rc.readout.include_input:
-        W_out_q[:, off:off + K] = config.W_out_input.quantize_array(
-            W_out[:, off:off + K])
+        if per_channel_out:
+            W_out_q[:, off:off + K] = _q_block_perrow(
+                W_out[:, off:off + K], config.W_out_input_scales)
+        else:
+            W_out_q[:, off:off + K] = config.W_out_input.quantize_array(
+                W_out[:, off:off + K])
         off += K
-    W_out_q[:, off:off + N] = config.W_out_state.quantize_array(
-        W_out[:, off:off + N])
+    if per_channel_out:
+        W_out_q[:, off:off + N] = _q_block_perrow(
+            W_out[:, off:off + N], config.W_out_state_scales)
+    else:
+        W_out_q[:, off:off + N] = config.W_out_state.quantize_array(
+            W_out[:, off:off + N])
 
     # Per-row weight sums for the zp folding (kept as i32 so LLVM globals
     # don't need an i64 path).
@@ -204,7 +255,14 @@ def quantize_model_affine(
 
     # Reservoir-step multipliers
     M_in  = (config.W_in.scale  * config.u_pre.scale) / config.pre.scale
-    M_res = (config.W_res.scale * config.state.scale) / config.pre.scale
+    # M_res: scalar (per-tensor) or per-row array (per-channel).
+    if per_channel_res:
+        M_res_arr = (W_res_scales * config.state.scale) / config.pre.scale
+        M_res = float(M_res_arr.max())  # representative (float-ref convenience)
+        M_res_M0_arr, M_res_n_arr = quantize_multiplier_array(M_res_arr)
+    else:
+        M_res = (config.W_res.scale * config.state.scale) / config.pre.scale
+        M_res_M0_arr = M_res_n_arr = None
 
     # LUT / approximation artifacts per the chosen strategy.
     lut_artifacts = build_lut_artifacts(config, lut_strategy)
@@ -236,6 +294,20 @@ def quantize_model_affine(
     M_out_input_M0, M_out_input_n = quantize_multiplier(M_out_input)
     M_out_state_M0, M_out_state_n = quantize_multiplier(M_out_state)
 
+    # Per-channel readout multipliers (per output row), when enabled.
+    (M_out_bias_M0_arr, M_out_bias_n_arr,
+     M_out_input_M0_arr, M_out_input_n_arr,
+     M_out_state_M0_arr, M_out_state_n_arr) = (None,) * 6
+    if per_channel_out:
+        M_out_state_M0_arr, M_out_state_n_arr = quantize_multiplier_array(
+            config.W_out_state_scales * config.state.scale / s_y)
+        if rc.readout.include_bias:
+            M_out_bias_M0_arr, M_out_bias_n_arr = quantize_multiplier_array(
+                config.W_out_bias_scales / s_y)
+        if rc.readout.include_input:
+            M_out_input_M0_arr, M_out_input_n_arr = quantize_multiplier_array(
+                config.W_out_input_scales * config.input.scale / s_y)
+
     # Integer preprocess multipliers (only needed for non-identity preprocess).
     offset = float(rc.input.input_offset)
     scaling = float(rc.input.input_scaling)
@@ -262,6 +334,7 @@ def quantize_model_affine(
         M_in=M_in, M_res=M_res,
         M_in_M0=M_in_M0, M_in_n=M_in_n,
         M_res_M0=M_res_M0, M_res_n=M_res_n,
+        M_res_M0_arr=M_res_M0_arr, M_res_n_arr=M_res_n_arr,
         leak_M0=leak_M0, leak_n=leak_n,
         M_out_bias=M_out_bias,
         M_out_input=M_out_input,
@@ -273,4 +346,9 @@ def quantize_model_affine(
         pre_M0=pre_M0, pre_n=pre_n, pre_const=pre_const,
         row_sum_Wout_input=row_sum_Wout_input,
         row_sum_Wout_state=row_sum_Wout_state,
+        M_out_bias_M0_arr=M_out_bias_M0_arr, M_out_bias_n_arr=M_out_bias_n_arr,
+        M_out_input_M0_arr=M_out_input_M0_arr,
+        M_out_input_n_arr=M_out_input_n_arr,
+        M_out_state_M0_arr=M_out_state_M0_arr,
+        M_out_state_n_arr=M_out_state_n_arr,
     )

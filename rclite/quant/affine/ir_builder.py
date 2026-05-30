@@ -75,6 +75,11 @@ def build_ir_from_quantized_affine(qmodel: AffineQuantizedModel,
     if not is_structured:
         weights["W_res"] = qmodel.W_res_q
         weights["row_sum_W_res"] = qmodel.row_sum_W_res
+        # Per-channel reservoir-step multiplier: emit per-row (M0, n) as i32
+        # globals so the lowering can index them per reservoir row.
+        if qmodel.M_res_M0_arr is not None:
+            weights["M_res_M0"] = qmodel.M_res_M0_arr.astype("int32")
+            weights["M_res_n"] = qmodel.M_res_n_arr.astype("int32")
     # The LUT global is only emitted for the table-based strategies.
     if qmodel.lut_strategy.kind in (LUTKind.DIRECT, LUTKind.LINEAR_INTERP):
         weights["lut_table"] = qmodel.lut_q
@@ -84,6 +89,17 @@ def build_ir_from_quantized_affine(qmodel: AffineQuantizedModel,
                 "qmodel has include_input=True but row_sum_Wout_input is None"
             )
         weights["row_sum_Wout_input"] = qmodel.row_sum_Wout_input
+
+    # Per-channel readout multipliers as i32 globals (per output row).
+    if qmodel.M_out_state_M0_arr is not None:
+        weights["M_out_state_M0"] = qmodel.M_out_state_M0_arr.astype("int32")
+        weights["M_out_state_n"] = qmodel.M_out_state_n_arr.astype("int32")
+        if rc.readout.include_bias:
+            weights["M_out_bias_M0"] = qmodel.M_out_bias_M0_arr.astype("int32")
+            weights["M_out_bias_n"] = qmodel.M_out_bias_n_arr.astype("int32")
+        if rc.readout.include_input:
+            weights["M_out_input_M0"] = qmodel.M_out_input_M0_arr.astype("int32")
+            weights["M_out_input_n"] = qmodel.M_out_input_n_arr.astype("int32")
 
     # When input_offset != 0 or input_scaling != 1, the kernel needs an
     # integer preprocess step that writes u_pre[k] into a scratch buffer
@@ -161,6 +177,8 @@ def build_ir_from_quantized_affine(qmodel: AffineQuantizedModel,
         # Reservoir-step multipliers (integer (M0, n))
         "M_in_M0":  qmodel.M_in_M0,  "M_in_n":  qmodel.M_in_n,
         "M_res_M0": qmodel.M_res_M0, "M_res_n": qmodel.M_res_n,
+        "per_channel_res": qmodel.M_res_M0_arr is not None,
+        "per_channel_out": qmodel.M_out_state_M0_arr is not None,
         "leak_M0":  qmodel.leak_M0,  "leak_n":  qmodel.leak_n,
         # Readout multipliers
         "M_out_bias_M0":  qmodel.M_out_bias_M0,
