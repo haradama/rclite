@@ -2443,6 +2443,31 @@ def compile_quantized_rc(qmodel, **kwargs) -> CompiledQuantizedRC:
     return CompiledQuantizedRC(qmodel, **kwargs)
 
 
+_FASTMATH_OPS = ("fadd", "fsub", "fmul", "fdiv", "fneg")
+
+
+def _add_fastmath_flags(ir_text: str) -> str:
+    """Insert `fast` into every FP arithmetic instruction in the IR text.
+
+    Matches `<op> ` followed by a float/double/vector type and rewrites it
+    to `<op> fast `. The leading word boundary plus the following-type
+    lookahead protect identifiers that merely start with `fadd`/etc.
+
+    Needed only for vectorized targets: strict IEEE FP addition is not
+    associative, so the LLVM loop vectorizer refuses to reorder the matmul
+    reductions (and thus leaves them scalar) unless the `fadd`/`fmul`
+    carry `fast` (or at least `reassoc contract`).
+    """
+    import re
+    for op in _FASTMATH_OPS:
+        pattern = re.compile(
+            rf"\b{op}\s+(?=(?:float|double|half|<\s*\d+\s+x\s+"
+            rf"(?:float|double|half)\s*>))"
+        )
+        ir_text = pattern.sub(f"{op} fast ", ir_text)
+    return ir_text
+
+
 class CrossCompiledRC:
     """AOT-only compiler targeting a non-host triple (e.g. Cortex-M0).
 
@@ -2457,7 +2482,7 @@ class CrossCompiledRC:
     def __init__(self, rc: ReservoirComputer, exe: RCExecutor, *,
                  triple: str, cpu: str = "", features: str = "",
                  dtype: str = "f32", opt_level: int = 2, passes=None,
-                 head=None):
+                 head=None, vectorize: bool = False):
         _ensure_all_targets()
         self.rc = rc
         self.exe = exe
@@ -2465,10 +2490,14 @@ class CrossCompiledRC:
         self.cpu = cpu
         self.dtype = dtype
         self.head = head or "logits"
+        self.vectorize = vectorize
 
         module = emit_module(rc, exe, dtype=dtype, passes=passes, head=head)
         module.triple = triple
-        self._ir_text = str(module)
+        ir_text = str(module)
+        if vectorize:
+            ir_text = _add_fastmath_flags(ir_text)
+        self._ir_text = ir_text
         self._mod = llvm.parse_assembly(self._ir_text)
         self._mod.verify()
 
@@ -2479,8 +2508,17 @@ class CrossCompiledRC:
 
         pto = llvm.create_pipeline_tuning_options()
         pto.speed_level = opt_level
-        pto.loop_vectorization = False  # Cortex-M0 has no SIMD; skip vector passes.
-        pto.slp_vectorization = False
+        # Scalar targets (e.g. Cortex-M0) have no SIMD, so vector passes only
+        # bloat the code. Targets with a vector ISA (e.g. wasm32 +simd128)
+        # opt in via `vectorize=True` to let LLVM lower the f32 matmul inner
+        # loops to packed `v128` ops (f32x4.mul / fma / load).
+        pto.loop_vectorization = vectorize
+        pto.slp_vectorization = vectorize
+        # With weight shapes known at compile time, full unrolling eagerly
+        # explodes the matmuls into thousands of scalar fmuls *before* the
+        # loop vectorizer runs, defeating SIMD. Keep the loops rolled when
+        # vectorizing so the vectorizer gets first crack at them.
+        pto.loop_unrolling = not vectorize
         pb = llvm.create_pass_builder(self._tm, pto)
         mpm = pb.getModulePassManager()
         mpm.run(self._mod, pb)

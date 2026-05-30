@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>rclite &middot; Echo State Network in WebAssembly</title>
+  <meta name="description"
+        content="An Echo State Network trained with rclite, cross-compiled to WebAssembly, running live in your browser." />
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>rclite<span class="dot">.</span> Echo State Network &mdash; live in WebAssembly</h1>
+      <p class="sub">
+        A Reservoir Computing model trained with
+        <a href="https://github.com/haradama/rclite">rclite</a>, cross-compiled
+        to a zero-WASI WebAssembly module and running entirely in your browser.
+        No server-side inference &mdash; the reservoir kernel executes locally.
+      </p>
+      <div class="badges" id="badges">
+        <span class="badge">loading model&hellip;</span>
+      </div>
+    </header>
+
+    <div class="tabs">
+      <div class="tab active" data-mode="predict">Predict &mdash; you drive, the ESN forecasts</div>
+      <div class="tab" data-mode="dream">Dream &mdash; the ESN runs on its own</div>
+    </div>
+
+    <div class="scope-card">
+      <canvas id="scope" width="1800" height="640"></canvas>
+      <div class="legend">
+        <span><i class="swatch" style="background:var(--accent)"></i>input</span>
+        <span><i class="swatch" style="background:var(--accent2)"></i>ESN&nbsp;1-step&nbsp;forecast</span>
+      </div>
+    </div>
+
+    <div class="readouts">
+      <div class="r"><span class="k">forecast error (NRMSE)</span><span class="v" id="r-nrmse">&mdash;</span></div>
+      <div class="r"><span class="k">inference / frame</span><span class="v" id="r-time">&mdash;</span></div>
+      <div class="r"><span class="k">reservoir units</span><span class="v" id="r-units">&mdash;</span></div>
+      <div class="r"><span class="k">module size</span><span class="v" id="r-size">&mdash;</span></div>
+    </div>
+
+    <div class="controls">
+      <div class="row">
+        <button class="btn primary" id="playPause">Pause</button>
+
+        <!-- Predict-mode controls -->
+        <div class="ctl mode-only predict">
+          <label for="wave">waveform</label>
+          <select id="wave">
+            <option value="sine">sine</option>
+            <option value="twotone">two-tone</option>
+            <option value="square">square</option>
+            <option value="triangle">triangle</option>
+            <option value="noisy">noisy sine</option>
+          </select>
+        </div>
+        <div class="ctl mode-only predict">
+          <label for="freq">frequency <span class="val" id="freqV"></span></label>
+          <input type="range" id="freq" min="8" max="80" value="32" />
+        </div>
+        <div class="ctl mode-only predict">
+          <label for="amp">amplitude <span class="val" id="ampV"></span></label>
+          <input type="range" id="amp" min="10" max="100" value="80" />
+        </div>
+        <div class="ctl mode-only predict">
+          <label for="noise">noise <span class="val" id="noiseV"></span></label>
+          <input type="range" id="noise" min="0" max="40" value="0" />
+        </div>
+        <button class="btn toggle mode-only predict" id="drawToggle">✎ draw input</button>
+
+        <!-- Dream-mode controls -->
+        <div class="ctl mode-only dream">
+          <label for="speed">steps / frame <span class="val" id="speedV"></span></label>
+          <input type="range" id="speed" min="1" max="6" value="2" />
+        </div>
+        <button class="btn mode-only dream" id="perturb">⚡ perturb</button>
+        <button class="btn mode-only dream" id="reseed">↺ reseed</button>
+      </div>
+      <p class="hint mode-only predict">
+        Drag the sliders, switch waveforms, or hit <b>✎ draw input</b> and
+        sketch directly on the scope &mdash; the magenta trace is the ESN's
+        one-step-ahead forecast, drawn where the signal is predicted to go next.
+      </p>
+      <p class="hint mode-only dream">
+        Here the loop is closed in JavaScript: each ESN output is fed back as
+        the next input, so the network autonomously regenerates the waveform it
+        learned. <b>⚡ perturb</b> kicks the reservoir state; watch it recover.
+      </p>
+    </div>
+
+    <footer>
+      Built with <a href="https://github.com/haradama/rclite">rclite</a> &middot;
+      the model is trained in Python, quantization-free <code>f32</code> kernel
+      cross-compiled to <code>wasm32</code> (SIMD128) and linked as a reactor
+      module exporting <code>rc_predict</code>. View the
+      <a href="https://github.com/haradama/rclite/tree/main/examples/wasm_pages_demo">build script</a>.
+    </footer>
+  </div>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

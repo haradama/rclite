@@ -42,6 +42,7 @@ cross-toolchain (and optionally an emulator) on `PATH`.
 | `microbit_esn_demo/` | BBC micro:bit (Cortex-M0) — float, quantized, i8, i16-affine | arm-none-eabi-gcc, qemu |
 | `gba_esn_demo/` | Game Boy Advance | devkitARM / mGBA |
 | `nes_esn_demo/` | Nintendo Entertainment System | cc65 / FCEUX |
+| `wasm_pages_demo/` | Browser (WebAssembly) — interactive GitHub Pages app | `rustup target add wasm32-wasip1` |
 
 The `microbit_esn_demo/` scripts (`build_microbit*.py`) cover the float and
 the three quantized paths; `c_library_demo/build_c_library.py` is the simplest

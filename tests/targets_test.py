@@ -18,7 +18,7 @@ from rclite.runtime import RCExecutor
 from rclite.targets import (
     Target, CompiledArtifact, RunResult,
     HostTarget, CortexM0Target, MicrobitV1, Microbit,
-    WasmTarget, Wasmtime,
+    WasmTarget, Wasmtime, BrowserWasm,
     GbaTarget, Gba,
     NesTarget, Nes,
 )
@@ -128,6 +128,164 @@ def test_wasmtime_class_inherits_wasm_target():
     assert wt.triple == "wasm32-wasip1"
     assert wt.rust_target == "wasm32-wasip1"
     assert wt.dtype == "f32"
+
+
+def test_wasm_simd_defaults_on_and_names():
+    on = Wasmtime()
+    off = Wasmtime(simd=False)
+    assert on.simd is True
+    assert off.simd is False
+    assert on.name.endswith("+simd128")
+    assert not off.name.endswith("+simd128")
+    # `+simd128` feature flag only when SIMD is on.
+    assert on._features() == "+simd128"
+    assert off._features() == ""
+
+
+def test_wasm_simd_emits_v128_instructions():
+    """With SIMD on, the matmul inner loops lower to packed v128 ops;
+    with SIMD off they stay scalar."""
+    if shutil.which("rustc") is None:
+        return  # skip — rustc not on PATH
+    import re
+    rc, exe, sample = _build()
+    counts = {}
+    for simd in (True, False):
+        with tempfile.TemporaryDirectory() as td:
+            Wasmtime(simd=simd).compile(rc, exe, output_dir=td,
+                                        test_inputs=sample)
+            asm = pathlib.Path(td, "rc_predict.s").read_text()
+            counts[simd] = len(re.findall(r"\bf32x4\.|\bv128\.", asm))
+    assert counts[True] > 0, "expected v128 ops in the SIMD build"
+    assert counts[False] == 0, "scalar build should have no v128 ops"
+
+
+def _build_quantized_wasm(storage_bits, state_frac):
+    """A small symmetric-quantized model for the WASM integer path."""
+    from rclite.quant import (QuantConfig, TanhLUTSpec, quantize_model,
+                              I8Symmetric, I16FixedPoint, I32FixedPoint)
+    rc = ReservoirComputer(
+        input=InputNode(units=1, input_offset=0.0, input_scaling=1.0,
+                        input_distribution=Distribution.BERNOULLI, name="in"),
+        reservoir=ReservoirNode(units=24, topology=Topology.SCR,
+                                 chain_weight=0.9, leak_rate=0.3, seed=42,
+                                 name="res"),
+        readout=ReadoutNode(units=1, trainer=Trainer.RIDGE,
+                            regularization=1e-6, washout=40,
+                            include_bias=True, include_input=True, name="out"),
+    )
+    exe = RCExecutor(rc)
+    rng = np.random.default_rng(0)
+    X = rng.standard_normal((300, 1)) * 0.2
+    Y = np.sin(np.arange(300) * 0.1)[:, None]
+    exe.fit(X, Y)
+    target = {8: I8Symmetric, 16: I16FixedPoint, 32: I32FixedPoint}[storage_bits]()
+    cfg = QuantConfig(state_frac=state_frac, input_frac=4, weight_frac=4)
+    qm = quantize_model(rc, exe, cfg, target=target, lut=TanhLUTSpec(n=64))
+    return qm, X[250:258]
+
+
+def test_wasm_compile_quantized_rejects_bad_storage():
+    rc, exe, sample = _build()
+
+    class _FakeTarget:
+        storage_bits = 4
+
+    class _FakeQModel:
+        rc = None
+        config = None
+        target = _FakeTarget()
+        M = 1
+    with tempfile.TemporaryDirectory() as td:
+        expect_raises(NotImplementedError, Wasmtime().compile_quantized,
+                      _FakeQModel(), output_dir=td, test_inputs=sample)
+
+
+def test_wasm_quantized_bit_exact():
+    """i8 / i16 / i32 quantized kernels cross-compiled to wasm32 reproduce
+    the host quantized kernel bit-for-bit under wasmtime."""
+    if shutil.which("rustc") is None:
+        return  # skip — rustc not on PATH
+    if shutil.which("wasmtime") is None:
+        return  # skip — wasmtime not on PATH
+    for storage_bits, state_frac in [(32, 16), (16, 10), (8, 5)]:
+        qm, sample = _build_quantized_wasm(storage_bits, state_frac)
+        with tempfile.TemporaryDirectory() as td:
+            target = Wasmtime()
+            art = target.compile_quantized(qm, output_dir=td,
+                                            test_inputs=sample)
+            assert art.binary.exists()
+            assert art.metadata["quantized"] is True
+            assert art.metadata["dtype"] == f"i{storage_bits}"
+            result = target.run(art)
+            assert result.success, f"wasmtime output:\n{result.output}"
+            assert "BIT_EXACT: yes" in result.output, (
+                f"i{storage_bits} not bit-exact:\n{result.output}")
+
+
+def test_browser_class_and_inheritance():
+    assert issubclass(BrowserWasm, WasmTarget)
+    b = BrowserWasm()
+    assert b.triple == "wasm32-wasip1"
+    assert b.name.endswith("browser+simd128")
+    assert BrowserWasm(simd=False).name == "wasm32/browser"
+
+
+def test_browser_f32_reactor():
+    """The f32 browser build is a reactor: exports rc_predict/memory, imports
+    only env.tanhf, and ships a JS loader + HTML demo with no leftover
+    template placeholders."""
+    if shutil.which("rustc") is None:
+        return  # skip — rustc not on PATH
+    rc, exe, sample = _build()
+    with tempfile.TemporaryDirectory() as td:
+        target = BrowserWasm()
+        art = target.compile(rc, exe, output_dir=td, test_inputs=sample)
+        assert art.metadata["browser"] is True
+        assert art.metadata["reactor"] is True
+        assert art.metadata["imports"] == ["env.tanhf"]
+        for sym in ("rc_predict", "memory", "__heap_base"):
+            assert sym in art.metadata["exports"]
+        outdir = pathlib.Path(td)
+        loader = outdir / "rclite.js"
+        html = outdir / "index.html"
+        assert loader.exists() and html.exists()
+        assert "@@" not in loader.read_text(), "unfilled placeholder in loader"
+        assert "@@" not in html.read_text(), "unfilled placeholder in html"
+        # structure-only smoke (f32 needs a JS host for tanhf)
+        assert target.run(art).success
+
+
+def test_browser_quantized_zero_imports():
+    """The quantized browser build has ZERO imports and instantiates/runs in
+    a non-WASI host (wasmtime --invoke)."""
+    if shutil.which("rustc") is None:
+        return  # skip — rustc not on PATH
+    qm, sample = _build_quantized_wasm(16, 10)
+    with tempfile.TemporaryDirectory() as td:
+        target = BrowserWasm()
+        art = target.compile_quantized(qm, output_dir=td, test_inputs=sample)
+        assert art.metadata["imports"] == [], (
+            f"quantized reactor should have no imports, got "
+            f"{art.metadata['imports']}")
+        assert "rc_predict" in art.metadata["exports"]
+        assert art.metadata["dtype"] == "i16"
+        if shutil.which("wasmtime") is not None:
+            assert target.run(art).success
+
+
+def test_wasm_inspect_parses_imports_exports():
+    """The minimal wasm parser agrees with the metadata the linker reports."""
+    if shutil.which("rustc") is None:
+        return  # skip — rustc not on PATH
+    from rclite.targets.wasm._wasm_inspect import inspect_wasm
+    rc, exe, sample = _build()
+    with tempfile.TemporaryDirectory() as td:
+        art = BrowserWasm().compile(rc, exe, output_dir=td, test_inputs=sample)
+        info = inspect_wasm(str(art.binary))
+        assert "rc_predict" in info.exports
+        assert "memory" in info.exports
+        assert info.imports == ["env.tanhf"]
 
 
 def test_wasm_target_rejects_non_f32():

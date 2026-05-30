@@ -36,6 +36,12 @@ jobs:
           PKGS=$(find rclite -name "__init__.py" -exec dirname {} \; | sed "s|/|.|g" | sort)
           pdoc $PKGS -o docs
 
+      - name: Add wasm target for the interactive demo
+        run: rustup target add wasm32-wasip1
+
+      - name: Build interactive WebAssembly demo
+        run: python examples/wasm_pages_demo/build.py --out docs/demo
+
       - uses: actions/configure-pages@v5
 
       - uses: actions/upload-pages-artifact@v3
