@@ -93,6 +93,54 @@ class FusedStepReadout(Op):
 
 
 @dataclass(frozen=True)
+class Argmax(Op):
+    """class_id := argmax_m y[m]   (writes one int32 per output row)
+
+    Classification head. Consumes the M linear scores produced by the
+    readout and emits the index of the largest. Monotone, so it is exact
+    under any quantization of the readout.
+    """
+    M: int
+
+
+@dataclass(frozen=True)
+class Softmax(Op):
+    """p[m] := exp(y[m] - max) / sum_j exp(y[j] - max)   (M probabilities)
+
+    Classification head producing calibrated class probabilities. The
+    max-subtraction keeps exp() in range; the float path calls libm exp.
+    """
+    M: int
+
+
+@dataclass(frozen=True)
+class AccumulateState(Op):
+    """Pool reservoir state over time (sequence-to-label).
+
+    Lives inside the TimeLoop body. mode="mean" adds h into a running sum
+    over post-washout steps (t >= min(washout, T-1)); mode="last" is a no-op
+    (the final h is already in place). Paired with `FinalizeAggregate`.
+    """
+    N: int
+    mode: str  # "mean" | "last"
+    washout: int = 0
+
+
+@dataclass(frozen=True)
+class FinalizeAggregate(Op):
+    """Finish time pooling after the TimeLoop: write the pooled state into h.
+
+    mode="mean" divides the running sum by the number of pooled steps
+    (T - min(washout, T-1)); mode="last" is a no-op. The following BuildPhi /
+    ReadoutLinear then run once on the pooled state, producing a single
+    output row for the whole sequence.
+    """
+    N: int
+    mode: str  # "mean" | "last"
+    washout: int = 0
+
+
+@dataclass(frozen=True)
 class TimeLoop(Op):
     """`for t in 0..T: <body>`
 

@@ -28,19 +28,32 @@ from __future__ import annotations
 
 import numpy as np
 
-from rclite.core.profile import Topology
+from rclite.core.profile import Aggregation, Topology
 from rclite.ir.module import Module
 from rclite.ir.ops import (
     PreprocessInput, ReservoirStep, BuildPhi, ReadoutLinear, TimeLoop,
+    Argmax, Softmax,
 )
 
 from .lut import LUTKind
 from .quantize import AffineQuantizedModel
+from ..softmax_lut import SoftmaxLUTSpec, build_params as build_softmax_params
 
 
-def build_ir_from_quantized_affine(qmodel: AffineQuantizedModel) -> Module:
+def build_ir_from_quantized_affine(qmodel: AffineQuantizedModel,
+                                   *, head=None) -> Module:
     rc = qmodel.rc
     cfg = qmodel.config
+    if head not in (None, "logits", "classify", "proba"):
+        raise NotImplementedError(
+            f"affine integer path supports head in (None, 'logits', "
+            f"'classify', 'proba'); got {head!r}"
+        )
+    if rc.readout.aggregation != Aggregation.NONE:
+        raise NotImplementedError(
+            "Quantized classification currently supports per-step readouts "
+            "(aggregation=NONE) only; sequence pooling is not yet quantized."
+        )
 
     K, N, M = qmodel.K, qmodel.N, qmodel.M
     F = qmodel.F
@@ -102,6 +115,17 @@ def build_ir_from_quantized_affine(qmodel: AffineQuantizedModel) -> Module:
         ),
         ReadoutLinear(M=M, F=F),
     ]
+    sm = None
+    if head == "classify":
+        body_ops.append(Argmax(M=M))
+    elif head == "proba":
+        import numpy as _np
+        sm = build_softmax_params(
+            SoftmaxLUTSpec(), s_diff=cfg.output.scale,
+            storage_bits=qmodel.storage_bits,
+            storage_dtype=_np.dtype(f"int{qmodel.storage_bits}"),
+        )
+        body_ops.append(Softmax(M=M))
     body = tuple(body_ops)
 
     # Pre-quantize the chain constants once (matches what dense W_res_q
@@ -158,7 +182,14 @@ def build_ir_from_quantized_affine(qmodel: AffineQuantizedModel) -> Module:
         "pre_M0":    qmodel.pre_M0,
         "pre_n":     qmodel.pre_n,
         "pre_const": qmodel.pre_const,
+        "head": head or "logits",
     }
+    if sm is not None:
+        weights["sm_lut"] = sm.lut_q
+        md["sm_dmin_q"] = sm.dmin_q
+        md["sm_n"] = sm.n
+        md["sm_idx_frac"] = sm.idx_frac
+        md["sm_prob_frac"] = sm.prob_frac
     if strat.kind == LUTKind.LINEAR_INTERP:
         md["lut_n_entries"]       = strat.n_entries
         md["lut_interp_frac_bits"] = strat.interp_frac_bits

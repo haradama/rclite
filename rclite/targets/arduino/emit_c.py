@@ -44,7 +44,8 @@ def _arr(name: str, ctype: str, values, rd_macro: str) -> str:
 
 def emit_affine_kernel_c(qmodel: AffineQuantizedModel,
                           fn_name: str = "rc_predict",
-                          *, allow_i32_accum: bool = False) -> str:
+                          *, allow_i32_accum: bool = False,
+                          head: str = None) -> str:
     """Emit the affine kernel as portable C.
 
     `allow_i32_accum` enables i32 (instead of i64) matmul accumulators
@@ -134,6 +135,18 @@ def emit_affine_kernel_c(qmodel: AffineQuantizedModel,
         a(_arr("rc_row_sum_W_res", "int32_t", qmodel.row_sum_W_res, "RC_RD32"))
     if strat.kind in (LUTKind.DIRECT, LUTKind.LINEAR_INTERP):
         a(_arr("rc_lut", storage_t, qmodel.lut_q, rd_s))
+    if head == "proba":
+        import numpy as _np
+        from rclite.quant.softmax_lut import (
+            SoftmaxLUTSpec, build_params as _build_sm,
+        )
+        _sm = _build_sm(SoftmaxLUTSpec(), cfg.output.scale, sb,
+                        _np.dtype(f"int{sb}"))
+        a(_arr("rc_sm_lut", storage_t, _sm.lut_q, rd_s))
+        a(f"#define RC_SM_N {_sm.n}")
+        a(f"#define RC_SM_DMIN ({_sm.dmin_q})")
+        a(f"#define RC_SM_IDXF {_sm.idx_frac}")
+        a(f"#define RC_SM_PF {_sm.prob_frac}")
     a("")
 
     # ---- SRAM state buffers ----
@@ -215,8 +228,22 @@ def emit_affine_kernel_c(qmodel: AffineQuantizedModel,
     zp_input = cfg.input.zero_point
     zp_output = cfg.output.zero_point
 
-    a(f"void {fn_name}(int32_t T, const rc_storage_t *X, rc_storage_t *Y){{")
+    if head not in (None, "logits", "classify", "proba"):
+        raise NotImplementedError(
+            f"affine C kernel supports head in (None, 'logits', 'classify', "
+            f"'proba'); got {head!r}"
+        )
+    classify = head == "classify"
+    proba = head == "proba"
+    y_type = "int32_t" if classify else "rc_storage_t"
+    a(f"void {fn_name}(int32_t T, const rc_storage_t *X, {y_type} *Y){{")
     a("    int32_t t, i, j, k, m;")
+    if classify:
+        a("    int32_t best_m; int32_t best_v;")
+    if proba:
+        a("    int32_t sm_max; int64_t sm_sum;")
+        a("    rc_storage_t rc_lg[RC_M];")
+        a("    int32_t rc_eq[RC_M];")
     a(f"    for (i = 0; i < RC_N; i++) rc_h[i] = {zp_state};")
     a("    for (t = 0; t < T; t++) {")
 
@@ -282,6 +309,8 @@ def emit_affine_kernel_c(qmodel: AffineQuantizedModel,
     off_bias = 0
     off_input = 1 if rc.readout.include_bias else 0
     off_state = off_input + (K if rc.readout.include_input else 0)
+    if classify:
+        a("        best_m = 0; best_v = 0;")
     a("        for (m = 0; m < RC_M; m++) {")
     a(f"            int32_t y = {zp_output};")
     if rc.readout.include_bias:
@@ -302,8 +331,37 @@ def emit_affine_kernel_c(qmodel: AffineQuantizedModel,
     a(f"            acc_s -= {ro_cast}{zp_state} * {ro_cast}RC_RD32(&rc_row_sum_Wout_state[m]);")
     a(f"            y += RC_RQ({_clamp('acc_s', ro_bits)}, "
       f"{qmodel.M_out_state_M0}, {qmodel.M_out_state_n});")
-    a("            Y[t*RC_M + m] = rc_sat(y);")
+    if classify:
+        # argmax over the saturated quantized scores (monotone in the logits).
+        a("            int32_t yq = (int32_t)rc_sat(y);")
+        a("            if (m == 0 || yq > best_v) { best_v = yq; best_m = m; }")
+    elif proba:
+        a("            rc_lg[m] = rc_sat(y);")
+    else:
+        a("            Y[t*RC_M + m] = rc_sat(y);")
     a("        }")
+    if classify:
+        a("        Y[t] = best_m;")
+    elif proba:
+        a("        sm_max = rc_lg[0];")
+        a("        for (m = 1; m < RC_M; m++) if (rc_lg[m] > sm_max) sm_max = rc_lg[m];")
+        a("        sm_sum = 0;")
+        a("        for (m = 0; m < RC_M; m++) {")
+        a("            int32_t d = (int32_t)rc_lg[m] - sm_max;")
+        a("            if (d < RC_SM_DMIN) d = RC_SM_DMIN;")
+        a("            int64_t pos = ((int64_t)(d - (RC_SM_DMIN)) * (RC_SM_N - 1) << RC_SM_IDXF) / (-(RC_SM_DMIN));")
+        a("            int32_t i0 = (int32_t)(pos >> RC_SM_IDXF);")
+        a("            if (i0 < 0) i0 = 0; if (i0 > RC_SM_N - 2) i0 = RC_SM_N - 2;")
+        a("            int64_t frac = pos - ((int64_t)i0 << RC_SM_IDXF);")
+        a(f"            int32_t y0 = {rd_s}(&rc_sm_lut[i0]); int32_t y1 = {rd_s}(&rc_sm_lut[i0 + 1]);")
+        a("            int64_t ev = (int64_t)y0 + (((int64_t)(y1 - y0) * frac) >> RC_SM_IDXF);")
+        a("            rc_eq[m] = (int32_t)ev; sm_sum += ev;")
+        a("        }")
+        a("        for (m = 0; m < RC_M; m++) {")
+        a("            int64_t p = ((int64_t)rc_eq[m] << RC_SM_PF) / sm_sum;")
+        a("            if (p > RC_QMAX) p = RC_QMAX;")
+        a("            Y[t*RC_M + m] = (rc_storage_t)p;")
+        a("        }")
     a("    }")
     a("}")
     a("")

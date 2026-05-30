@@ -41,7 +41,15 @@ def _sat_storage(v: int, sb: int) -> int:
 
 
 def emit_symmetric_kernel_c(qmodel: QuantizedModel,
-                             fn_name: str = "rc_predict") -> str:
+                             fn_name: str = "rc_predict",
+                             *, head: str = None) -> str:
+    if head not in (None, "logits", "classify", "proba"):
+        raise NotImplementedError(
+            f"symmetric C kernel supports head in (None, 'logits', "
+            f"'classify', 'proba'); got {head!r}"
+        )
+    classify = head == "classify"
+    proba = head == "proba"
     rc = qmodel.rc
     cfg = qmodel.config
     sb = qmodel.target.storage_bits
@@ -133,6 +141,17 @@ def emit_symmetric_kernel_c(qmodel: QuantizedModel,
     a(_arr("rc_lut", storage_t, qmodel.lut_table_q))
     if not is_structured:
         a(_arr("rc_W_res", storage_t, qmodel.W_res_q))
+    if proba:
+        from rclite.quant.softmax_lut import (
+            SoftmaxLUTSpec, build_params as _build_sm,
+        )
+        sm = _build_sm(SoftmaxLUTSpec(), 1.0 / cfg.state_scale, sb,
+                       qmodel.target.storage_dtype)
+        a(_arr("rc_sm_lut", storage_t, sm.lut_q))
+        a(f"#define RC_SM_N {sm.n}")
+        a(f"#define RC_SM_DMIN ({sm.dmin_q})")
+        a(f"#define RC_SM_IDXF {sm.idx_frac}")
+        a(f"#define RC_SM_PF {sm.prob_frac}")
     a("")
     a("static rc_storage_t rc_h[RC_N];")
     a("static rc_storage_t rc_pre[RC_N];")
@@ -165,8 +184,15 @@ def emit_symmetric_kernel_c(qmodel: QuantizedModel,
     a("")
 
     # kernel
-    a(f"void {fn_name}(int32_t T, const rc_storage_t *X, rc_storage_t *Y){{")
+    y_type = "int32_t" if classify else "rc_storage_t"
+    a(f"void {fn_name}(int32_t T, const rc_storage_t *X, {y_type} *Y){{")
     a("    int32_t t, i, j, k, m;")
+    if classify:
+        a("    int32_t best_m; int64_t best_v;")
+    if proba:
+        a("    int32_t sm_max; int64_t sm_sum;")
+        a("    rc_storage_t rc_lg[RC_M];")
+        a("    int32_t rc_eq[RC_M];")
     a("    for (i = 0; i < RC_N; i++) rc_h[i] = 0;")
     a("    for (t = 0; t < T; t++) {")
     # preprocess: u_pre[k] = wrap_s( ((X - offset_q) * scaling_q) >> weight_frac )
@@ -194,6 +220,8 @@ def emit_symmetric_kernel_c(qmodel: QuantizedModel,
     a("            rc_h[i] = rc_ws((int32_t)t1 + (int32_t)t2);")
     a("        }")
     # readout (mirage mixed-scale, i64 accumulate)
+    if classify:
+        a("        best_m = 0; best_v = 0;")
     a("        for (m = 0; m < RC_M; m++) {")
     a("            int64_t out = 0;")
     if rc.readout.include_bias:
@@ -206,8 +234,38 @@ def emit_symmetric_kernel_c(qmodel: QuantizedModel,
     a("            int64_t sh = out >> RC_STATE_FRAC;")
     a("            if (sh < RC_QMIN) sh = RC_QMIN;")
     a("            if (sh > RC_QMAX) sh = RC_QMAX;")
-    a("            Y[t*RC_M + m] = (rc_storage_t)sh;")
+    if classify:
+        # argmax over the (saturated) quantized scores — monotone, so the
+        # class id matches the float readout's argmax.
+        a("            if (m == 0 || sh > best_v) { best_v = sh; best_m = m; }")
+    elif proba:
+        a("            rc_lg[m] = (rc_storage_t)sh;")
+    else:
+        a("            Y[t*RC_M + m] = (rc_storage_t)sh;")
     a("        }")
+    if classify:
+        a("        Y[t] = best_m;")
+    elif proba:
+        # fixed-point softmax over rc_lg[] (exp LUT), bit-exact with softmax_q
+        a("        sm_max = rc_lg[0];")
+        a("        for (m = 1; m < RC_M; m++) if (rc_lg[m] > sm_max) sm_max = rc_lg[m];")
+        a("        sm_sum = 0;")
+        a("        for (m = 0; m < RC_M; m++) {")
+        a("            int32_t d = (int32_t)rc_lg[m] - sm_max;")
+        a("            if (d < RC_SM_DMIN) d = RC_SM_DMIN;")
+        a("            int64_t pos = ((int64_t)(d - (RC_SM_DMIN)) * (RC_SM_N - 1) << RC_SM_IDXF) / (-(RC_SM_DMIN));")
+        a("            int32_t i0 = (int32_t)(pos >> RC_SM_IDXF);")
+        a("            if (i0 < 0) i0 = 0; if (i0 > RC_SM_N - 2) i0 = RC_SM_N - 2;")
+        a("            int64_t frac = pos - ((int64_t)i0 << RC_SM_IDXF);")
+        a(f"            int32_t y0 = {rd}(&rc_sm_lut[i0]); int32_t y1 = {rd}(&rc_sm_lut[i0 + 1]);")
+        a("            int64_t ev = (int64_t)y0 + (((int64_t)(y1 - y0) * frac) >> RC_SM_IDXF);")
+        a("            rc_eq[m] = (int32_t)ev; sm_sum += ev;")
+        a("        }")
+        a("        for (m = 0; m < RC_M; m++) {")
+        a("            int64_t p = ((int64_t)rc_eq[m] << RC_SM_PF) / sm_sum;")
+        a("            if (p > RC_QMAX) p = RC_QMAX;")
+        a("            Y[t*RC_M + m] = (rc_storage_t)p;")
+        a("        }")
     a("    }")
     a("}")
     a("")

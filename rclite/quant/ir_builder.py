@@ -20,20 +20,40 @@ shift amounts and clamp constants.
 """
 from __future__ import annotations
 
-from rclite.core.profile import Topology
+from rclite.core.profile import Aggregation, Topology
 from rclite.ir.module import Module
 from rclite.ir.ops import (
     PreprocessInput, ReservoirStep, BuildPhi, ReadoutLinear, TimeLoop,
+    Argmax, Softmax,
 )
 from .model import QuantizedModel
+from .softmax_lut import SoftmaxLUTSpec, build_params as build_softmax_params
 
 
-def build_ir_from_quantized(qmodel: QuantizedModel) -> Module:
-    """Construct an rclite IR module for the i32 integer path."""
+def build_ir_from_quantized(qmodel: QuantizedModel, *, head=None) -> Module:
+    """Construct an rclite IR module for the i32 integer path.
+
+    `head="classify"` appends an Argmax so the kernel emits an int32 class
+    id per step instead of M quantized scores. argmax is monotone in the
+    quantized logits, so the result is identical to argmax over the float
+    readout — quantization introduces no class errors except at exact ties.
+    `head="proba"` appends a fixed-point Softmax (exp LUT) emitting M
+    probabilities at Q.prob_frac in the storage type.
+    """
     rc = qmodel.rc
     cfg = qmodel.config
     if qmodel.lut is None or qmodel.lut_table_q is None:
         raise ValueError("QuantizedModel must have a LUT for the integer path")
+    if head not in (None, "logits", "classify", "proba"):
+        raise NotImplementedError(
+            f"quantized integer path supports head in (None, 'logits', "
+            f"'classify', 'proba'); got {head!r}"
+        )
+    if rc.readout.aggregation != Aggregation.NONE:
+        raise NotImplementedError(
+            "Quantized classification currently supports per-step readouts "
+            "(aggregation=NONE) only; sequence pooling is not yet quantized."
+        )
 
     K, N, M = qmodel.K, qmodel.N, qmodel.M
     F = qmodel.F
@@ -74,6 +94,17 @@ def build_ir_from_quantized(qmodel: QuantizedModel) -> Module:
         ),
         ReadoutLinear(M=M, F=F),
     )
+    sm = None
+    if head == "classify":
+        body = body + (Argmax(M=M),)
+    elif head == "proba":
+        sm = build_softmax_params(
+            SoftmaxLUTSpec(), s_diff=1.0 / cfg.state_scale,
+            storage_bits=qmodel.target.storage_bits,
+            storage_dtype=qmodel.target.storage_dtype,
+        )
+        body = body + (Softmax(M=M),)
+        weights["sm_lut"] = sm.lut_q
 
     # Pick IR-level dtype string from the target's storage width
     if qmodel.target.storage_bits == 32:
@@ -105,5 +136,12 @@ def build_ir_from_quantized(qmodel: QuantizedModel) -> Module:
             "lut_xmax_q": int(qmodel.lut.xmax * cfg.state_scale),
             "leak_q": qmodel.target.quantize_state(rc.reservoir.leak_rate, cfg),
             "bias_q": qmodel.target.quantize_state(rc.reservoir.bias, cfg),
+            "head": head or "logits",
+            **({} if sm is None else {
+                "sm_dmin_q": sm.dmin_q,
+                "sm_n": sm.n,
+                "sm_idx_frac": sm.idx_frac,
+                "sm_prob_frac": sm.prob_frac,
+            }),
         },
     )

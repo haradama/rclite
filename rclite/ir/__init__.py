@@ -10,6 +10,7 @@ from .ops import (
     Op,
     PreprocessInput, ReservoirStep, BuildPhi, ReadoutLinear,
     FusedStepReadout, TimeLoop,
+    Argmax, Softmax, AccumulateState, FinalizeAggregate,
 )
 from .builder import build_ir
 from .printer import to_mlir_text
@@ -20,6 +21,7 @@ __all__ = [
     "Op",
     "PreprocessInput", "ReservoirStep", "BuildPhi", "ReadoutLinear",
     "FusedStepReadout", "TimeLoop",
+    "Argmax", "Softmax", "AccumulateState", "FinalizeAggregate",
     "build_ir", "to_mlir_text",
     "StructuralSpecialize", "FuseStepReadout", "TimeUnroll",
 ]

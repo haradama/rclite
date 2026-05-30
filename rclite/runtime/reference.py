@@ -18,7 +18,9 @@ except ImportError as e:
     ) from e
 
 from rclite.core.composite import ReservoirComputer
-from rclite.core.profile import Activation, Distribution, Topology, Trainer
+from rclite.core.profile import (
+    Activation, Aggregation, Distribution, Task, Topology, Trainer,
+)
 
 
 _ACTIVATIONS = {
@@ -36,6 +38,25 @@ def _activation_fn(a: Activation):
         raise NotImplementedError(
             f"Activation {a.name} is not implemented in the reference runtime"
         )
+
+
+def _softmax(Z: "np.ndarray") -> "np.ndarray":
+    """Numerically stable softmax over the last axis."""
+    Z = Z - np.max(Z, axis=-1, keepdims=True)
+    E = np.exp(Z)
+    return E / np.sum(E, axis=-1, keepdims=True)
+
+
+def _one_hot(y: "np.ndarray", classes: "np.ndarray") -> "np.ndarray":
+    """Encode integer/label vector y (n,) into a one-hot matrix (n, C).
+
+    `classes` is the sorted array of unique labels; column j corresponds to
+    classes[j].
+    """
+    idx = np.searchsorted(classes, y)
+    Y = np.zeros((len(y), len(classes)))
+    Y[np.arange(len(y)), idx] = 1.0
+    return Y
 
 
 def _sample(rng, shape, distribution: Distribution):
@@ -57,6 +78,9 @@ class RCExecutor:
     W_res: "np.ndarray" = field(init=False)
     W_fb: Optional["np.ndarray"] = field(init=False, default=None)
     W_out: Optional["np.ndarray"] = field(init=False, default=None)
+    # Sorted unique labels seen at fit time (classification only); column j of
+    # the readout corresponds to classes_[j]. None for regression / untrained.
+    classes_: Optional["np.ndarray"] = field(init=False, default=None)
 
     def __post_init__(self):
         rng = np.random.default_rng(self.rc.reservoir.seed)
@@ -189,10 +213,27 @@ class RCExecutor:
             H[t] = h
         return H
 
+    def _encode_targets(self, Y: "np.ndarray") -> "np.ndarray":
+        """For classification, turn a label vector into a one-hot matrix.
+
+        A 1-D `Y` is treated as integer/label targets and one-hot encoded
+        (recording `classes_`). An already 2-D `Y` is assumed to be one-hot
+        and passed through, with `classes_` defaulting to 0..C-1.
+        """
+        if self.rc.readout.task != Task.CLASSIFICATION:
+            return Y
+        if Y.ndim == 1:
+            self.classes_ = np.unique(Y)
+            return _one_hot(Y, self.classes_)
+        self.classes_ = np.arange(Y.shape[1])
+        return Y
+
     def fit(self, X: "np.ndarray", Y: "np.ndarray") -> "np.ndarray":
         """Batch training (RIDGE / PINV). Use `online_fit` for online trainers."""
         if X.ndim == 1:
             X = X[:, None]
+        Y = np.asarray(Y)
+        Y = self._encode_targets(Y)
         if Y.ndim == 1:
             Y = Y[:, None]
         use_fb = self.W_fb is not None
@@ -226,6 +267,114 @@ class RCExecutor:
         H = self.collect_states(X)
         Phi = self._augment(X, H)
         return Phi @ self.W_out.T
+
+    def _check_classification(self) -> None:
+        if self.rc.readout.task != Task.CLASSIFICATION:
+            raise ValueError(
+                "predict_proba / predict_classes require "
+                "readout.task == Task.CLASSIFICATION"
+            )
+        if self.classes_ is None:
+            raise RuntimeError("Classifier has not been trained — call fit() first")
+
+    def predict_proba(self, X: "np.ndarray") -> "np.ndarray":
+        """Per-step class probabilities (T, C) via softmax of the readout."""
+        self._check_classification()
+        return _softmax(self.predict(X))
+
+    def predict_classes(self, X: "np.ndarray") -> "np.ndarray":
+        """Per-step predicted labels (T,) via argmax, mapped back to classes_."""
+        self._check_classification()
+        return self.classes_[np.argmax(self.predict(X), axis=1)]
+
+    # ------------------------------------------------------------------
+    # Sequence-to-label (state aggregation over time)
+
+    def _aggregate_states(self, H: "np.ndarray", X_raw: "np.ndarray"):
+        """Pool a sequence's states (and raw input) into one feature vector.
+
+        Returns (h_bar, u_bar) where u_bar is None unless include_input.
+        MEAN averages post-washout steps; LAST takes the final step.
+        """
+        agg = self.rc.readout.aggregation
+        want_input = self.rc.readout.include_input
+        if agg == Aggregation.LAST:
+            return H[-1], (X_raw[-1] if want_input else None)
+        if agg == Aggregation.MEAN:
+            w = min(self.rc.readout.washout, H.shape[0] - 1)
+            w = max(w, 0)
+            h_bar = H[w:].mean(axis=0)
+            u_bar = X_raw[w:].mean(axis=0) if want_input else None
+            return h_bar, u_bar
+        raise ValueError(
+            "Sequence methods require readout.aggregation in {MEAN, LAST}; "
+            f"got {agg.name}"
+        )
+
+    def _augment_agg(self, u_bar, h_bar: "np.ndarray") -> "np.ndarray":
+        parts = []
+        if self.rc.readout.include_bias:
+            parts.append(np.ones(1))
+        if self.rc.readout.include_input:
+            parts.append(np.atleast_1d(u_bar))
+        parts.append(h_bar)
+        return np.concatenate(parts)
+
+    def _sequence_features(self, seqs) -> "np.ndarray":
+        feats = []
+        for X in seqs:
+            X = np.asarray(X, dtype=float)
+            if X.ndim == 1:
+                X = X[:, None]
+            H = self.collect_states(X)
+            h_bar, u_bar = self._aggregate_states(H, X)
+            feats.append(self._augment_agg(u_bar, h_bar))
+        return np.stack(feats)
+
+    def fit_sequences(self, seqs, labels: "np.ndarray") -> "np.ndarray":
+        """Train a sequence-to-label readout (one feature vector per sequence).
+
+        `seqs` is a list of (T_i, K) arrays; `labels` is (S,). For
+        classification, labels are one-hot encoded; for regression they are
+        used as (S,) or (S, M) targets. Requires aggregation in {MEAN, LAST}.
+        """
+        if self.rc.readout.aggregation == Aggregation.NONE:
+            raise ValueError(
+                "fit_sequences requires readout.aggregation in {MEAN, LAST}; "
+                "use fit() for per-step training"
+            )
+        Phi = self._sequence_features(seqs)
+        Y = self._encode_targets(np.asarray(labels))
+        if Y.ndim == 1:
+            Y = Y[:, None]
+        trainer = self.rc.readout.trainer
+        if trainer == Trainer.RIDGE:
+            lam = self.rc.readout.regularization
+            A = Phi.T @ Phi + lam * np.eye(Phi.shape[1])
+            self.W_out = np.linalg.solve(A, Phi.T @ Y).T
+        elif trainer == Trainer.PINV:
+            self.W_out = (np.linalg.pinv(Phi) @ Y).T
+        else:
+            raise NotImplementedError(
+                f"Trainer {trainer.name} is not supported for sequence "
+                "training; use RIDGE or PINV"
+            )
+        return self.W_out
+
+    def predict_sequences(self, seqs) -> "np.ndarray":
+        """Per-sequence output. Regression: (S, M). Classification: labels (S,)."""
+        if self.W_out is None:
+            raise RuntimeError("Readout has not been trained — call fit_sequences() first")
+        Z = self._sequence_features(seqs) @ self.W_out.T
+        if self.rc.readout.task == Task.CLASSIFICATION:
+            return self.classes_[np.argmax(Z, axis=1)]
+        return Z
+
+    def predict_proba_sequences(self, seqs) -> "np.ndarray":
+        """Per-sequence class probabilities (S, C) via softmax."""
+        self._check_classification()
+        Z = self._sequence_features(seqs) @ self.W_out.T
+        return _softmax(Z)
 
     def free_run(self, X_seed: "np.ndarray", n_steps: int) -> "np.ndarray":
         if self.W_out is None:

@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
-from .profile import Activation, Distribution, Topology, Trainer
+from .profile import Activation, Aggregation, Distribution, Task, Topology, Trainer
 from .ports import SignalIn, SignalOut
 
 
@@ -100,6 +100,15 @@ class ReadoutNode(Layer):
     Online trainers (RLS / LMS / FORCE) consume `learning_rate` (LMS),
     `forgetting_factor` (RLS / FORCE), and `init_variance` (initial P
     matrix for RLS-family trainers as `P_0 = init_variance^{-1} I`).
+
+    `task` selects regression (default) vs classification. For
+    CLASSIFICATION, `units` is the number of classes C (one linear output per
+    class); the readout is trained on one-hot targets via RIDGE / PINV, and
+    class id / probabilities are recovered with argmax / softmax.
+
+    `aggregation` pools reservoir states over time. NONE keeps the per-step
+    readout; MEAN / LAST collapse a whole sequence to one feature vector so a
+    sequence maps to a single label (or scalar).
     """
     trainer: Trainer = Trainer.RIDGE
     regularization: float = 1e-6
@@ -109,9 +118,24 @@ class ReadoutNode(Layer):
     learning_rate: float = 1e-2
     forgetting_factor: float = 1.0
     init_variance: float = 1e-3
+    task: Task = Task.REGRESSION
+    aggregation: Aggregation = Aggregation.NONE
 
     def __post_init__(self):
         super().__post_init__()
+        if self.task == Task.CLASSIFICATION:
+            if self.units < 2:
+                raise ValueError(
+                    "ReadoutNode.units must be >= 2 for classification "
+                    f"(one output per class; got {self.units}). Binary "
+                    "classification uses C=2 one-hot outputs."
+                )
+            if self.trainer not in (Trainer.RIDGE, Trainer.PINV):
+                raise ValueError(
+                    "Classification supports only batch least-squares "
+                    f"trainers (RIDGE / PINV); got {self.trainer.name}. "
+                    "Online classification is not implemented."
+                )
         if self.washout < 0:
             raise ValueError(
                 f"ReadoutNode.washout must be >= 0, got {self.washout}"

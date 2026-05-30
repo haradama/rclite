@@ -49,6 +49,33 @@ class Trainer(Enum):
     RLS = "RLS"
 
 
+class Task(Enum):
+    """SysML2: enum def Task
+
+    Selects how the readout's linear output is interpreted.
+
+    REGRESSION     — the linear output is the prediction (existing behavior).
+    CLASSIFICATION — the readout is trained on one-hot targets via least
+                     squares (RIDGE / PINV); class id = argmax of the linear
+                     scores, class probabilities = softmax of the scores.
+    """
+    REGRESSION = "regression"
+    CLASSIFICATION = "classification"
+
+
+class Aggregation(Enum):
+    """SysML2: enum def Aggregation
+
+    Pools reservoir states over time so a whole sequence maps to a single
+    readout. NONE keeps the existing per-step readout; MEAN / LAST collapse a
+    sequence to one feature vector (sequence-to-label classification, or
+    sequence-to-scalar regression).
+    """
+    NONE = "none"   # per-step readout (default; existing behavior)
+    MEAN = "mean"   # mean of post-washout states -> one label per sequence
+    LAST = "last"   # final state -> one label per sequence
+
+
 class DType(Enum):
     """SysML2: enum def DType"""
     FLOAT16 = "float16"

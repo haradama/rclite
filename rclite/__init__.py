@@ -13,7 +13,7 @@ Top-level re-exports keep the most common IDL identifiers one import away:
     from rclite.targets import HostTarget, Microbit
 """
 from rclite.core import (
-    Distribution, Activation, Topology, Trainer, DType,
+    Distribution, Activation, Topology, Trainer, DType, Task, Aggregation,
     Tensor, TimeSeries,
     Direction, SignalIn, SignalOut, Synapse, WeightMatrix,
     Layer, InputNode, ReservoirNode, ReadoutNode,
@@ -28,6 +28,7 @@ from rclite.verification import (
 
 __all__ = [
     "Distribution", "Activation", "Topology", "Trainer", "DType",
+    "Task", "Aggregation",
     "Tensor", "TimeSeries",
     "Direction", "SignalIn", "SignalOut", "Synapse", "WeightMatrix",
     "Layer", "InputNode", "ReservoirNode", "ReadoutNode",

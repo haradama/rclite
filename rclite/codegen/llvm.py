@@ -150,7 +150,10 @@ class _Lowerer:
     """Walks an `rclite.ir.Module` and emits LLVM IR."""
 
     def __init__(self, ir_module, dtype: str):
-        from rclite.ir.ops import ReadoutLinear, BuildPhi, FusedStepReadout, TimeLoop
+        from rclite.ir.ops import (
+            ReadoutLinear, BuildPhi, FusedStepReadout, TimeLoop,
+            Argmax, Softmax, AccumulateState,
+        )
 
         self.ir_module = ir_module
         self.fty, self.tanh_name, self.np_dtype, _ = _dtype_bindings(dtype)
@@ -163,6 +166,17 @@ class _Lowerer:
             self.module, ir.FunctionType(self.fty, [self.fty]),
             name=self.tanh_name,
         )
+        self.exp_fn = None  # lazily declared by the softmax head
+
+        # Classification heads: argmax produces an i32 output; both heads make
+        # the readout write to a logits scratch buffer rather than Y directly.
+        flat = list(self._flatten_ops())
+        self.out_int = any(isinstance(op, Argmax) for op in flat)
+        self.has_head = any(isinstance(op, (Argmax, Softmax)) for op in flat)
+        self.needs_state_sum = any(
+            isinstance(op, AccumulateState) and op.mode == "mean" for op in flat
+        )
+        out_ty = _I32 if self.out_int else self.fty
 
         # Emit weight globals
         self.globals = {}
@@ -172,7 +186,7 @@ class _Lowerer:
         # rc_predict function
         fnty = ir.FunctionType(
             ir.VoidType(),
-            [_I64, self.fty.as_pointer(), self.fty.as_pointer()],
+            [_I64, self.fty.as_pointer(), out_ty.as_pointer()],
         )
         self.fn = ir.Function(self.module, fnty, name="rc_predict")
         self.T_arg, self.X_arg, self.Y_arg = self.fn.args
@@ -184,9 +198,9 @@ class _Lowerer:
         # Determine scratch sizes
         needs_phi = any(
             isinstance(op, (ReadoutLinear, BuildPhi))
-            for op in self._flatten_ops()
+            for op in flat
         )
-        max_F = max((op.F for op in self._flatten_ops()
+        max_F = max((op.F for op in flat
                       if isinstance(op, (ReadoutLinear, FusedStepReadout))),
                      default=self.N + self.K + 1)
 
@@ -198,12 +212,25 @@ class _Lowerer:
             if needs_phi else None
         )
         self.acc = self.b.alloca(self.fty, name="acc")
+        # Logits scratch when a classification head consumes the readout.
+        self.logits = (
+            self.b.alloca(self.fty, size=_ci(max(self.M, 1)), name="logits")
+            if self.has_head else None
+        )
+        # Running state sum + step count for MEAN time-pooling.
+        if self.needs_state_sum:
+            self.h_sum = self.b.alloca(self.fty, size=_ci(self.N), name="h_sum")
+            with _loop(self.b, _ci(self.N), "sinit") as i:
+                _store1d(self.b, self.h_sum, i, self._cf(0.0))
+        else:
+            self.h_sum = None
 
         # Init h to zero
         with _loop(self.b, _ci(self.N), "init") as i:
             _store1d(self.b, self.h, i, self._cf(0.0))
 
-        self.t = None  # current time index, valid inside a TimeLoop body
+        self.t = None    # current time index, valid inside a TimeLoop body
+        self.row = None  # current output row (= t per-step, = 0 post-loop)
 
     def _cf(self, v):
         return ir.Constant(self.fty, float(v))
@@ -234,6 +261,7 @@ class _Lowerer:
         from rclite.ir.ops import (
             TimeLoop, PreprocessInput, ReservoirStep, BuildPhi,
             ReadoutLinear, FusedStepReadout,
+            Argmax, Softmax, AccumulateState, FinalizeAggregate,
         )
         if isinstance(op, TimeLoop):
             return self._lower_time_loop(op)
@@ -247,6 +275,14 @@ class _Lowerer:
             return self._lower_readout_linear(op)
         if isinstance(op, FusedStepReadout):
             return self._lower_fused(op)
+        if isinstance(op, AccumulateState):
+            return self._lower_accumulate_state(op)
+        if isinstance(op, FinalizeAggregate):
+            return self._lower_finalize_aggregate(op)
+        if isinstance(op, Argmax):
+            return self._lower_argmax(op)
+        if isinstance(op, Softmax):
+            return self._lower_softmax(op)
         raise NotImplementedError(f"unknown op: {type(op).__name__}")
 
     def _lower_time_loop(self, op):
@@ -255,9 +291,11 @@ class _Lowerer:
         if K_unroll == 1:
             with _loop(self.b, T, "t") as t:
                 self.t = t
+                self.row = t
                 for body_op in op.body:
                     self._lower(body_op)
             self.t = None
+            self.row = None
             return
         # Unroll body by `K_unroll` over [0, T_unrolled), tail loop for remainder.
         K_const = _ci(K_unroll)
@@ -266,13 +304,16 @@ class _Lowerer:
             for k in range(K_unroll):
                 self.t = (t_base if k == 0
                           else self.b.add(t_base, _ci(k), name=f"t_{k}"))
+                self.row = self.t
                 for body_op in op.body:
                     self._lower(body_op)
         with _loop_strided(self.b, T_unrolled, T, _ci(1), "ttail") as t:
             self.t = t
+            self.row = t
             for body_op in op.body:
                 self._lower(body_op)
         self.t = None
+        self.row = None
 
     def _lower_preprocess(self, op):
         tK = self.b.mul(self.t, _ci(op.K))
@@ -369,7 +410,7 @@ class _Lowerer:
 
     def _lower_readout_linear(self, op):
         g_Wout = self.globals[op.W_out_name]
-        tM = self.b.mul(self.t, _ci(op.M))
+        tM = self.b.mul(self.row, _ci(op.M))
         with _loop(self.b, _ci(op.M), "m") as m:
             self.b.store(self._cf(0.0), self.acc)
             with _loop(self.b, _ci(op.F), "fout") as fi:
@@ -379,8 +420,11 @@ class _Lowerer:
                     self.b.fadd(self.b.load(self.acc), self.b.fmul(w, pv)),
                     self.acc,
                 )
-            _store1d(self.b, self.Y_arg, self.b.add(tM, m),
-                      self.b.load(self.acc))
+            if self.logits is not None:
+                _store1d(self.b, self.logits, m, self.b.load(self.acc))
+            else:
+                _store1d(self.b, self.Y_arg, self.b.add(tM, m),
+                          self.b.load(self.acc))
 
     def _lower_fused(self, op):
         """Step + readout in one op: no phi buffer materialization."""
@@ -411,7 +455,7 @@ class _Lowerer:
             _store1d(b, self.h, i, new_h)
 
         # Readout — phi is virtual; we index W_out's columns directly.
-        tM = b.mul(self.t, _ci(op.M))
+        tM = b.mul(self.row, _ci(op.M))
         tK = b.mul(self.t, _ci(op.K))
         bias_off = 1 if op.include_bias_phi else 0
         input_off = bias_off + (op.K if op.include_input_phi else 0)
@@ -434,16 +478,112 @@ class _Lowerer:
                                     b.add(_ci(input_off), i))
                 hv = _load1d(b, self.h, i)
                 b.store(b.fadd(b.load(self.acc), b.fmul(w, hv)), self.acc)
-            _store1d(b, self.Y_arg, b.add(tM, m), b.load(self.acc))
+            if self.logits is not None:
+                _store1d(b, self.logits, m, b.load(self.acc))
+            else:
+                _store1d(b, self.Y_arg, b.add(tM, m), b.load(self.acc))
+
+    # ------------------------------------------------------------------
+    # sequence-to-label time pooling
+
+    def _washout_clamped(self, washout):
+        """w = min(washout, T-1) as an i64 SSA value (loop-invariant)."""
+        b = self.b
+        w_const = _ci(washout)
+        t_minus1 = b.sub(self.T_arg, _ci(1))
+        return b.select(b.icmp_signed("<", w_const, self.T_arg),
+                        w_const, t_minus1)
+
+    def _lower_accumulate_state(self, op):
+        """mode='mean': h_sum += h for t >= min(washout, T-1).
+        mode='last': nothing (the final h is the pool)."""
+        if op.mode == "last":
+            return
+        b = self.b
+        w = self._washout_clamped(op.washout)
+        in_window = b.icmp_signed(">=", self.t, w)
+        with _loop(b, _ci(op.N), "acc_h") as i:
+            s = _load1d(b, self.h_sum, i)
+            h_i = _load1d(b, self.h, i)
+            add = b.select(in_window, h_i, self._cf(0.0))
+            _store1d(b, self.h_sum, i, b.fadd(s, add))
+
+    def _lower_finalize_aggregate(self, op):
+        """Write the pooled state into h, then point output at row 0.
+
+        mode='mean' divides the running sum by the pooled-step count
+        (T - min(washout, T-1)); mode='last' leaves h untouched.
+        """
+        if op.mode == "mean":
+            b = self.b
+            w = self._washout_clamped(op.washout)
+            count = b.sub(self.T_arg, w)
+            tf = b.uitofp(count, self.fty)
+            with _loop(b, _ci(op.N), "fin_h") as i:
+                s = _load1d(b, self.h_sum, i)
+                _store1d(b, self.h, i, b.fdiv(s, tf))
+        # Sequence output is a single row.
+        self.t = _ci(0)
+        self.row = _ci(0)
+
+    # ------------------------------------------------------------------
+    # classification heads
+
+    def _lower_argmax(self, op):
+        """class_id = argmax_m logits[m]; write one i32 at output row."""
+        b = self.b
+        best_v = b.alloca(self.fty, name="best_v")
+        best_i = b.alloca(_I64, name="best_i")
+        b.store(_load1d(b, self.logits, _ci(0)), best_v)
+        b.store(_ci(0), best_i)
+        with _loop(b, _ci(op.M), "am") as m:
+            v = _load1d(b, self.logits, m)
+            is_gt = b.fcmp_ordered(">", v, b.load(best_v))
+            b.store(b.select(is_gt, v, b.load(best_v)), best_v)
+            b.store(b.select(is_gt, m, b.load(best_i)), best_i)
+        cls = b.trunc(b.load(best_i), _I32)
+        _store1d(b, self.Y_arg, self.row, cls)
+
+    def _lower_softmax(self, op):
+        """p[m] = exp(logits[m]-max) / sum_j exp(logits[j]-max), M floats out."""
+        b = self.b
+        if self.exp_fn is None:
+            exp_name = "expf" if self.fty == _F32 else "exp"
+            self.exp_fn = ir.Function(
+                self.module, ir.FunctionType(self.fty, [self.fty]),
+                name=exp_name,
+            )
+        # max
+        mx = b.alloca(self.fty, name="sm_max")
+        b.store(_load1d(b, self.logits, _ci(0)), mx)
+        with _loop(b, _ci(op.M), "smx") as m:
+            v = _load1d(b, self.logits, m)
+            is_gt = b.fcmp_ordered(">", v, b.load(mx))
+            b.store(b.select(is_gt, v, b.load(mx)), mx)
+        # exp(v - max) into logits, accumulate sum
+        b.store(self._cf(0.0), self.acc)
+        with _loop(b, _ci(op.M), "sme") as m:
+            v = _load1d(b, self.logits, m)
+            e = b.call(self.exp_fn, [b.fsub(v, b.load(mx))])
+            _store1d(b, self.logits, m, e)
+            b.store(b.fadd(b.load(self.acc), e), self.acc)
+        # normalize into Y
+        tM = b.mul(self.row, _ci(op.M))
+        denom = b.load(self.acc)
+        with _loop(b, _ci(op.M), "smn") as m:
+            e = _load1d(b, self.logits, m)
+            _store1d(b, self.Y_arg, b.add(tM, m), b.fdiv(e, denom))
 
 
 def emit_module(rc: ReservoirComputer, exe: RCExecutor,
-                *, dtype: str = "f64", passes=None) -> ir.Module:
+                *, dtype: str = "f64", passes=None, head=None) -> ir.Module:
     """Build an rclite IR module, apply passes, and lower to LLVM IR.
 
     `dtype` selects f64 (host) vs f32 (Cortex-M cross-compile).
     `passes` is a list of `rclite.ir.passes.*` instances; defaults to
     `[StructuralSpecialize()]`.
+    `head` selects the output format: None / "logits" (raw scores),
+    "proba" (softmax), or "classify" (argmax class id, i32 output).
     """
     if rc.reservoir.activation != Activation.TANH:
         raise NotImplementedError(
@@ -454,7 +594,7 @@ def emit_module(rc: ReservoirComputer, exe: RCExecutor,
     from rclite.ir import build_ir
     from rclite.ir.passes import StructuralSpecialize
 
-    ir_module = build_ir(rc, exe)
+    ir_module = build_ir(rc, exe, head=head)
     if passes is None:
         passes = [StructuralSpecialize()]
     for p in passes:
@@ -463,13 +603,14 @@ def emit_module(rc: ReservoirComputer, exe: RCExecutor,
 
 
 def emit_quantized_module(qmodel, *, passes=None,
-                            saturating: bool = True) -> ir.Module:
+                            saturating: bool = True, head=None) -> ir.Module:
     """Build LLVM IR for the integer quantized path (i32, i16, or i8).
 
     Function signature:
         void rc_predict(int64_t T, storage_t* X, storage_t* Y);
     where storage_t is int32_t / int16_t / int8_t for the corresponding
-    `I32FixedPoint` / `I16FixedPoint` / `I8Symmetric` target.
+    `I32FixedPoint` / `I16FixedPoint` / `I8Symmetric` target. With
+    `head="classify"`, Y is `int32_t*` (one class id per step).
 
     `saturating=True` wraps inner-loop accumulations and the final
     truncation with `@llvm.sadd.sat.*` and clamping selects, so overflow
@@ -478,7 +619,7 @@ def emit_quantized_module(qmodel, *, passes=None,
     """
     from rclite.quant.ir_builder import build_ir_from_quantized
 
-    ir_module = build_ir_from_quantized(qmodel)
+    ir_module = build_ir_from_quantized(qmodel, head=head)
     if passes is None:
         passes = []
     for p in passes:
@@ -521,6 +662,7 @@ class _IntLowerer:
     def __init__(self, ir_module, *, saturating: bool = True):
         from rclite.ir.ops import (
             TimeLoop, ReservoirStep, BuildPhi, ReadoutLinear, FusedStepReadout,
+            Argmax, Softmax,
         )
 
         self.ir_module = ir_module
@@ -586,6 +728,20 @@ class _IntLowerer:
         else:
             self.sadd_sat_fn = None
 
+        # Classification head: argmax produces an int32 class id per step;
+        # softmax produces M probabilities (storage type, Q.sm_prob_frac).
+        # Both route the readout through a logits scratch.
+        flat = list(self._flatten_ops())
+        self.out_int = any(isinstance(op, Argmax) for op in flat)
+        self.has_softmax = any(isinstance(op, Softmax) for op in flat)
+        self.has_head = self.out_int or self.has_softmax
+        out_ty = _I32 if self.out_int else self.storage_ty
+        if self.has_softmax:
+            self.sm_dmin_q = int(md["sm_dmin_q"])
+            self.sm_n = int(md["sm_n"])
+            self.sm_idx_frac = int(md["sm_idx_frac"])
+            self.sm_prob_frac = int(md["sm_prob_frac"])
+
         # Weight / LUT globals at storage_ty (i32 or i16)
         self.globals = {}
         for name, arr in ir_module.weights.items():
@@ -593,7 +749,7 @@ class _IntLowerer:
 
         fnty = ir.FunctionType(
             ir.VoidType(),
-            [_I64, self.storage_ty.as_pointer(), self.storage_ty.as_pointer()],
+            [_I64, self.storage_ty.as_pointer(), out_ty.as_pointer()],
         )
         self.fn = ir.Function(self.module, fnty, name="rc_predict")
         self.T_arg, self.X_arg, self.Y_arg = self.fn.args
@@ -604,10 +760,10 @@ class _IntLowerer:
 
         needs_phi = any(
             isinstance(op, (ReadoutLinear, BuildPhi))
-            for op in self._flatten_ops()
+            for op in flat
         )
         max_F = max(
-            (op.F for op in self._flatten_ops()
+            (op.F for op in flat
               if isinstance(op, (ReadoutLinear, FusedStepReadout))),
             default=self.N + self.K + 1,
         )
@@ -620,6 +776,17 @@ class _IntLowerer:
         self.phi_arr = (
             self.b.alloca(self.storage_ty, size=_ci(max(max_F, 1)), name="phi")
             if needs_phi else None
+        )
+        # Logits scratch (storage_ty) when a classification head consumes the
+        # readout; argmax compares these monotone-quantized scores.
+        self.logits = (
+            self.b.alloca(self.storage_ty, size=_ci(max(self.M, 1)), name="logits")
+            if self.has_head else None
+        )
+        # exp() scratch (i32, Q.sm_prob_frac) for the softmax head.
+        self.exp_scratch = (
+            self.b.alloca(_I32, size=_ci(max(self.M, 1)), name="exp_q")
+            if self.has_softmax else None
         )
         # Accumulator is in accum_ty (wider) — protects against per-row overflow
         # in the matmul over N terms.
@@ -714,6 +881,7 @@ class _IntLowerer:
     def _lower(self, op):
         from rclite.ir.ops import (
             TimeLoop, PreprocessInput, ReservoirStep, BuildPhi, ReadoutLinear,
+            Argmax, Softmax,
         )
         if isinstance(op, TimeLoop):
             return self._lower_time_loop(op)
@@ -725,6 +893,10 @@ class _IntLowerer:
             return self._lower_build_phi(op)
         if isinstance(op, ReadoutLinear):
             return self._lower_readout_linear(op)
+        if isinstance(op, Argmax):
+            return self._lower_argmax(op)
+        if isinstance(op, Softmax):
+            return self._lower_softmax(op)
         raise NotImplementedError(
             f"{type(op).__name__} not supported in the integer path"
         )
@@ -735,6 +907,76 @@ class _IntLowerer:
             for body_op in op.body:
                 self._lower(body_op)
         self.t = None
+
+    def _lower_argmax(self, op):
+        """class_id = argmax_m logits[m] over the monotone quantized scores."""
+        b = self.b
+        best_v = b.alloca(self.storage_ty, name="best_v")
+        best_i = b.alloca(_I64, name="best_i")
+        b.store(_load1d(b, self.logits, _ci(0)), best_v)
+        b.store(_ci(0), best_i)
+        with _loop(b, _ci(op.M), "am") as m:
+            v = _load1d(b, self.logits, m)
+            is_gt = b.icmp_signed(">", v, b.load(best_v))
+            b.store(b.select(is_gt, v, b.load(best_v)), best_v)
+            b.store(b.select(is_gt, m, b.load(best_i)), best_i)
+        _store1d(b, self.Y_arg, self.t, b.trunc(b.load(best_i), _I32))
+
+    def _lower_softmax(self, op):
+        """Fixed-point softmax (exp LUT), bit-exact with softmax_q.
+
+        Writes M probabilities at Q.sm_prob_frac into Y (storage type).
+        """
+        b = self.b
+        g_lut = self.globals["sm_lut"]
+        n = self.sm_n
+        idxf = self.sm_idx_frac
+        dmin = self.sm_dmin_q
+        pf = self.sm_prob_frac
+        M = op.M
+        qmax = (1 << (self.storage_bits - 1)) - 1
+
+        # max over logits (i32)
+        mx = b.alloca(_I32, name="sm_max")
+        b.store(b.sext(_load1d(b, self.logits, _ci(0)), _I32), mx)
+        with _loop(b, _ci(M), "smx") as m:
+            v = b.sext(_load1d(b, self.logits, m), _I32)
+            b.store(b.select(b.icmp_signed(">", v, b.load(mx)), v, b.load(mx)), mx)
+
+        # exp(d) via clamped, linearly-interpolated LUT; accumulate sum (i64)
+        sum_acc = b.alloca(_I64, name="sm_sum")
+        b.store(self._ci64(0), sum_acc)
+        with _loop(b, _ci(M), "sme") as m:
+            v = b.sext(_load1d(b, self.logits, m), _I32)
+            d = b.sub(v, b.load(mx))                       # <= 0
+            d = b.select(b.icmp_signed("<", d, self._ci32(dmin)),
+                         self._ci32(dmin), d)
+            num = b.sub(d, self._ci32(dmin))               # [0, -dmin]
+            # pos = (num * (n-1) << idxf) / (-dmin)   in i64
+            num64 = b.sext(num, _I64)
+            posn = b.shl(b.mul(num64, self._ci64(n - 1)), self._ci64(idxf))
+            pos = b.sdiv(posn, self._ci64(-dmin))
+            i0 = b.ashr(pos, self._ci64(idxf))             # i64 index
+            i0 = b.select(b.icmp_signed("<", i0, self._ci64(0)),
+                          self._ci64(0), i0)
+            i0 = b.select(b.icmp_signed(">", i0, self._ci64(n - 2)),
+                          self._ci64(n - 2), i0)
+            frac = b.sub(pos, b.shl(i0, self._ci64(idxf)))
+            y0 = b.sext(_load1d_global(b, g_lut, i0), _I64)
+            y1 = b.sext(_load1d_global(b, g_lut, b.add(i0, self._ci64(1))), _I64)
+            e = b.add(y0, b.ashr(b.mul(b.sub(y1, y0), frac), self._ci64(idxf)))
+            _store1d(b, self.exp_scratch, m, b.trunc(e, _I32))
+            b.store(b.add(b.load(sum_acc), e), sum_acc)
+
+        # normalize: p = (e << prob_frac) / sum, clamp to qmax, store
+        s = b.load(sum_acc)
+        with _loop(b, _ci(M), "smn") as m:
+            e = b.sext(_load1d(b, self.exp_scratch, m), _I64)
+            p = b.sdiv(b.shl(e, self._ci64(pf)), s)
+            p = b.select(b.icmp_signed(">", p, self._ci64(qmax)),
+                         self._ci64(qmax), p)
+            tM = b.mul(self.t, _ci(M))
+            _store1d(b, self.Y_arg, b.add(tM, m), b.trunc(p, self.storage_ty))
 
     def _lower_preprocess(self, op):
         """u_pre_q[k] := ((X_raw_q[k] - offset_q) * scaling_q) >> weight_frac
@@ -997,18 +1239,22 @@ class _IntLowerer:
                     self.b.icmp_signed(">", clipped_lo, hi), hi, clipped_lo
                 )
                 y = self.b.trunc(clipped, self.storage_ty)
-            _store1d(self.b, self.Y_arg, self.b.add(tM, m), y)
+            if self.logits is not None:
+                _store1d(self.b, self.logits, m, y)
+            else:
+                _store1d(self.b, self.Y_arg, self.b.add(tM, m), y)
 
 
 # ----------------------------------------------------------------------------
 # Affine (asymmetric per-tensor) lowering
 
 
-def emit_quantized_affine_module(qmodel, *, passes=None) -> ir.Module:
+def emit_quantized_affine_module(qmodel, *, passes=None, head=None) -> ir.Module:
     """Build LLVM IR for the affine integer quantized path (i8 or i16).
 
     Function signature is identical to the symmetric path:
         void rc_predict(int64_t T, storage_t* X, storage_t* Y);
+    With `head="classify"`, Y is `int32_t*` (one class id per step).
 
     `qmodel` is an `AffineQuantizedModel`; weights and metadata flow
     through `build_ir_from_quantized_affine` into the IR Module, then
@@ -1016,7 +1262,7 @@ def emit_quantized_affine_module(qmodel, *, passes=None) -> ir.Module:
     """
     from rclite.quant.affine.ir_builder import build_ir_from_quantized_affine
 
-    ir_module = build_ir_from_quantized_affine(qmodel)
+    ir_module = build_ir_from_quantized_affine(qmodel, head=head)
     if passes is None:
         passes = []
     for p in passes:
@@ -1056,7 +1302,9 @@ class _AffineLowerer:
     """
 
     def __init__(self, ir_module):
-        from rclite.ir.ops import ReservoirStep, BuildPhi, ReadoutLinear, TimeLoop
+        from rclite.ir.ops import (
+            ReservoirStep, BuildPhi, ReadoutLinear, TimeLoop, Argmax, Softmax,
+        )
 
         self.ir_module = ir_module
         md = ir_module.metadata
@@ -1143,15 +1391,29 @@ class _AffineLowerer:
         )
         self.module.triple = llvm.get_default_triple()
 
+        # Classification head: argmax emits an int32 class id per step;
+        # softmax emits M probabilities (storage type, Q.sm_prob_frac).
+        # Both route the readout through a logits scratch.
+        flat = list(self._flatten_ops())
+        self.out_int = any(isinstance(op, Argmax) for op in flat)
+        self.has_softmax = any(isinstance(op, Softmax) for op in flat)
+        self.has_head = self.out_int or self.has_softmax
+        out_ty = _I32 if self.out_int else self.storage_ty
+        if self.has_softmax:
+            self.sm_dmin_q = int(md["sm_dmin_q"])
+            self.sm_n = int(md["sm_n"])
+            self.sm_idx_frac = int(md["sm_idx_frac"])
+            self.sm_prob_frac = int(md["sm_prob_frac"])
+
         # Emit all globals (storage-typed weights + i32 precomputed row sums).
         self.globals = {}
         for name, arr in ir_module.weights.items():
             self.globals[name] = self._emit_global(name, arr)
 
-        # void rc_predict(i64 T, storage_t* X, storage_t* Y)
+        # void rc_predict(i64 T, storage_t* X, {storage_t|i32}* Y)
         fnty = ir.FunctionType(
             ir.VoidType(),
-            [_I64, self.storage_ty.as_pointer(), self.storage_ty.as_pointer()],
+            [_I64, self.storage_ty.as_pointer(), out_ty.as_pointer()],
         )
         self.fn = ir.Function(self.module, fnty, name="rc_predict")
         self.T_arg, self.X_arg, self.Y_arg = self.fn.args
@@ -1168,6 +1430,14 @@ class _AffineLowerer:
         )
         self.pre_buf = self.b.alloca(
             self.storage_ty, size=_ci(self.N), name="pre",
+        )
+        self.logits = (
+            self.b.alloca(self.storage_ty, size=_ci(max(self.M, 1)), name="logits")
+            if self.has_head else None
+        )
+        self.exp_scratch = (
+            self.b.alloca(_I32, size=_ci(max(self.M, 1)), name="exp_q")
+            if self.has_softmax else None
         )
         # u_pre scratch only allocated when integer preprocess is in play —
         # otherwise the matmul reads X directly.
@@ -1282,9 +1552,17 @@ class _AffineLowerer:
         self.b.ret_void()
         return self.module
 
+    def _flatten_ops(self):
+        from rclite.ir.ops import TimeLoop
+        for op in self.ir_module.ops:
+            yield op
+            if isinstance(op, TimeLoop):
+                yield from op.body
+
     def _lower(self, op):
         from rclite.ir.ops import (
             TimeLoop, PreprocessInput, ReservoirStep, BuildPhi, ReadoutLinear,
+            Argmax, Softmax,
         )
         if isinstance(op, TimeLoop):
             return self._lower_time_loop(op)
@@ -1297,9 +1575,80 @@ class _AffineLowerer:
             return
         if isinstance(op, ReadoutLinear):
             return self._lower_readout_linear(op)
+        if isinstance(op, Argmax):
+            return self._lower_argmax(op)
+        if isinstance(op, Softmax):
+            return self._lower_softmax(op)
         raise NotImplementedError(
             f"{type(op).__name__} not supported in the affine path"
         )
+
+    def _lower_argmax(self, op):
+        """class_id = argmax_m logits[m] over the monotone quantized scores."""
+        b = self.b
+        best_v = b.alloca(self.storage_ty, name="best_v")
+        best_i = b.alloca(_I64, name="best_i")
+        b.store(_load1d(b, self.logits, _ci(0)), best_v)
+        b.store(_ci(0), best_i)
+        with _loop(b, _ci(op.M), "am") as m:
+            v = _load1d(b, self.logits, m)
+            is_gt = b.icmp_signed(">", v, b.load(best_v))
+            b.store(b.select(is_gt, v, b.load(best_v)), best_v)
+            b.store(b.select(is_gt, m, b.load(best_i)), best_i)
+        _store1d(b, self.Y_arg, self.t, b.trunc(b.load(best_i), _I32))
+
+    def _lower_softmax(self, op):
+        """Fixed-point softmax (exp LUT), bit-exact with softmax_q.
+
+        Identical integer algorithm to the symmetric path; operates on the
+        quantized logits scratch and writes Q.sm_prob_frac probabilities.
+        """
+        b = self.b
+        g_lut = self.globals["sm_lut"]
+        n = self.sm_n
+        idxf = self.sm_idx_frac
+        dmin = self.sm_dmin_q
+        pf = self.sm_prob_frac
+        M = op.M
+        qmax = (1 << (self.storage_bits - 1)) - 1
+
+        mx = b.alloca(_I32, name="sm_max")
+        b.store(b.sext(_load1d(b, self.logits, _ci(0)), _I32), mx)
+        with _loop(b, _ci(M), "smx") as m:
+            v = b.sext(_load1d(b, self.logits, m), _I32)
+            b.store(b.select(b.icmp_signed(">", v, b.load(mx)), v, b.load(mx)), mx)
+
+        sum_acc = b.alloca(_I64, name="sm_sum")
+        b.store(self._ci64(0), sum_acc)
+        with _loop(b, _ci(M), "sme") as m:
+            v = b.sext(_load1d(b, self.logits, m), _I32)
+            d = b.sub(v, b.load(mx))
+            d = b.select(b.icmp_signed("<", d, self._ci32(dmin)),
+                         self._ci32(dmin), d)
+            num = b.sub(d, self._ci32(dmin))
+            num64 = b.sext(num, _I64)
+            posn = b.shl(b.mul(num64, self._ci64(n - 1)), self._ci64(idxf))
+            pos = b.sdiv(posn, self._ci64(-dmin))
+            i0 = b.ashr(pos, self._ci64(idxf))
+            i0 = b.select(b.icmp_signed("<", i0, self._ci64(0)),
+                          self._ci64(0), i0)
+            i0 = b.select(b.icmp_signed(">", i0, self._ci64(n - 2)),
+                          self._ci64(n - 2), i0)
+            frac = b.sub(pos, b.shl(i0, self._ci64(idxf)))
+            y0 = b.sext(_load1d_global(b, g_lut, i0), _I64)
+            y1 = b.sext(_load1d_global(b, g_lut, b.add(i0, self._ci64(1))), _I64)
+            e = b.add(y0, b.ashr(b.mul(b.sub(y1, y0), frac), self._ci64(idxf)))
+            _store1d(b, self.exp_scratch, m, b.trunc(e, _I32))
+            b.store(b.add(b.load(sum_acc), e), sum_acc)
+
+        s = b.load(sum_acc)
+        with _loop(b, _ci(M), "smn") as m:
+            e = b.sext(_load1d(b, self.exp_scratch, m), _I64)
+            p = b.sdiv(b.shl(e, self._ci64(pf)), s)
+            p = b.select(b.icmp_signed(">", p, self._ci64(qmax)),
+                         self._ci64(qmax), p)
+            tM = b.mul(self.t, _ci(M))
+            _store1d(b, self.Y_arg, b.add(tM, m), b.trunc(p, self.storage_ty))
 
     def _lower_preprocess_affine(self, op):
         """Integer preprocess: u_pre[k] = sat(pre_const + apply_mult(q_x − zp_x)).
@@ -1674,7 +2023,10 @@ class _AffineLowerer:
             self.b.store(self.b.add(self.b.load(y_var), rq_s), y_var)
 
             y_q = self._emit_saturate_to_storage(self.b.load(y_var))
-            _store1d(self.b, self.Y_arg, self.b.add(tM, m), y_q)
+            if self.logits is not None:
+                _store1d(self.b, self.logits, m, y_q)
+            else:
+                _store1d(self.b, self.Y_arg, self.b.add(tM, m), y_q)
 
 
 class CompiledAffineRC:
@@ -1689,11 +2041,15 @@ class CompiledAffineRC:
 
     name = "llvm-affine"
 
-    def __init__(self, qmodel, opt_level: int = 3, passes=None):
+    def __init__(self, qmodel, opt_level: int = 3, passes=None, head=None):
         _ensure_initialized()
         self.qmodel = qmodel
         self.rc = qmodel.rc
-        self._ir_text = str(emit_quantized_affine_module(qmodel, passes=passes))
+        self.head = head or "logits"
+        self._out_int = self.head == "classify"
+        self._ir_text = str(emit_quantized_affine_module(
+            qmodel, passes=passes, head=head,
+        ))
         self._mod = llvm.parse_assembly(self._ir_text)
         self._mod.verify()
 
@@ -1721,23 +2077,36 @@ class CompiledAffineRC:
             raise NotImplementedError(
                 f"CompiledAffineRC: storage_bits {sw} not supported"
             )
+        out_ptr = (ctypes.POINTER(ctypes.c_int32) if self._out_int
+                   else ctypes.POINTER(self._cstorage))
         addr = self._engine.get_function_address("rc_predict")
         self._cfn = ctypes.CFUNCTYPE(
             None, ctypes.c_int64,
             ctypes.POINTER(self._cstorage),
-            ctypes.POINTER(self._cstorage),
+            out_ptr,
         )(addr)
 
     def predict(self, X: np.ndarray) -> np.ndarray:
-        """Float input → JIT kernel → dequantized float output."""
+        """Float input → JIT kernel → output.
+
+        head="logits": dequantized float (T, M). head="classify": int32
+        class indices (T,). head="proba": float (T, M) probabilities.
+        """
         if X.ndim == 1:
             X = X[:, None]
         T = X.shape[0]
-        K = self.qmodel.K
         Mout = self.qmodel.M
         # Quantize input via the model's input params (matches Python ref).
         X_q = self.qmodel.config.input.quantize_array(X).astype(self._np_storage)
         X_q = np.ascontiguousarray(X_q.reshape(-1))
+        if self._out_int:
+            Y = np.zeros(T, dtype=np.int32)
+            self._cfn(
+                ctypes.c_int64(T),
+                X_q.ctypes.data_as(ctypes.POINTER(self._cstorage)),
+                Y.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+            )
+            return Y
         Y_q = np.zeros(T * Mout, dtype=self._np_storage)
         self._cfn(
             ctypes.c_int64(T),
@@ -1745,6 +2114,9 @@ class CompiledAffineRC:
             Y_q.ctypes.data_as(ctypes.POINTER(self._cstorage)),
         )
         Y_q = Y_q.reshape(T, Mout)
+        if self.head == "proba":
+            prob_frac = min(self.qmodel.storage_bits - 1, 15)
+            return Y_q.astype(np.float64) / (1 << prob_frac)
         return self.qmodel.config.output.dequantize_array(Y_q)
 
     @property
@@ -1770,11 +2142,13 @@ class CompiledRC:
 
     def __init__(self, rc: ReservoirComputer, exe: RCExecutor,
                  opt_level: int = 3, vectorize: bool = True,
-                 passes=None):
+                 passes=None, head=None):
         _ensure_initialized()
         self.rc = rc
         self.exe = exe
-        self._ir_text = str(emit_module(rc, exe, passes=passes))
+        self.head = head or "logits"
+        self._out_int = self.head == "classify"
+        self._ir_text = str(emit_module(rc, exe, passes=passes, head=head))
         self._mod = llvm.parse_assembly(self._ir_text)
         self._mod.verify()
 
@@ -1792,20 +2166,39 @@ class CompiledRC:
         self._engine.finalize_object()
         self._engine.run_static_constructors()
 
+        out_ptr = (ctypes.POINTER(ctypes.c_int32) if self._out_int
+                   else ctypes.POINTER(ctypes.c_double))
         addr = self._engine.get_function_address("rc_predict")
         self._cfn = ctypes.CFUNCTYPE(
             None, ctypes.c_int64,
             ctypes.POINTER(ctypes.c_double),
-            ctypes.POINTER(ctypes.c_double),
+            out_ptr,
         )(addr)
 
     def predict(self, X: np.ndarray) -> np.ndarray:
+        """Run the kernel.
+
+        head="logits"/"proba": returns float (n_rows, M).
+        head="classify":       returns int32 class indices (n_rows,).
+        n_rows is T for per-step readouts, or 1 for sequence aggregation
+        (the whole input is pooled to a single output row).
+        """
         if X.ndim == 1:
             X = X[:, None]
+        from rclite.core.profile import Aggregation
         T = X.shape[0]
         M = self.rc.readout.units
+        n_rows = 1 if self.rc.readout.aggregation != Aggregation.NONE else T
         X = np.ascontiguousarray(X, dtype=np.float64)
-        Y = np.zeros((T, M), dtype=np.float64)
+        if self._out_int:
+            Y = np.zeros(n_rows, dtype=np.int32)
+            self._cfn(
+                ctypes.c_int64(T),
+                X.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+                Y.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+            )
+            return Y
+        Y = np.zeros((n_rows, M), dtype=np.float64)
         self._cfn(
             ctypes.c_int64(T),
             X.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
@@ -1860,12 +2253,26 @@ class CompiledRC:
                 pass
 
     def emit_header(self, path: str, fn_name: str = "rc_predict") -> None:
-        """Write a C header declaring the compiled function."""
+        """Write a C header declaring the compiled function.
+
+        The output type tracks the head this CompiledRC was built with:
+        head="classify" declares `int32_t *Y` (class ids, one per row);
+        head="logits"/"proba" declare `double *Y`. Sequence-aggregation
+        models produce a single output row regardless of T.
+        """
+        from rclite.core.profile import Aggregation
         K = self.rc.input.units
         N = self.rc.reservoir.units
         M = self.rc.readout.units
         topo = self.rc.reservoir.topology.name
         trainer = self.rc.readout.trainer.name
+        task = self.rc.readout.task.name
+        agg = self.rc.readout.aggregation.name
+        n_rows = "1 (sequence-pooled)" if self.rc.readout.aggregation != Aggregation.NONE else "T"
+        out_decl = (f"int32_t *Y" if self._out_int else "double *Y")
+        out_desc = ("class id per row (argmax)" if self._out_int
+                    else ("softmax probabilities" if self.head == "proba"
+                          else "linear scores"))
         guard = "RC_PREDICT_H"
         header = (
             f"/* Auto-generated header for compiled ReservoirComputer.\n"
@@ -1875,6 +2282,9 @@ class CompiledRC:
             f" *   output units     = {M}\n"
             f" *   topology         = {topo}\n"
             f" *   trainer          = {trainer}\n"
+            f" *   task             = {task}\n"
+            f" *   aggregation      = {agg}\n"
+            f" *   head             = {self.head}\n"
             f" *   activation       = {self.rc.reservoir.activation.name}\n"
             f" *   leak_rate        = {self.rc.reservoir.leak_rate}\n"
             f" *   input_scaling    = {self.rc.input.input_scaling}\n"
@@ -1888,6 +2298,7 @@ class CompiledRC:
             f"#define RC_INPUT_DIM  {K}\n"
             f"#define RC_OUTPUT_DIM {M}\n"
             f"#define RC_RES_UNITS  {N}\n"
+            f"#define RC_NUM_CLASSES {M if task == 'CLASSIFICATION' else 0}\n"
             f"\n"
             f"#ifdef __cplusplus\n"
             f"extern \"C\" {{\n"
@@ -1895,9 +2306,9 @@ class CompiledRC:
             f"\n"
             f"/* Run inference over a length-T sequence.\n"
             f" *   X: row-major (T x RC_INPUT_DIM) input.   Caller-owned.\n"
-            f" *   Y: row-major (T x RC_OUTPUT_DIM) output. Caller-allocated.\n"
+            f" *   Y: {out_desc}; {n_rows} output row(s). Caller-allocated.\n"
             f" */\n"
-            f"void {fn_name}(int64_t T, double *X, double *Y);\n"
+            f"void {fn_name}(int64_t T, double *X, {out_decl});\n"
             f"\n"
             f"#ifdef __cplusplus\n"
             f"}}\n"
@@ -1927,13 +2338,15 @@ class CompiledQuantizedRC:
     name = "llvm-quantized"
 
     def __init__(self, qmodel, opt_level: int = 3, passes=None,
-                 saturating: bool = True):
+                 saturating: bool = True, head=None):
         _ensure_initialized()
         self.qmodel = qmodel
         self.rc = qmodel.rc
         self.saturating = saturating
+        self.head = head or "logits"
+        self._out_int = self.head == "classify"
         self._ir_text = str(emit_quantized_module(
-            qmodel, passes=passes, saturating=saturating,
+            qmodel, passes=passes, saturating=saturating, head=head,
         ))
         self._mod = llvm.parse_assembly(self._ir_text)
         self._mod.verify()
@@ -1967,14 +2380,18 @@ class CompiledQuantizedRC:
         else:
             raise NotImplementedError(f"storage width {sw} not supported in JIT")
 
+        out_ptr = (ctypes.POINTER(ctypes.c_int32) if self._out_int
+                   else ctypes.POINTER(self._cstorage))
         addr = self._engine.get_function_address("rc_predict")
         self._cfn = ctypes.CFUNCTYPE(
             None, ctypes.c_int64,
             ctypes.POINTER(self._cstorage),
-            ctypes.POINTER(self._cstorage),
+            out_ptr,
         )(addr)
 
     def predict(self, X: np.ndarray) -> np.ndarray:
+        """head="logits": float (T, M) at state scale. head="classify":
+        int32 class indices (T,). head="proba": float (T, M) probabilities."""
         if X.ndim == 1:
             X = X[:, None]
         cfg = self.qmodel.config
@@ -1984,12 +2401,23 @@ class CompiledQuantizedRC:
             self.qmodel.target.quantize_input_array(X, cfg).astype(self._np_storage)
         )
         T = X_q.shape[0]
+        if self._out_int:
+            Y = np.zeros(T, dtype=np.int32)
+            self._cfn(
+                ctypes.c_int64(T),
+                X_q.ctypes.data_as(ctypes.POINTER(self._cstorage)),
+                Y.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+            )
+            return Y
         Y_q = np.zeros((T, self.qmodel.M), dtype=self._np_storage)
         self._cfn(
             ctypes.c_int64(T),
             X_q.ctypes.data_as(ctypes.POINTER(self._cstorage)),
             Y_q.ctypes.data_as(ctypes.POINTER(self._cstorage)),
         )
+        if self.head == "proba":
+            prob_frac = min(self.qmodel.target.storage_bits - 1, 15)
+            return Y_q.astype(np.float64) / (1 << prob_frac)
         return Y_q.astype(np.float64) / cfg.state_scale
 
     @property
@@ -2028,15 +2456,17 @@ class CrossCompiledRC:
 
     def __init__(self, rc: ReservoirComputer, exe: RCExecutor, *,
                  triple: str, cpu: str = "", features: str = "",
-                 dtype: str = "f32", opt_level: int = 2, passes=None):
+                 dtype: str = "f32", opt_level: int = 2, passes=None,
+                 head=None):
         _ensure_all_targets()
         self.rc = rc
         self.exe = exe
         self.triple = triple
         self.cpu = cpu
         self.dtype = dtype
+        self.head = head or "logits"
 
-        module = emit_module(rc, exe, dtype=dtype, passes=passes)
+        module = emit_module(rc, exe, dtype=dtype, passes=passes, head=head)
         module.triple = triple
         self._ir_text = str(module)
         self._mod = llvm.parse_assembly(self._ir_text)

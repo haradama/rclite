@@ -17,6 +17,7 @@ from .ops import (
     Op,
     PreprocessInput, ReservoirStep, BuildPhi, ReadoutLinear,
     FusedStepReadout, TimeLoop,
+    Argmax, Softmax, AccumulateState, FinalizeAggregate,
 )
 
 
@@ -95,4 +96,12 @@ def _emit_op(op: Op, indent: int) -> List[str]:
             operands += ", @" + op.W_res_name
         operands += ", @" + op.W_out_name
         return [f"{pad}rc.fused_step_readout {operands}, %Y[%t] {{{attrs}}}"]
+    if isinstance(op, AccumulateState):
+        return [f'{pad}rc.accumulate_state %h {{mode = "{op.mode}"}}']
+    if isinstance(op, FinalizeAggregate):
+        return [f'{pad}rc.finalize_aggregate %h {{mode = "{op.mode}"}}']
+    if isinstance(op, Argmax):
+        return [f"{pad}rc.argmax %Y[%t] : i32"]
+    if isinstance(op, Softmax):
+        return [f"{pad}rc.softmax %Y[%t]"]
     return [f"{pad}// <unknown op {type(op).__name__}>"]
