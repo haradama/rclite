@@ -196,9 +196,11 @@ class GbaTarget(Target):
         x_flat = np.ascontiguousarray(test_inputs, dtype=np.float32).ravel()
         y_flat = np.ascontiguousarray(expected_outputs, dtype=np.float32).ravel()
         main_path = out / "main.c"
+        # @@T_LEN@@ is the step count T; X/Y are embedded row-major (T, K)/(T, M)
+        # with the dims coming from rc_predict.h's RC_INPUT_DIM / RC_OUTPUT_DIM.
         main_path.write_text(
             tmpl
-            .replace("@@T_LEN@@", str(len(x_flat)))
+            .replace("@@T_LEN@@", str(test_inputs.shape[0]))
             .replace("@@TOLF@@", f"{tol:.9g}")
             .replace("@@X_VALUES@@", ", ".join(f"{v:.9g}f" for v in x_flat))
             .replace("@@Y_VALUES@@", ", ".join(f"{v:.9g}f" for v in y_flat))
@@ -231,11 +233,26 @@ class GbaTarget(Target):
                           tol: int = 1,
                           **_) -> CompiledArtifact:
         """Cross-compile a symmetric (Q-format) quantized model to a .gba."""
+        sw = qmodel.target.storage_bits
+        # Known limitation: on multi-input (K>1) models the LLVM thumbv4t
+        # backend miscompiles the narrow-storage (i8/i16) input-accumulation
+        # loop, so the device result diverges from the host reference (the
+        # identical kernel IR is bit-exact on Cortex-M0, and i32 symmetric /
+        # affine / float are all bit-exact on the GBA). Steer K>1 i8/i16 to a
+        # verified-working path rather than emit silently-wrong numbers. This
+        # is a model-capability check, so it runs before the toolchain probe.
+        if qmodel.K > 1 and sw in (8, 16):
+            raise NotImplementedError(
+                f"GBA symmetric i{sw} quantization does not support "
+                f"multi-input models (K={qmodel.K}) — the thumbv4t backend "
+                "miscompiles the i8/i16 input loop. Use the affine path "
+                "(compile_affine_quantized) or i32 symmetric (I32FixedPoint), "
+                "both bit-exact for multi-input on the GBA."
+            )
         self._require_cc()
         out = pathlib.Path(output_dir)
         out.mkdir(parents=True, exist_ok=True)
         cfg = qmodel.config
-        sw = qmodel.target.storage_bits
         if sw == 32:
             storage_t, np_storage = "int32_t", np.int32
         elif sw == 16:
@@ -269,6 +286,8 @@ class GbaTarget(Target):
         main_path.write_text(
             tmpl
             .replace("@@T_LEN@@", str(T))
+            .replace("@@RC_K@@", str(qmodel.K))
+            .replace("@@RC_M@@", str(qmodel.M))
             .replace("@@STATE_FRAC@@", str(cfg.state_frac))
             .replace("@@STORAGE_T@@", storage_t)
             .replace("@@TOL@@", str(int(tol)))
@@ -343,6 +362,8 @@ class GbaTarget(Target):
         main_path.write_text(
             tmpl
             .replace("@@T_LEN@@", str(T))
+            .replace("@@RC_K@@", str(qmodel.K))
+            .replace("@@RC_M@@", str(qmodel.M))
             .replace("@@STORAGE_T@@", storage_t)
             .replace("@@LUT_KIND@@", qmodel.lut_strategy.kind.value)
             .replace("@@TOL@@", str(int(tol)))

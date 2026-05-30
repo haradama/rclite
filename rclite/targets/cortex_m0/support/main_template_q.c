@@ -5,23 +5,32 @@
  * formatting is pure integer arithmetic. Compared against the host
  * reference embedded as state-scaled storage_t constants.
  *
+ * Multi-input / multi-output aware: X_q is row-major (T_LEN x RC_K), the
+ * reference Y row-major (T_LEN x RC_M).
+ *
  * Template placeholders (filled in by CortexM0Target.compile_quantized):
- *   @@T_LEN@@        — number of inference steps
+ *   @@T_LEN@@        — number of inference steps T (not T*K / T*M)
+ *   @@RC_K@@         — input dimension K
+ *   @@RC_M@@         — output dimension M
  *   @@STATE_FRAC@@   — state Q-format fractional bits
  *   @@STORAGE_T@@    — kernel storage type (int8_t / int16_t / int32_t)
- *   @@X_VALUES_Q@@   — comma-separated input samples (at input_scale)
- *   @@Y_VALUES_Q@@   — comma-separated reference outputs (at state_scale)
+ *   @@X_VALUES_Q@@   — comma-separated input samples (at input_scale), (T, K)
+ *   @@Y_VALUES_Q@@   — comma-separated reference outputs (at state_scale), (T, M)
  */
 #include <stdint.h>
 
 #define T_LEN          @@T_LEN@@
+#define RC_K           @@RC_K@@
+#define RC_M           @@RC_M@@
+#define X_LEN          (T_LEN * RC_K)
+#define Y_LEN          (T_LEN * RC_M)
 #define STATE_FRAC     @@STATE_FRAC@@
 #define STATE_SCALE    (1 << STATE_FRAC)
 
 typedef @@STORAGE_T@@ storage_t;
 
-static const storage_t X_q[T_LEN]           = { @@X_VALUES_Q@@ };
-static const storage_t Y_reference_q[T_LEN] = { @@Y_VALUES_Q@@ };
+static const storage_t X_q[X_LEN]           = { @@X_VALUES_Q@@ };
+static const storage_t Y_reference_q[Y_LEN] = { @@Y_VALUES_Q@@ };
 
 extern void rc_predict(int64_t T, storage_t *X, storage_t *Y);
 
@@ -104,11 +113,11 @@ static int fmt_fixed(char *buf, int32_t v, int frac_bits, int decimals)
 
 int main(void)
 {
-    storage_t X[T_LEN];
-    storage_t Y[T_LEN] = {0};
+    storage_t X[X_LEN];
+    storage_t Y[Y_LEN] = {0};
     char buf[40];
 
-    for (int i = 0; i < T_LEN; i++) X[i] = X_q[i];
+    for (int i = 0; i < X_LEN; i++) X[i] = X_q[i];
 
     sh_puts("==========================================\n");
     sh_puts("rc_predict (Q-format, storage=" "@@STORAGE_T@@" ") on micro:bit\n");
@@ -119,25 +128,36 @@ int main(void)
 
     rc_predict((int64_t)T_LEN, X, Y);
 
-    int32_t max_abs_diff = 0;
     for (int t = 0; t < T_LEN; t++) {
-        int32_t d = (int32_t)Y[t] - (int32_t)Y_reference_q[t];
-        int32_t ad = (d < 0) ? -d : d;
-        if (ad > max_abs_diff) max_abs_diff = ad;
-
         sh_puts("Step ");
         fmt_int(buf, t);
         sh_puts(buf);
-        sh_puts(": X_q=");
-        fmt_int(buf, (int32_t)X[t]);
-        sh_puts(buf);
-        sh_puts("  Y_ref=");
-        fmt_fixed(buf, (int32_t)Y_reference_q[t], STATE_FRAC, 4);
-        sh_puts(buf);
-        sh_puts("  Y=");
-        fmt_fixed(buf, (int32_t)Y[t], STATE_FRAC, 4);
-        sh_puts(buf);
-        sh_puts("\n");
+        sh_puts(": X_q=[");
+        for (int k = 0; k < RC_K; k++) {
+            if (k) sh_puts(",");
+            fmt_int(buf, (int32_t)X[t * RC_K + k]);
+            sh_puts(buf);
+        }
+        sh_puts("] Y_ref=[");
+        for (int m = 0; m < RC_M; m++) {
+            if (m) sh_puts(",");
+            fmt_fixed(buf, (int32_t)Y_reference_q[t * RC_M + m], STATE_FRAC, 4);
+            sh_puts(buf);
+        }
+        sh_puts("] Y=[");
+        for (int m = 0; m < RC_M; m++) {
+            if (m) sh_puts(",");
+            fmt_fixed(buf, (int32_t)Y[t * RC_M + m], STATE_FRAC, 4);
+            sh_puts(buf);
+        }
+        sh_puts("]\n");
+    }
+
+    int32_t max_abs_diff = 0;
+    for (int i = 0; i < Y_LEN; i++) {
+        int32_t d = (int32_t)Y[i] - (int32_t)Y_reference_q[i];
+        int32_t ad = (d < 0) ? -d : d;
+        if (ad > max_abs_diff) max_abs_diff = ad;
     }
 
     sh_puts("------------------------------------------\n");

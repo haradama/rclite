@@ -86,14 +86,17 @@ class CortexM0Target(Target):
         if expected_outputs is None:
             expected_outputs = host_jit.predict(test_inputs).astype(np.float32)
 
-        # 4. Render main.c from template.
+        # 4. Render main.c from template. @@T_LEN@@ is the step count T (not
+        # T*K / T*M); X and Y are embedded row-major as (T, K) and (T, M),
+        # the dims coming from rc_predict.h's RC_INPUT_DIM / RC_OUTPUT_DIM.
         tmpl = (_SUPPORT_DIR / "main_template.c").read_text()
+        T = test_inputs.shape[0]
         x_flat = np.ascontiguousarray(test_inputs, dtype=np.float32).ravel()
         y_flat = np.ascontiguousarray(expected_outputs, dtype=np.float32).ravel()
         main_path = out / "main.c"
         main_path.write_text(
             tmpl
-            .replace("@@T_LEN@@", str(len(x_flat)))
+            .replace("@@T_LEN@@", str(T))
             .replace("@@X_VALUES@@", ", ".join(f"{v:.9g}f" for v in x_flat))
             .replace("@@Y_VALUES@@", ", ".join(f"{v:.9g}f" for v in y_flat))
         )
@@ -235,6 +238,8 @@ class CortexM0Target(Target):
         y_lit = ", ".join(str(int(v)) for v in Y_ref_q.ravel())
         main_c = (tmpl
                   .replace("@@T_LEN@@", str(T))
+                  .replace("@@RC_K@@", str(qmodel.K))
+                  .replace("@@RC_M@@", str(qmodel.M))
                   .replace("@@STATE_FRAC@@", str(cfg.state_frac))
                   .replace("@@STORAGE_T@@", storage_t)
                   .replace("@@X_VALUES_Q@@", x_lit)
@@ -386,6 +391,8 @@ class CortexM0Target(Target):
         y_lit = ", ".join(str(int(v)) for v in Y_ref_q.ravel())
         main_c = (tmpl
                   .replace("@@T_LEN@@", str(T))
+                  .replace("@@RC_K@@", str(qmodel.K))
+                  .replace("@@RC_M@@", str(qmodel.M))
                   .replace("@@STORAGE_T@@", storage_t)
                   .replace("@@LUT_KIND@@", qmodel.lut_strategy.kind.value)
                   .replace("@@X_VALUES_Q@@", x_lit)

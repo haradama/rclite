@@ -102,7 +102,9 @@ class ArduinoUnoTarget(Target):
         x_lit = ", ".join(str(int(v)) for v in X_q.ravel())
         y_lit = ", ".join(str(int(v)) for v in Y_ref_q.ravel())
         ino = (tmpl
-               .replace("@@T@@", str(T * qmodel.M))
+               .replace("@@T@@", str(T))
+               .replace("@@RC_K@@", str(qmodel.K))
+               .replace("@@RC_M@@", str(qmodel.M))
                .replace("@@STORAGE_T@@", storage_t)
                .replace("@@X_VALUES@@", x_lit)
                .replace("@@Y_VALUES@@", y_lit))

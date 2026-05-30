@@ -30,6 +30,12 @@ The canonical time-series demos and the shared Mackey-Glass helper.
 | `classification_esn.py` | Per-step and sequence-to-label classification in the reference runtime (`predict_proba` / `predict_classes`). |
 | `classification_deploy.py` | Quantize → `export_bundle(head="classify"/"proba")` → compile the generated C kernel with host gcc. Needs `gcc`. |
 
+## `multi_io/` — multi-input / multi-output
+
+| File | What it shows |
+|------|---------------|
+| `mimo_esn.py` | A genuine MIMO ESN (3 inputs → 2 outputs) driven end-to-end: reference runtime → LLVM JIT (bit-exact) → symmetric i16 quantization → generated C kernel compiled with host gcc (bit-exact). The whole pipeline is generic over the input dim `input.units` (K) and output dim `readout.units` (M). The C-export stage needs `gcc`. |
+
 ## Deploy demos (one directory per target)
 
 Each builds an end-to-end artifact for a specific device. Most need a
