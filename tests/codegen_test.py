@@ -39,6 +39,7 @@ def _build_and_train(**overrides):
         include_bias=True, include_input=True,
         input_distribution=Distribution.NORMAL,
         chain_weight=0.7, chain_feedback=0.05,
+        activation=Activation.TANH,
     )
     cfg.update(overrides)
     rc = ReservoirComputer(
@@ -46,7 +47,7 @@ def _build_and_train(**overrides):
                         input_distribution=cfg["input_distribution"],
                         name="in"),
         reservoir=ReservoirNode(
-            units=cfg["units"], activation=Activation.TANH,
+            units=cfg["units"], activation=cfg["activation"],
             spectral_radius=cfg["spectral_radius"], leak_rate=cfg["leak_rate"],
             density=cfg["density"], topology=cfg["topology"],
             chain_weight=cfg["chain_weight"],
@@ -177,18 +178,64 @@ def test_rejects_untrained_readout():
     expect_raises(ValueError, compile_rc, rc, exe)
 
 
-def test_rejects_non_tanh_activation():
+def test_parity_relu_activation():
+    rc, exe, X = _build_and_train(activation=Activation.RELU)
+    Y_np = exe.predict(X)
+    Y_jit = compile_rc(rc, exe).predict(X)
+    _assert_close(Y_jit, Y_np)
+
+
+def test_parity_sigmoid_activation():
+    rc, exe, X = _build_and_train(activation=Activation.SIGMOID)
+    Y_np = exe.predict(X)
+    Y_jit = compile_rc(rc, exe).predict(X)
+    _assert_close(Y_jit, Y_np)
+
+
+def test_parity_identity_activation():
+    rc, exe, X = _build_and_train(activation=Activation.IDENTITY)
+    Y_np = exe.predict(X)
+    Y_jit = compile_rc(rc, exe).predict(X)
+    _assert_close(Y_jit, Y_np)
+
+
+def test_parity_sigmoid_sparse_fused():
+    # Guards that the activation threads through SparsifyReservoir + FuseStepReadout
+    # (both reconstruct the step op) and stays bit-exact with the dense path.
+    from rclite.ir.passes import StructuralSpecialize
+    from rclite.ir.passes.sparsify import SparsifyReservoir
+    from rclite.ir.passes.fuse import FuseStepReadout
+    rc, exe, X = _build_and_train(activation=Activation.SIGMOID, density=0.1)
+    Y_np = exe.predict(X)
+    passes = [StructuralSpecialize(), SparsifyReservoir(strategy="csr"),
+              FuseStepReadout()]
+    Y_jit = compile_rc(rc, exe, passes=passes).predict(X)
+    _assert_close(Y_jit, Y_np)
+
+
+def test_parity_relu_structured():
+    # RELU on a structured topology (no W_res matvec, O(N) chain kernel).
+    rc, exe, X = _build_and_train(
+        activation=Activation.RELU, topology=Topology.SCR, chain_weight=0.9,
+        input_distribution=Distribution.BERNOULLI,
+    )
+    Y_np = exe.predict(X)
+    Y_jit = compile_rc(rc, exe).predict(X)
+    _assert_close(Y_jit, Y_np)
+
+
+def test_rejects_unsupported_activation():
+    # LEAKY_INTEGRATOR / SPIKING are enum members with no runtime/codegen
+    # implementation — codegen must reject them rather than emit wrong code.
     rc = ReservoirComputer(
         input=InputNode(units=1, name="in"),
-        reservoir=ReservoirNode(units=10, activation=Activation.RELU,
+        reservoir=ReservoirNode(units=10, activation=Activation.SPIKING,
                                 spectral_radius=0.9, density=0.5, name="res"),
         readout=ReadoutNode(units=1, name="out"),
     )
+    # emit_module checks the activation first, before touching trained weights,
+    # so an untrained executor is enough to exercise the guard.
     exe = RCExecutor(rc)
-    rng = np.random.default_rng(0)
-    X = rng.standard_normal((100, 1))
-    Y = np.sin(np.arange(100) * 0.1)[:, None]
-    exe.fit(X, Y)
     expect_raises(NotImplementedError, compile_rc, rc, exe)
 
 

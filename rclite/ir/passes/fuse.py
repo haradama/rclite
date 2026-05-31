@@ -55,6 +55,7 @@ class FuseStepReadout:
                     W_res_name=step.W_res_name,
                     W_out_name=ro.W_out_name,
                     res_sparse=step.res_sparse,
+                    activation=step.activation,
                 ))
                 i += 4
             else:

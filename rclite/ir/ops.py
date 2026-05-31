@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
-from rclite.core.profile import Topology
+from rclite.core.profile import Activation, Topology
 
 
 @dataclass(frozen=True)
@@ -55,7 +55,9 @@ class PreprocessInput(Op):
 
 @dataclass(frozen=True)
 class ReservoirStep(Op):
-    """h := (1-leak)*h + leak*tanh(W_res*h + W_in*u_pre + bias)
+    """h := (1-leak)*h + leak*act(W_res*h + W_in*u_pre + bias)
+
+    `act` is the reservoir activation (tanh / sigmoid / relu / identity).
 
     Lowered with topology-specific kernels:
       RANDOM / ESN_STANDARD: dense W_res matmul
@@ -71,6 +73,7 @@ class ReservoirStep(Op):
     W_in_name: str = "W_in"
     W_res_name: Optional[str] = "W_res"
     res_sparse: Optional[SparseSpec] = None
+    activation: Activation = Activation.TANH
 
 
 @dataclass(frozen=True)
@@ -119,6 +122,7 @@ class FusedStepReadout(Op):
     W_res_name: Optional[str] = "W_res"
     W_out_name: str = "W_out"
     res_sparse: Optional[SparseSpec] = None
+    activation: Activation = Activation.TANH
 
 
 @dataclass(frozen=True)

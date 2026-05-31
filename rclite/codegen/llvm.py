@@ -10,8 +10,9 @@ point:
 buffer the caller pre-allocates. Reservoir weights are embedded as
 internal global constants so LLVM can constant-fold and vectorize.
 
-Currently supports: tanh activation; any topology (DLR/DLRB/SCR/RANDOM);
-include_bias / include_input readout features; RIDGE/PINV-trained readouts.
+Currently supports: tanh / sigmoid / relu / identity activations; any
+topology (DLR/DLRB/SCR/RANDOM); include_bias / include_input readout
+features; RIDGE/PINV-trained readouts.
 """
 from __future__ import annotations
 import ctypes
@@ -54,6 +55,12 @@ _F64 = ir.DoubleType()
 _F32 = ir.FloatType()
 _I64 = ir.IntType(64)
 _I32 = ir.IntType(32)
+
+# Float activations the LLVM backend can emit (matches the reference runtime).
+# tanh/sigmoid import libm (tanh[f]/exp[f]); relu/identity import nothing.
+_SUPPORTED_ACTIVATIONS = (
+    Activation.TANH, Activation.SIGMOID, Activation.RELU, Activation.IDENTITY,
+)
 
 
 def _dtype_bindings(dtype: str):
@@ -161,17 +168,16 @@ class _Lowerer:
         )
 
         self.ir_module = ir_module
-        self.fty, self.tanh_name, self.np_dtype, _ = _dtype_bindings(dtype)
+        self.fty, _, self.np_dtype, _ = _dtype_bindings(dtype)
         self.K, self.N, self.M = ir_module.K, ir_module.N, ir_module.M
 
         self.module = ir.Module(name=f"rc_jit_{id(ir_module)}")
         self.module.triple = llvm.get_default_triple()
 
-        self.libm_fn = ir.Function(
-            self.module, ir.FunctionType(self.fty, [self.fty]),
-            name=self.tanh_name,
-        )
-        self.exp_fn = None  # lazily declared by the softmax head
+        # libm scalar functions are declared lazily and cached by name so the
+        # f32/f64 variant ("tanh"/"tanhf", "exp"/"expf") is only imported when
+        # an activation or head actually needs it. relu/identity import nothing.
+        self._libm_cache = {}
 
         # Classification heads: argmax produces an i32 output; both heads make
         # the readout write to a logits scratch buffer rather than Y directly.
@@ -239,6 +245,45 @@ class _Lowerer:
 
     def _cf(self, v):
         return ir.Constant(self.fty, float(v))
+
+    def _libm(self, base):
+        """Declare (once) and return an external libm scalar function.
+
+        `base` is the f64 name ("tanh", "exp"); the f32 variant appends "f".
+        """
+        name = base + ("f" if self.fty == _F32 else "")
+        fn = self._libm_cache.get(name)
+        if fn is None:
+            fn = ir.Function(
+                self.module, ir.FunctionType(self.fty, [self.fty]), name=name,
+            )
+            self._libm_cache[name] = fn
+        return fn
+
+    def _emit_activation(self, pre_i, activation):
+        """Emit `activation(pre_i)` and return the resulting value.
+
+        Mirrors `rclite.runtime.reference._ACTIVATIONS`:
+          tanh     → libm tanh/tanhf
+          sigmoid  → 1 / (1 + exp(-x))   (libm exp/expf)
+          relu     → max(0, x)           (fcmp + select, no libm)
+          identity → x                   (no-op)
+        """
+        b = self.b
+        if activation == Activation.TANH:
+            return b.call(self._libm("tanh"), [pre_i])
+        if activation == Activation.IDENTITY:
+            return pre_i
+        if activation == Activation.RELU:
+            is_pos = b.fcmp_ordered(">", pre_i, self._cf(0.0))
+            return b.select(is_pos, pre_i, self._cf(0.0))
+        if activation == Activation.SIGMOID:
+            neg = b.fsub(self._cf(0.0), pre_i)
+            e = b.call(self._libm("exp"), [neg])
+            return b.fdiv(self._cf(1.0), b.fadd(self._cf(1.0), e))
+        raise NotImplementedError(
+            f"LLVM backend does not support activation {activation.name}"
+        )
 
     def _emit_global(self, name, arr):
         arr = np.asarray(arr)
@@ -347,10 +392,10 @@ class _Lowerer:
         with _loop(self.b, _ci(op.N), "iupd") as i:
             h_old = _load1d(self.b, self.h, i)
             pre_i = _load1d(self.b, self.pre_arr, i)
-            tan = self.b.call(self.libm_fn, [pre_i])
+            act = self._emit_activation(pre_i, op.activation)
             new_h = self.b.fadd(
                 self.b.fmul(self._cf(1.0 - op.leak), h_old),
-                self.b.fmul(self._cf(op.leak), tan),
+                self.b.fmul(self._cf(op.leak), act),
             )
             _store1d(self.b, self.h, i, new_h)
 
@@ -495,10 +540,10 @@ class _Lowerer:
         with _loop(b, _ci(op.N), "iupd") as i:
             h_old = _load1d(b, self.h, i)
             pre_i = _load1d(b, self.pre_arr, i)
-            tan = b.call(self.libm_fn, [pre_i])
+            act = self._emit_activation(pre_i, op.activation)
             new_h = b.fadd(
                 b.fmul(cf(1.0 - op.leak), h_old),
-                b.fmul(cf(op.leak), tan),
+                b.fmul(cf(op.leak), act),
             )
             _store1d(b, self.h, i, new_h)
 
@@ -595,12 +640,7 @@ class _Lowerer:
     def _lower_softmax(self, op):
         """p[m] = exp(logits[m]-max) / sum_j exp(logits[j]-max), M floats out."""
         b = self.b
-        if self.exp_fn is None:
-            exp_name = "expf" if self.fty == _F32 else "exp"
-            self.exp_fn = ir.Function(
-                self.module, ir.FunctionType(self.fty, [self.fty]),
-                name=exp_name,
-            )
+        exp_fn = self._libm("exp")
         # max
         mx = b.alloca(self.fty, name="sm_max")
         b.store(_load1d(b, self.logits, _ci(0)), mx)
@@ -612,7 +652,7 @@ class _Lowerer:
         b.store(self._cf(0.0), self.acc)
         with _loop(b, _ci(op.M), "sme") as m:
             v = _load1d(b, self.logits, m)
-            e = b.call(self.exp_fn, [b.fsub(v, b.load(mx))])
+            e = b.call(exp_fn, [b.fsub(v, b.load(mx))])
             _store1d(b, self.logits, m, e)
             b.store(b.fadd(b.load(self.acc), e), self.acc)
         # normalize into Y
@@ -633,9 +673,11 @@ def emit_module(rc: ReservoirComputer, exe: RCExecutor,
     `head` selects the output format: None / "logits" (raw scores),
     "proba" (softmax), or "classify" (argmax class id, i32 output).
     """
-    if rc.reservoir.activation != Activation.TANH:
+    if rc.reservoir.activation not in _SUPPORTED_ACTIVATIONS:
         raise NotImplementedError(
-            f"LLVM backend only supports tanh; got {rc.reservoir.activation.name}"
+            f"LLVM backend supports "
+            f"{', '.join(a.name for a in _SUPPORTED_ACTIVATIONS)}; "
+            f"got {rc.reservoir.activation.name}"
         )
 
     # Import here to avoid an import cycle (rclite.ir uses runtime types).

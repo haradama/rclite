@@ -78,6 +78,7 @@ def build_ir(rc: ReservoirComputer, exe: RCExecutor, *, head=None) -> Module:
         chain_weight=float(rc.reservoir.chain_weight),
         chain_feedback=float(rc.reservoir.chain_feedback),
         W_res_name=None if is_structured else "W_res",
+        activation=rc.reservoir.activation,
     )
     build_phi = BuildPhi(
         include_bias=bool(rc.readout.include_bias),

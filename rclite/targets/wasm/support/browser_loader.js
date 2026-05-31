@@ -34,9 +34,15 @@ const align16 = (n) => (n + 15) & ~15;
 export async function loadRclite(src) {
   const imports = {};
   if (@@HAS_TANHF@@) {
-    // The f32 kernel calls libm `tanhf`; browsers have no WASI, so wire it
-    // to the JS Math.tanh (f32-rounded for closer parity with wasi-libc).
-    imports.env = { tanhf: (x) => Math.fround(Math.tanh(x)) };
+    // f32 kernels call libm scalar fns depending on the activation:
+    //   tanh -> tanhf,  sigmoid -> expf;  relu/identity import nothing.
+    // Browsers have no WASI, so wire each to its JS Math equivalent
+    // (f32-rounded for closer parity with wasi-libc). Supplying an import
+    // the module does not declare is harmless, so we wire both.
+    imports.env = {
+      tanhf: (x) => Math.fround(Math.tanh(x)),
+      expf: (x) => Math.fround(Math.exp(x)),
+    };
   }
 
   let instance;
