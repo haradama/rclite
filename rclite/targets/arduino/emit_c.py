@@ -27,7 +27,7 @@ from typing import List
 
 import numpy as np
 
-from rclite.core.profile import Topology
+from rclite.core.profile import Aggregation, Topology
 from rclite.quant.affine.quantize import AffineQuantizedModel
 from rclite.quant.affine.lut import LUTKind
 
@@ -80,6 +80,20 @@ def emit_affine_kernel_c(qmodel: AffineQuantizedModel,
     is_structured = rc.reservoir.topology in (
         Topology.DLR, Topology.DLRB, Topology.SCR)
     topo = rc.reservoir.topology.name
+
+    # Sequence-to-label time pooling (aggregation in {MEAN, LAST}). The readout
+    # runs once after the loop on the pooled state instead of once per step.
+    agg = rc.readout.aggregation
+    pooled = agg != Aggregation.NONE
+    mean_pool = agg == Aggregation.MEAN
+    if pooled and rc.readout.include_input:
+        raise NotImplementedError(
+            "affine C kernel: sequence pooling does not support "
+            "include_input=True"
+        )
+    # i8 sums of post-washout states fit i32 for any realistic T; i16 uses i64.
+    sum_t = "int32_t" if sb == 8 else "int64_t"
+    washout_c = int(rc.readout.washout)
 
     # Sparse W_res (CSR) for dense topologies. Code size stays bounded, so
     # any requested strategy maps to CSR on this code-size-constrained path.
@@ -192,6 +206,8 @@ def emit_affine_kernel_c(qmodel: AffineQuantizedModel,
     a("static rc_storage_t rc_pre[RC_N];")
     if qmodel.has_integer_preprocess:
         a("static rc_storage_t rc_u[RC_K];")
+    if mean_pool:
+        a(f"static {sum_t} rc_hsum[RC_N];   /* MEAN time-pool accumulator */")
     a("")
 
     # ---- helpers ----
@@ -282,7 +298,13 @@ def emit_affine_kernel_c(qmodel: AffineQuantizedModel,
         a("    int32_t sm_max; int64_t sm_sum;")
         a("    rc_storage_t rc_lg[RC_M];")
         a("    int32_t rc_eq[RC_M];")
+    if mean_pool:
+        # w_ = clamp(washout, 0, T-1); L_ = T - w_ (pooled step count, >= 1).
+        a("    int32_t w_, L_;")
+        a(f"    w_ = ({washout_c} < T) ? {washout_c} : (T - 1); if (w_ < 0) w_ = 0;")
     a(f"    for (i = 0; i < RC_N; i++) rc_h[i] = {zp_state};")
+    if mean_pool:
+        a("    for (i = 0; i < RC_N; i++) rc_hsum[i] = 0;")
     a("    for (t = 0; t < T; t++) {")
 
     # preprocess
@@ -356,71 +378,95 @@ def emit_affine_kernel_c(qmodel: AffineQuantizedModel,
     a(f"            rc_h[i] = rc_sat({zp_state} + hc + d);")
     a("        }")
 
-    # readout
+    # readout — once per step (aggregation=NONE) or once after the loop on the
+    # pooled state (MEAN/LAST). `_emit_readout` writes output row `row` (a C
+    # expression) at indentation `ind`; the body is identical either way.
     off_bias = 0
     off_input = 1 if rc.readout.include_bias else 0
     off_state = off_input + (K if rc.readout.include_input else 0)
-    if classify:
-        a("        best_m = 0; best_v = 0;")
-    a("        for (m = 0; m < RC_M; m++) {")
-    a(f"            int32_t y = {zp_output};")
-    if rc.readout.include_bias:
-        m_bias = ("RC_RD32(&rc_M_out_bias_M0[m]), RC_RD32(&rc_M_out_bias_n[m])"
-                  if use_per_channel_out
-                  else f"{qmodel.M_out_bias_M0}, {qmodel.M_out_bias_n}")
-        a(f"            y += RC_RQ((int32_t){rd_w}(&rc_W_out[m*RC_F + {off_bias}]), "
-          f"{m_bias});")
-    if rc.readout.include_input:
-        a(f"            {ro_t} acc_i = 0;")
-        a("            for (k = 0; k < RC_K; k++)")
-        a(f"                acc_i += {ro_cast}{rd_w}(&rc_W_out[m*RC_F + {off_input} + k]) "
-          f"* {ro_cast}X[t*RC_K + k];")
-        a(f"            acc_i -= {ro_cast}{zp_input} * {ro_cast}RC_RD32(&rc_row_sum_Wout_input[m]);")
-        m_in = ("RC_RD32(&rc_M_out_input_M0[m]), RC_RD32(&rc_M_out_input_n[m])"
+
+    def _emit_readout(row, ind):
+        if classify:
+            a(f"{ind}best_m = 0; best_v = 0;")
+        a(f"{ind}for (m = 0; m < RC_M; m++) {{")
+        a(f"{ind}    int32_t y = {zp_output};")
+        if rc.readout.include_bias:
+            m_bias = ("RC_RD32(&rc_M_out_bias_M0[m]), RC_RD32(&rc_M_out_bias_n[m])"
+                      if use_per_channel_out
+                      else f"{qmodel.M_out_bias_M0}, {qmodel.M_out_bias_n}")
+            a(f"{ind}    y += RC_RQ((int32_t){rd_w}(&rc_W_out[m*RC_F + {off_bias}]), "
+              f"{m_bias});")
+        if rc.readout.include_input:
+            a(f"{ind}    {ro_t} acc_i = 0;")
+            a(f"{ind}    for (k = 0; k < RC_K; k++)")
+            a(f"{ind}        acc_i += {ro_cast}{rd_w}(&rc_W_out[m*RC_F + {off_input} + k]) "
+              f"* {ro_cast}X[({row})*RC_K + k];")
+            a(f"{ind}    acc_i -= {ro_cast}{zp_input} * {ro_cast}RC_RD32(&rc_row_sum_Wout_input[m]);")
+            m_in = ("RC_RD32(&rc_M_out_input_M0[m]), RC_RD32(&rc_M_out_input_n[m])"
+                    if use_per_channel_out
+                    else f"{qmodel.M_out_input_M0}, {qmodel.M_out_input_n}")
+            a(f"{ind}    y += RC_RQ({_clamp('acc_i', ro_bits)}, {m_in});")
+        a(f"{ind}    {ro_t} acc_s = 0;")
+        a(f"{ind}    for (j = 0; j < RC_N; j++)")
+        a(f"{ind}        acc_s += {ro_cast}{rd_w}(&rc_W_out[m*RC_F + {off_state} + j]) "
+          f"* {ro_cast}rc_h[j];")
+        a(f"{ind}    acc_s -= {ro_cast}{zp_state} * {ro_cast}RC_RD32(&rc_row_sum_Wout_state[m]);")
+        m_st = ("RC_RD32(&rc_M_out_state_M0[m]), RC_RD32(&rc_M_out_state_n[m])"
                 if use_per_channel_out
-                else f"{qmodel.M_out_input_M0}, {qmodel.M_out_input_n}")
-        a(f"            y += RC_RQ({_clamp('acc_i', ro_bits)}, {m_in});")
-    a(f"            {ro_t} acc_s = 0;")
-    a("            for (j = 0; j < RC_N; j++)")
-    a(f"                acc_s += {ro_cast}{rd_w}(&rc_W_out[m*RC_F + {off_state} + j]) "
-      f"* {ro_cast}rc_h[j];")
-    a(f"            acc_s -= {ro_cast}{zp_state} * {ro_cast}RC_RD32(&rc_row_sum_Wout_state[m]);")
-    m_st = ("RC_RD32(&rc_M_out_state_M0[m]), RC_RD32(&rc_M_out_state_n[m])"
-            if use_per_channel_out
-            else f"{qmodel.M_out_state_M0}, {qmodel.M_out_state_n}")
-    a(f"            y += RC_RQ({_clamp('acc_s', ro_bits)}, {m_st});")
-    if classify:
-        # argmax over the saturated quantized scores (monotone in the logits).
-        a("            int32_t yq = (int32_t)rc_sat(y);")
-        a("            if (m == 0 || yq > best_v) { best_v = yq; best_m = m; }")
-    elif proba:
-        a("            rc_lg[m] = rc_sat(y);")
-    else:
-        a("            Y[t*RC_M + m] = rc_sat(y);")
-    a("        }")
-    if classify:
-        a("        Y[t] = best_m;")
-    elif proba:
-        a("        sm_max = rc_lg[0];")
-        a("        for (m = 1; m < RC_M; m++) if (rc_lg[m] > sm_max) sm_max = rc_lg[m];")
-        a("        sm_sum = 0;")
-        a("        for (m = 0; m < RC_M; m++) {")
-        a("            int32_t d = (int32_t)rc_lg[m] - sm_max;")
-        a("            if (d < RC_SM_DMIN) d = RC_SM_DMIN;")
-        a("            int64_t pos = ((int64_t)(d - (RC_SM_DMIN)) * (RC_SM_N - 1) << RC_SM_IDXF) / (-(RC_SM_DMIN));")
-        a("            int32_t i0 = (int32_t)(pos >> RC_SM_IDXF);")
-        a("            if (i0 < 0) i0 = 0; if (i0 > RC_SM_N - 2) i0 = RC_SM_N - 2;")
-        a("            int64_t frac = pos - ((int64_t)i0 << RC_SM_IDXF);")
-        a(f"            int32_t y0 = {rd_s}(&rc_sm_lut[i0]); int32_t y1 = {rd_s}(&rc_sm_lut[i0 + 1]);")
-        a("            int64_t ev = (int64_t)y0 + (((int64_t)(y1 - y0) * frac) >> RC_SM_IDXF);")
-        a("            rc_eq[m] = (int32_t)ev; sm_sum += ev;")
-        a("        }")
-        a("        for (m = 0; m < RC_M; m++) {")
-        a("            int64_t p = ((int64_t)rc_eq[m] << RC_SM_PF) / sm_sum;")
-        a("            if (p > RC_QMAX) p = RC_QMAX;")
-        a("            Y[t*RC_M + m] = (rc_storage_t)p;")
-        a("        }")
+                else f"{qmodel.M_out_state_M0}, {qmodel.M_out_state_n}")
+        a(f"{ind}    y += RC_RQ({_clamp('acc_s', ro_bits)}, {m_st});")
+        if classify:
+            # argmax over the saturated quantized scores (monotone in logits).
+            a(f"{ind}    int32_t yq = (int32_t)rc_sat(y);")
+            a(f"{ind}    if (m == 0 || yq > best_v) {{ best_v = yq; best_m = m; }}")
+        elif proba:
+            a(f"{ind}    rc_lg[m] = rc_sat(y);")
+        else:
+            a(f"{ind}    Y[({row})*RC_M + m] = rc_sat(y);")
+        a(f"{ind}}}")
+        if classify:
+            a(f"{ind}Y[{row}] = best_m;")
+        elif proba:
+            a(f"{ind}sm_max = rc_lg[0];")
+            a(f"{ind}for (m = 1; m < RC_M; m++) if (rc_lg[m] > sm_max) sm_max = rc_lg[m];")
+            a(f"{ind}sm_sum = 0;")
+            a(f"{ind}for (m = 0; m < RC_M; m++) {{")
+            a(f"{ind}    int32_t d = (int32_t)rc_lg[m] - sm_max;")
+            a(f"{ind}    if (d < RC_SM_DMIN) d = RC_SM_DMIN;")
+            a(f"{ind}    int64_t pos = ((int64_t)(d - (RC_SM_DMIN)) * (RC_SM_N - 1) << RC_SM_IDXF) / (-(RC_SM_DMIN));")
+            a(f"{ind}    int32_t i0 = (int32_t)(pos >> RC_SM_IDXF);")
+            a(f"{ind}    if (i0 < 0) i0 = 0; if (i0 > RC_SM_N - 2) i0 = RC_SM_N - 2;")
+            a(f"{ind}    int64_t frac = pos - ((int64_t)i0 << RC_SM_IDXF);")
+            a(f"{ind}    int32_t y0 = {rd_s}(&rc_sm_lut[i0]); int32_t y1 = {rd_s}(&rc_sm_lut[i0 + 1]);")
+            a(f"{ind}    int64_t ev = (int64_t)y0 + (((int64_t)(y1 - y0) * frac) >> RC_SM_IDXF);")
+            a(f"{ind}    rc_eq[m] = (int32_t)ev; sm_sum += ev;")
+            a(f"{ind}}}")
+            a(f"{ind}for (m = 0; m < RC_M; m++) {{")
+            a(f"{ind}    int64_t p = ((int64_t)rc_eq[m] << RC_SM_PF) / sm_sum;")
+            a(f"{ind}    if (p > RC_QMAX) p = RC_QMAX;")
+            a(f"{ind}    Y[({row})*RC_M + m] = (rc_storage_t)p;")
+            a(f"{ind}}}")
+
+    if not pooled:
+        _emit_readout("t", "        ")
+    elif mean_pool:
+        # Accumulate post-washout states; readout runs once after the loop.
+        a("        if (t >= w_) { for (j = 0; j < RC_N; j++) rc_hsum[j] += rc_h[j]; }")
+    # LAST: nothing inside the loop (the final state is the pool).
     a("    }")
+    if pooled:
+        if mean_pool:
+            # hbar[j] = round_div(sum, L_), rounding half away from zero —
+            # bit-exact with AffineQuantizedExecutor._round_div / the JIT.
+            a("    L_ = T - w_;")
+            a("    for (j = 0; j < RC_N; j++) {")
+            a(f"        {sum_t} s = rc_hsum[j];")
+            a("        int64_t half = (int64_t)L_ >> 1;")
+            a("        int64_t q = (s >= 0) ? (((int64_t)s + half) / L_)")
+            a("                             : (-(((int64_t)(-s) + half) / L_));")
+            a("        rc_h[j] = rc_sat((int32_t)q);")
+            a("    }")
+        _emit_readout("0", "    ")
     a("}")
     a("")
     return "\n".join(L)

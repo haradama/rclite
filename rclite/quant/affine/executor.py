@@ -321,3 +321,84 @@ class AffineQuantizedExecutor:
             self.step_q(u_pre_q)
             H_q[t] = self.state_q
         return self.cfg.state.dequantize_array(H_q)
+
+    # ------------------------------------------------------------------
+    # Sequence-to-label pooling (aggregation in {MEAN, LAST})
+    #
+    # Integer pooling semantics — defined once here and mirrored bit-for-bit
+    # by `_AffineLowerer` (LLVM/host/wasm) and `emit_affine_kernel_c` (AVR):
+    #
+    #   w        = clamp(washout, 0, T-1)
+    #   L        = T - w                       (>= 1)
+    #   S[j]     = sum_{t=w}^{T-1} q_h[t][j]    (raw quantized state, zp included)
+    #   hbar_q[j]= sat( round_div(S[j], L) )    (round half away from zero)
+    #
+    # then the *unchanged* per-step readout runs once on `hbar_q` (LAST simply
+    # uses the final `q_h` and skips the average). Accumulating the raw state
+    # and dividing by L reproduces the float MEAN (the constant zero-point sums
+    # to L*zp and divides back out), so no separate centering is needed.
+
+    @staticmethod
+    def _round_div(S: np.ndarray, L: int) -> np.ndarray:
+        """Elementwise round-half-away-from-zero integer division of S by L>0.
+
+        Matches the C / LLVM lowering, which use truncating integer division
+        on `(|s| + L/2)` and re-apply the sign.
+        """
+        half = L // 2
+        S = S.astype(np.int64)
+        q = np.where(S >= 0, (S + half) // L, -((-S + half) // L))
+        return q.astype(np.int64)
+
+    def _washout_clamped(self, T: int) -> int:
+        w = int(self.qmodel.rc.readout.washout)
+        if w >= T:
+            w = T - 1
+        if w < 0:
+            w = 0
+        return w
+
+    def pool_state_q(self, X: np.ndarray) -> np.ndarray:
+        """Run the reservoir over one sequence and return the pooled q_h (i32).
+
+        `mode` is taken from the readout's aggregation: MEAN averages the
+        post-washout states, LAST returns the final state.
+        """
+        from rclite.core.profile import Aggregation
+        if X.ndim == 1:
+            X = X[:, None]
+        T = X.shape[0]
+        N = self.qmodel.N
+        agg = self.qmodel.rc.readout.aggregation
+        self.reset()
+        if agg == Aggregation.MEAN:
+            w = self._washout_clamped(T)
+            S = np.zeros(N, dtype=np.int64)
+            for t in range(T):
+                self.step_q(self._quantize_u_pre(X[t]))
+                if t >= w:
+                    S += self.state_q.astype(np.int64)
+            L = T - w
+            hbar = _saturate(self._round_div(S, L), self.storage_bits)
+            return hbar.astype(np.int32)
+        elif agg == Aggregation.LAST:
+            for t in range(T):
+                self.step_q(self._quantize_u_pre(X[t]))
+            return self.state_q.copy()
+        raise ValueError(
+            "pool_state_q requires readout.aggregation in {MEAN, LAST}; "
+            f"got {agg.name}"
+        )
+
+    def predict_pooled_q(self, X: np.ndarray) -> np.ndarray:
+        """Pool one sequence and run the readout once → q_y logits (M,) i32."""
+        hbar_q = self.pool_state_q(X)
+        # include_input is disallowed for aggregation, so x_raw_q is unused by
+        # the readout; pass zeros to keep the signature.
+        x_raw_q = np.zeros(self.qmodel.K, dtype=np.int32)
+        return self.predict_one_q(x_raw_q, hbar_q)
+
+    def predict_pooled(self, X: np.ndarray) -> np.ndarray:
+        """Pool one sequence; return the dequantized readout logits (M,)."""
+        q_y = self.predict_pooled_q(X)
+        return self.cfg.output.dequantize_array(q_y[None, :])[0]

@@ -13,8 +13,9 @@
  *   @@RC_K@@        input dimension K
  *   @@RC_M@@        output dimension M
  *   @@STORAGE_T@@   int8_t / int16_t
+ *   @@NROWS@@       number of output rows (T per-step, 1 for sequence pooling)
  *   @@X_VALUES@@    embedded quantized inputs, row-major (T, K)
- *   @@Y_VALUES@@    embedded quantized reference outputs, row-major (T, M)
+ *   @@Y_VALUES@@    embedded quantized reference outputs, row-major (NROWS, M)
  */
 #include <stdint.h>
 
@@ -24,8 +25,9 @@ extern "C" void rc_predict(int32_t T, const @@STORAGE_T@@ *X, @@STORAGE_T@@ *Y);
 #define RC_T @@T@@
 #define RC_K @@RC_K@@
 #define RC_M @@RC_M@@
+#define RC_NROWS @@NROWS@@
 #define X_LEN (RC_T * RC_K)
-#define Y_LEN (RC_T * RC_M)
+#define Y_LEN (RC_NROWS * RC_M)
 
 static const @@STORAGE_T@@ X_q[X_LEN] = { @@X_VALUES@@ };
 static const @@STORAGE_T@@ Y_ref[Y_LEN] = { @@Y_VALUES@@ };

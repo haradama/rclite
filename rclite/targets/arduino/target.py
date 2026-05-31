@@ -82,6 +82,7 @@ class ArduinoUnoTarget(Target):
 
         # Quantize test inputs + bit-exact reference outputs via the Python
         # executor (same path the host JIT / C kernel reproduce exactly).
+        from rclite.core.profile import Aggregation
         from rclite.quant.affine.executor import AffineQuantizedExecutor
         cfg = qmodel.config
         X = test_inputs
@@ -90,12 +91,21 @@ class ArduinoUnoTarget(Target):
         X_q = cfg.input.quantize_array(X).astype(np_storage)
         qexe = AffineQuantizedExecutor(qmodel)
         T = X.shape[0]
-        Y_ref_q = np.zeros((T, qmodel.M), dtype=np_storage)
-        for t in range(T):
-            x_raw_q = qexe._quantize_raw_input(X[t])
-            u_pre_q = qexe._quantize_u_pre(X[t])
-            qexe.step_q(u_pre_q)
-            Y_ref_q[t] = qexe.predict_one_q(x_raw_q, qexe.state_q).astype(np_storage)
+        pooled = qmodel.rc.readout.aggregation != Aggregation.NONE
+        if pooled:
+            # Sequence-to-label: the kernel pools the whole window and emits a
+            # single readout row.
+            n_rows = 1
+            Y_ref_q = qexe.predict_pooled_q(X)[None, :].astype(np_storage)
+        else:
+            n_rows = T
+            Y_ref_q = np.zeros((T, qmodel.M), dtype=np_storage)
+            for t in range(T):
+                x_raw_q = qexe._quantize_raw_input(X[t])
+                u_pre_q = qexe._quantize_u_pre(X[t])
+                qexe.step_q(u_pre_q)
+                Y_ref_q[t] = qexe.predict_one_q(
+                    x_raw_q, qexe.state_q).astype(np_storage)
 
         # Render sketch.ino
         tmpl = (_TEMPLATE_DIR / "sketch.ino").read_text()
@@ -103,6 +113,7 @@ class ArduinoUnoTarget(Target):
         y_lit = ", ".join(str(int(v)) for v in Y_ref_q.ravel())
         ino = (tmpl
                .replace("@@T@@", str(T))
+               .replace("@@NROWS@@", str(n_rows))
                .replace("@@RC_K@@", str(qmodel.K))
                .replace("@@RC_M@@", str(qmodel.M))
                .replace("@@STORAGE_T@@", storage_t)

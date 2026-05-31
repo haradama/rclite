@@ -1436,6 +1436,7 @@ class _AffineLowerer:
     def __init__(self, ir_module):
         from rclite.ir.ops import (
             ReservoirStep, BuildPhi, ReadoutLinear, TimeLoop, Argmax, Softmax,
+            AccumulateState,
         )
 
         self.ir_module = ir_module
@@ -1532,6 +1533,10 @@ class _AffineLowerer:
         self.out_int = any(isinstance(op, Argmax) for op in flat)
         self.has_softmax = any(isinstance(op, Softmax) for op in flat)
         self.has_head = self.out_int or self.has_softmax
+        # MEAN time-pooling needs a running i64 state-sum buffer.
+        self.needs_state_sum = any(
+            isinstance(op, AccumulateState) and op.mode == "mean" for op in flat
+        )
         out_ty = _I32 if self.out_int else self.storage_ty
         if self.has_softmax:
             self.sm_dmin_q = int(md["sm_dmin_q"])
@@ -1581,6 +1586,14 @@ class _AffineLowerer:
             )
         else:
             self.u_pre_buf = None
+
+        # Running state-sum buffer (i64) for MEAN time-pooling.
+        if self.needs_state_sum:
+            self.h_sum = self.b.alloca(_I64, size=_ci(self.N), name="h_sum")
+            with _loop(self.b, _ci(self.N), "sinit") as i:
+                _store1d(self.b, self.h_sum, i, self._ci64(0))
+        else:
+            self.h_sum = None
 
         # Initialize state to zp_state
         with _loop(self.b, _ci(self.N), "init") as i:
@@ -1715,7 +1728,7 @@ class _AffineLowerer:
     def _lower(self, op):
         from rclite.ir.ops import (
             TimeLoop, PreprocessInput, ReservoirStep, BuildPhi, ReadoutLinear,
-            Argmax, Softmax,
+            Argmax, Softmax, AccumulateState, FinalizeAggregate,
         )
         if isinstance(op, TimeLoop):
             return self._lower_time_loop(op)
@@ -1728,6 +1741,10 @@ class _AffineLowerer:
             return
         if isinstance(op, ReadoutLinear):
             return self._lower_readout_linear(op)
+        if isinstance(op, AccumulateState):
+            return self._lower_accumulate_state(op)
+        if isinstance(op, FinalizeAggregate):
+            return self._lower_finalize_aggregate(op)
         if isinstance(op, Argmax):
             return self._lower_argmax(op)
         if isinstance(op, Softmax):
@@ -1735,6 +1752,59 @@ class _AffineLowerer:
         raise NotImplementedError(
             f"{type(op).__name__} not supported in the affine path"
         )
+
+    # ------------------------------------------------------------------
+    # sequence-to-label time pooling (mirrors AffineQuantizedExecutor)
+
+    def _washout_clamped(self, washout):
+        """Return min(washout, T-1) clamped at >= 0 as an i64 SSA value."""
+        b = self.b
+        w_const = self._ci64(washout)
+        t_minus1 = b.sub(self.T_arg, self._ci64(1))
+        w = b.select(b.icmp_signed("<", w_const, self.T_arg), w_const, t_minus1)
+        return b.select(b.icmp_signed("<", w, self._ci64(0)), self._ci64(0), w)
+
+    def _lower_accumulate_state(self, op):
+        """mode='mean': h_sum[i] += q_h[i] for t >= washout. 'last': no-op."""
+        if op.mode == "last":
+            return
+        b = self.b
+        w = self._washout_clamped(op.washout)
+        in_window = b.icmp_signed(">=", self.t, w)
+        with _loop(b, _ci(op.N), "acc_h") as i:
+            s = _load1d(b, self.h_sum, i)               # i64
+            h_i = b.sext(_load1d(b, self.h_buf, i), _I64)
+            add = b.select(in_window, h_i, self._ci64(0))
+            _store1d(b, self.h_sum, i, b.add(s, add))
+
+    def _lower_finalize_aggregate(self, op):
+        """Write the pooled state back into h_buf, then point output at row 0.
+
+        mode='mean' divides the running sum by L = T - washout, rounding half
+        away from zero (bit-exact with `AffineQuantizedExecutor._round_div`).
+        mode='last' leaves the final state in place.
+        """
+        if op.mode == "mean":
+            b = self.b
+            w = self._washout_clamped(op.washout)
+            L = b.sub(self.T_arg, w)                     # i64, >= 1
+            with _loop(b, _ci(op.N), "fin_h") as i:
+                s = _load1d(b, self.h_sum, i)            # i64
+                q = self._emit_round_div_i64(s, L)
+                _store1d(b, self.h_buf, i,
+                         self._emit_saturate_to_storage(self._clamp_i64_to_i32(q)))
+        # The pooled sequence produces a single output row.
+        self.t = _ci(0)
+
+    def _emit_round_div_i64(self, s, L):
+        """Round-half-away-from-zero integer division s/L (L>0), in i64."""
+        b = self.b
+        half = b.ashr(L, self._ci64(1))                 # floor(L/2), L>0
+        is_neg = b.icmp_signed("<", s, self._ci64(0))
+        pos = b.sdiv(b.add(s, half), L)                 # sdiv truncates toward 0
+        neg_s = b.sub(self._ci64(0), s)
+        neg = b.sub(self._ci64(0), b.sdiv(b.add(neg_s, half), L))
+        return b.select(is_neg, neg, pos)
 
     def _lower_argmax(self, op):
         """class_id = argmax_m logits[m] over the monotone quantized scores."""
@@ -2280,26 +2350,30 @@ class CompiledAffineRC:
         """
         if X.ndim == 1:
             X = X[:, None]
+        from rclite.core.profile import Aggregation
         T = X.shape[0]
         Mout = self.qmodel.M
+        # Sequence pooling collapses the whole input to a single output row.
+        n_rows = (1 if self.qmodel.rc.readout.aggregation != Aggregation.NONE
+                  else T)
         # Quantize input via the model's input params (matches Python ref).
         X_q = self.qmodel.config.input.quantize_array(X).astype(self._np_storage)
         X_q = np.ascontiguousarray(X_q.reshape(-1))
         if self._out_int:
-            Y = np.zeros(T, dtype=np.int32)
+            Y = np.zeros(n_rows, dtype=np.int32)
             self._cfn(
                 ctypes.c_int64(T),
                 X_q.ctypes.data_as(ctypes.POINTER(self._cstorage)),
                 Y.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
             )
             return Y
-        Y_q = np.zeros(T * Mout, dtype=self._np_storage)
+        Y_q = np.zeros(n_rows * Mout, dtype=self._np_storage)
         self._cfn(
             ctypes.c_int64(T),
             X_q.ctypes.data_as(ctypes.POINTER(self._cstorage)),
             Y_q.ctypes.data_as(ctypes.POINTER(self._cstorage)),
         )
-        Y_q = Y_q.reshape(T, Mout)
+        Y_q = Y_q.reshape(n_rows, Mout)
         if self.head == "proba":
             prob_frac = min(self.qmodel.storage_bits - 1, 15)
             return Y_q.astype(np.float64) / (1 << prob_frac)

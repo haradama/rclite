@@ -32,7 +32,7 @@ from rclite.core.profile import Aggregation, Topology
 from rclite.ir.module import Module
 from rclite.ir.ops import (
     PreprocessInput, ReservoirStep, BuildPhi, ReadoutLinear, TimeLoop,
-    Argmax, Softmax,
+    Argmax, Softmax, AccumulateState, FinalizeAggregate,
 )
 
 from .lut import LUTKind
@@ -49,10 +49,11 @@ def build_ir_from_quantized_affine(qmodel: AffineQuantizedModel,
             f"affine integer path supports head in (None, 'logits', "
             f"'classify', 'proba'); got {head!r}"
         )
-    if rc.readout.aggregation != Aggregation.NONE:
+    agg = rc.readout.aggregation
+    if agg != Aggregation.NONE and rc.readout.include_input:
         raise NotImplementedError(
-            "Quantized classification currently supports per-step readouts "
-            "(aggregation=NONE) only; sequence pooling is not yet quantized."
+            "Quantized sequence pooling does not support include_input=True; "
+            "set include_input=False on the readout."
         )
 
     K, N, M = qmodel.K, qmodel.N, qmodel.M
@@ -107,33 +108,34 @@ def build_ir_from_quantized_affine(qmodel: AffineQuantizedModel,
     # `PreprocessInput` IR op; the affine lowerer recognises it via
     # `has_integer_preprocess` metadata and emits the affine integer form
     # (M_pre,n,pre_const) instead of the symmetric one.
-    body_ops = []
+    # Loop-body prefix: preprocess (optional) + reservoir step.
+    loop_ops = []
     if qmodel.has_integer_preprocess:
-        body_ops.append(PreprocessInput(
+        loop_ops.append(PreprocessInput(
             offset=float(rc.input.input_offset),
             scale=float(rc.input.input_scaling),
             K=K,
         ))
-    body_ops += [
-        ReservoirStep(
-            leak=float(rc.reservoir.leak_rate),
-            bias=float(rc.reservoir.bias),
-            N=N, K=K,
-            topology=rc.reservoir.topology,
-            chain_weight=float(rc.reservoir.chain_weight),
-            chain_feedback=float(rc.reservoir.chain_feedback),
-            W_res_name=None if is_structured else "W_res",
-        ),
-        BuildPhi(
-            include_bias=rc.readout.include_bias,
-            include_input=rc.readout.include_input,
-            K=K, N=N,
-        ),
-        ReadoutLinear(M=M, F=F),
-    ]
+    loop_ops.append(ReservoirStep(
+        leak=float(rc.reservoir.leak_rate),
+        bias=float(rc.reservoir.bias),
+        N=N, K=K,
+        topology=rc.reservoir.topology,
+        chain_weight=float(rc.reservoir.chain_weight),
+        chain_feedback=float(rc.reservoir.chain_feedback),
+        W_res_name=None if is_structured else "W_res",
+    ))
+
+    build_phi = BuildPhi(
+        include_bias=rc.readout.include_bias,
+        include_input=rc.readout.include_input,
+        K=K, N=N,
+    )
+    readout = ReadoutLinear(M=M, F=F)
     sm = None
+    head_op = None
     if head == "classify":
-        body_ops.append(Argmax(M=M))
+        head_op = Argmax(M=M)
     elif head == "proba":
         import numpy as _np
         sm = build_softmax_params(
@@ -141,8 +143,22 @@ def build_ir_from_quantized_affine(qmodel: AffineQuantizedModel,
             storage_bits=qmodel.storage_bits,
             storage_dtype=_np.dtype(f"int{qmodel.storage_bits}"),
         )
-        body_ops.append(Softmax(M=M))
-    body = tuple(body_ops)
+        head_op = Softmax(M=M)
+
+    if agg == Aggregation.NONE:
+        # Per-step: readout inside the time loop, one output row per step.
+        body = tuple(loop_ops + [build_phi, readout]
+                     + ([head_op] if head_op is not None else []))
+        ops = [TimeLoop(body=body)]
+    else:
+        # Sequence-to-label: pool the state in the loop, read out once after.
+        mode = "mean" if agg == Aggregation.MEAN else "last"
+        washout = int(rc.readout.washout)
+        loop = TimeLoop(body=tuple(
+            loop_ops + [AccumulateState(N=N, mode=mode, washout=washout)]))
+        ops = ([loop, FinalizeAggregate(N=N, mode=mode, washout=washout),
+                build_phi, readout]
+               + ([head_op] if head_op is not None else []))
 
     # Pre-quantize the chain constants once (matches what dense W_res_q
     # holds at the chain positions); the lowering uses them as scalar i32
@@ -166,6 +182,7 @@ def build_ir_from_quantized_affine(qmodel: AffineQuantizedModel,
         "include_bias": rc.readout.include_bias,
         "include_input": rc.readout.include_input,
         "feature_dim": F,
+        "aggregation": agg.name,
         # Zero points
         "zp_input":  cfg.input.zero_point,
         "zp_u_pre":  cfg.u_pre.zero_point,
@@ -226,5 +243,4 @@ def build_ir_from_quantized_affine(qmodel: AffineQuantizedModel,
         md["poly_a3_qf"]      = art.poly_a3_qf
         md["poly_a5_qf"]      = art.poly_a5_qf
 
-    return Module(K=K, N=N, M=M, weights=weights,
-                   ops=[TimeLoop(body=body)], metadata=md)
+    return Module(K=K, N=N, M=M, weights=weights, ops=ops, metadata=md)
