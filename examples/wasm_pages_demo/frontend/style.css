@@ -10,6 +10,12 @@
   --ok: #57e389;
   --warn: #ffce5a;
   --border: #26304a;
+  /* per-class palette (shared by probability bars, strip and legend) */
+  --c0: #5ad1ff;
+  --c1: #ff6ad5;
+  --c2: #ffce5a;
+  --c3: #57e389;
+  --c4: #b18cff;
 }
 
 * { box-sizing: border-box; }
@@ -29,7 +35,7 @@ header h1 {
   letter-spacing: -0.01em;
 }
 header h1 .dot { color: var(--accent); }
-header p.sub { color: var(--muted); margin: 0 0 1.1rem; max-width: 60ch; }
+header p.sub { color: var(--muted); margin: 0 0 1.1rem; max-width: 62ch; }
 
 .badges { display: flex; flex-wrap: wrap; gap: .5rem; margin-bottom: 1.2rem; }
 .badge {
@@ -39,7 +45,7 @@ header p.sub { color: var(--muted); margin: 0 0 1.1rem; max-width: 60ch; }
 }
 .badge b { color: var(--ink); font-weight: 600; }
 
-.tabs { display: flex; gap: .4rem; margin-bottom: .8rem; }
+.tabs { display: flex; flex-wrap: wrap; gap: .4rem; margin-bottom: .8rem; }
 .tab {
   background: var(--panel); border: 1px solid var(--border);
   color: var(--muted); border-radius: 10px 10px 0 0;
@@ -47,7 +53,12 @@ header p.sub { color: var(--muted); margin: 0 0 1.1rem; max-width: 60ch; }
 }
 .tab.active { background: var(--panel-2); color: var(--ink); border-bottom-color: var(--panel-2); }
 
+/* stage: scope on the left, classification panel on the right (when shown) */
+.stage { display: flex; gap: 14px; align-items: stretch; }
+@media (max-width: 760px) { .stage { flex-direction: column; } }
+
 .scope-card {
+  flex: 1; min-width: 0;
   background: var(--panel-2); border: 1px solid var(--border);
   border-radius: 0 12px 12px 12px; padding: 14px; position: relative;
 }
@@ -55,12 +66,34 @@ canvas#scope {
   width: 100%; height: 320px; display: block;
   background: #0a0d14; border-radius: 8px; touch-action: none; cursor: crosshair;
 }
+
+/* per-step / regression legend */
 .legend {
   position: absolute; top: 22px; right: 26px; font-size: .8rem;
   display: flex; gap: 1rem; pointer-events: none;
 }
 .legend span { display: inline-flex; align-items: center; gap: .35rem; }
 .swatch { width: 14px; height: 3px; border-radius: 2px; display: inline-block; }
+
+/* classification prediction panel */
+.predict-card {
+  width: 300px; flex: none;
+  background: var(--panel-2); border: 1px solid var(--border);
+  border-radius: 12px; padding: 16px; display: flex; flex-direction: column;
+}
+@media (max-width: 760px) { .predict-card { width: auto; } }
+.pred-head { color: var(--muted); font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; }
+.pred-class { font-size: 1.9rem; font-weight: 700; margin: .15rem 0 .1rem; letter-spacing: -0.01em; }
+.pred-conf { color: var(--muted); font-size: .82rem; margin-bottom: .9rem; font-variant-numeric: tabular-nums; }
+
+.probs { display: flex; flex-direction: column; gap: .55rem; margin-top: auto; }
+.prob { display: grid; grid-template-columns: 66px 1fr 44px; align-items: center; gap: .5rem; }
+.prob .lbl { font-size: .82rem; color: var(--ink); }
+.prob .track { height: 12px; background: #0a0d14; border-radius: 6px; overflow: hidden; border: 1px solid var(--border); }
+.prob .fill { height: 100%; width: 0%; border-radius: 6px; transition: width .12s linear; }
+.prob .pct { font-size: .78rem; color: var(--muted); text-align: right; font-variant-numeric: tabular-nums; }
+.prob.lead .lbl { font-weight: 700; }
+.prob.lead .pct { color: var(--ink); }
 
 .readouts { display: flex; flex-wrap: wrap; gap: 1.4rem; margin: .9rem 2px 0; }
 .readouts .r { font-variant-numeric: tabular-nums; }
@@ -73,6 +106,11 @@ canvas#scope {
   border-radius: 12px; padding: 1rem 1.1rem;
 }
 .row { display: flex; flex-wrap: wrap; gap: 1.1rem 1.4rem; align-items: center; }
+/* mode-specific elements start hidden; app.js reveals the active mode's set
+   with an explicit inline display (inline always wins over this default). */
+[data-modes] { display: none; }
+/* control groups are layout-transparent: their controls flow in the row */
+.cgroup { display: contents; }
 .ctl { display: flex; flex-direction: column; gap: .25rem; min-width: 150px; }
 .ctl label { font-size: .8rem; color: var(--muted); }
 .ctl input[type=range] { width: 180px; accent-color: var(--accent); }
@@ -88,7 +126,6 @@ button.btn.primary { background: var(--accent); color: #04222e; border-color: va
 button.btn.toggle.on { background: var(--accent2); color: #2a0a22; border-color: var(--accent2); }
 
 .hint { color: var(--muted); font-size: .82rem; margin-top: .6rem; }
-.mode-only { display: none; }
 
 footer { margin-top: 2.2rem; color: var(--muted); font-size: .85rem; }
 footer a { color: var(--accent); text-decoration: none; }
