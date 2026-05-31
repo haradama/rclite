@@ -39,11 +39,20 @@ wasm runtime.
 The Cortex-M0 / AVR / wasm benches below share the **same columns**
 (`_perf_schema.py`) over a common matrix: **dtype ∈ {float, i8, i16, i32} ×
 kernel ∈ {dense, csr, value-spec unroll}**. A cell a target cannot measure is
-left **blank** (AVR has no float/unroll path; wasm has no Flash/RAM). Speed is
-a per-target *deterministic* op-count proxy (SysTick ticks / AVR cycles /
-wasmtime fuel — unit per caption); the `vs float` column is the unit-free
-cross-dtype headline (float-dense ÷ row, same N). Shared model/quant/object/
-reference helpers live in `_perf_kernels.py`.
+rendered **`-`** ("not measured" — AVR has no float/unroll path; wasm has no
+Flash/RAM). Columns:
+
+- **speed** — a per-target *deterministic* op-count proxy (`ops/step`: SysTick
+  ticks / AVR cycles / wasmtime fuel, unit per caption) and `vs float`
+  (float-dense ÷ row at the same N) as the unit-free cross-dtype headline.
+- **size** — Flash/RAM (MCU) or wasm bytes, plus the W_res table bytes.
+- **accuracy** — `MSE` of the dequantized output vs the ground-truth target
+  (real units; a function of dtype only, so it repeats across kernels).
+
+Quant scheme: **i8/i16 = affine** (data-calibrated; symmetric fixed-point
+saturates the ridge W_out and gives misleading non-monotonic accuracy), and
+**i32 = symmetric** (affine i32 overflows the i64 requantize). Shared
+model/quant/object/reference helpers live in `_perf_kernels.py`.
 
 ## `sparse_mcu/` — Cortex-M0 (QEMU)
 

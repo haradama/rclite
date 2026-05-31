@@ -38,6 +38,7 @@ import numpy as np
 
 from rclite.quant import LUTStrategy
 from rclite.quant.affine import calibrate_from_data, quantize_model_affine
+from rclite.codegen.llvm import CompiledAffineRC
 from rclite.targets.arduino import emit_affine_kernel_c
 import bench as _b               # sparse_mcu/bench.py — data + wres helpers
 import _perf_schema as S
@@ -99,6 +100,7 @@ def run(sizes):
         N = rc.reservoir.units
         nnz = int(np.count_nonzero(exe.W_res))
         x_seq = X[900:900 + _b.T_FW]
+        y_true = Y[900:900 + _b.T_FW]
         with tempfile.TemporaryDirectory() as td:
             td = pathlib.Path(td)
             driver = _build_driver(td)
@@ -127,8 +129,11 @@ def run(sizes):
                             fl, ram, cyc, par = _build_and_run(
                                 qm, x_seq, strat, driver,
                                 td / f"{dtype}_{kernel}")
+                            out = np.asarray(CompiledAffineRC(qm).predict(
+                                x_seq)).reshape(y_true.shape)
+                            mse = float(np.mean((out - y_true) ** 2))
                             r.update(flash_B=fl, ram_B=ram, ops_per_step=cyc,
-                                     parity=par,
+                                     parity=par, mse=mse,
                                      wres_B=_b._wres_bytes(qm, strat))
                         except Exception as e:
                             print(f"  (blank {dtype}/{kernel}: "

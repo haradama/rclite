@@ -102,14 +102,15 @@ def _build_and_run(dtype, src, x_seq, sparse, workdir):
 def run(sizes):
     rows = []
     for units, density in sizes:
-        rc, exe, x_seq = K.train_model(units, density, T_SEQ)
+        rc, exe, x_seq, y_true, x_cal = K.train_model(units, density, T_SEQ)
         N = rc.reservoir.units
         nnz = int(np.count_nonzero(exe.W_res))
-        qms = {b: K.sym_qmodel(rc, exe, K._BITS[b]) for b in ("i8", "i16", "i32")}
+        qms = {b: K.quant_model(b, rc, exe, x_cal) for b in ("i8", "i16", "i32")}
         with tempfile.TemporaryDirectory() as td:
             td = pathlib.Path(td)
             for dtype in S.DTYPES:
                 src = (rc, exe) if dtype == "float" else qms[dtype]
+                mse = K.accuracy_mse(dtype, src, x_seq, y_true)
                 for kernel in S.KERNELS:
                     fl, ram, ticks, par = _build_and_run(
                         dtype, src, x_seq, K.KERNEL_SPARSE[kernel],
@@ -118,13 +119,13 @@ def run(sizes):
                         N=N, density=density, nnz=nnz, dtype=dtype,
                         kernel=kernel,
                         ops_per_step=(ticks if ticks > 0 else None),
-                        parity=par, flash_B=fl, ram_B=ram,
+                        parity=par, flash_B=fl, ram_B=ram, mse=mse,
                         wres_B=K.wres_bytes(dtype, src,
                                             K.KERNEL_SPARSE[kernel], N)))
     return rows
 
 
-TARGET = "Cortex-M0 (nRF51) — float + symmetric i8/i16/i32"
+TARGET = "Cortex-M0 (nRF51) — float, affine i8/i16, symmetric i32"
 
 
 def main():
@@ -142,7 +143,10 @@ def main():
     print(S.fmt_text(TARGET, rows, unit="SysTick ticks"))
 
     if args.md:
-        args.md.write_text(S.fmt_md(TARGET, rows, unit="SysTick ticks"))
+        args.md.write_text(S.fmt_md(
+            TARGET, rows, unit="SysTick ticks",
+            note="Quant scheme: i8/i16 = affine (calibrated), i32 = symmetric "
+                 "fixed-point (affine i32 overflows the i64 requantize)."))
         print(f"\nwrote {args.md}")
     ok = S.all_parity_ok(rows)
     if not ok:

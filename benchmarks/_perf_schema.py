@@ -18,7 +18,8 @@ from __future__ import annotations
 DTYPES = ["float", "i8", "i16", "i32"]
 KERNELS = ["dense", "csr", "unroll"]
 
-# (key, header, kind) — kind drives formatting. None cells render blank.
+# (key, header, kind) — kind drives formatting. A None cell renders as "-"
+# (in both markdown and text) so an unmeasured value is never an empty gap.
 COLUMNS = [
     ("dtype", "dtype", "str"),
     ("kernel", "kernel", "str"),
@@ -28,16 +29,23 @@ COLUMNS = [
     ("wres_B", "Wres B", "int"),
     ("ops_per_step", "ops/step", "int"),
     ("vs_float", "vs float", "speedup"),
+    ("mse", "MSE", "sci"),
     ("parity", "parity", "parity"),
 ]
 
 
 def row(*, N, density, nnz, dtype, kernel, ops_per_step=None, parity=None,
-        flash_B=None, ram_B=None, wasm_B=None, wres_B=None):
-    """One measurement. Unmeasured fields stay None → rendered blank."""
+        flash_B=None, ram_B=None, wasm_B=None, wres_B=None, mse=None):
+    """One measurement. Unmeasured fields stay None → rendered as "-".
+
+    `mse` is the prediction error (mean squared error of the dequantized
+    model output vs the ground-truth target, real units) — a function of the
+    dtype only (the dense/csr/unroll kernels are bit-exact), so it repeats
+    across a dtype's kernel rows.
+    """
     return dict(N=N, density=density, nnz=nnz, dtype=dtype, kernel=kernel,
                 ops_per_step=ops_per_step, parity=parity, flash_B=flash_B,
-                ram_B=ram_B, wasm_B=wasm_B, wres_B=wres_B)
+                ram_B=ram_B, wasm_B=wasm_B, wres_B=wres_B, mse=mse)
 
 
 def _add_vs_float(rows):
@@ -55,9 +63,11 @@ def _add_vs_float(rows):
 def _cell(r, key, kind, md):
     v = r.get(key)
     if v is None:
-        return "" if md else "-"
+        return "-"                       # explicit "not measured" in both
     if kind == "int":
         return str(v)
+    if kind == "sci":
+        return f"{v:.2e}"
     if kind == "speedup":
         return (f"{v:.2f}×" if md else f"{v:.2f}x")
     if kind == "parity":
@@ -73,8 +83,9 @@ def fmt_md(target, rows, *, unit, note=""):
     out = [f"### {target}", ""]
     cap = (f"`ops/step` = {unit} (deterministic op-count proxy, **not** "
            f"silicon cycles). `vs float` = float-dense ops / row ops at the "
-           f"same N (blank if float not measured on this target). Blank cells "
-           f"are not measurable on this target.")
+           f"same N. `MSE` = prediction error vs the ground-truth target "
+           f"(dequantized output, real units; depends on dtype only). "
+           f"A **`-`** cell was **not measured** on this target.")
     if note:
         cap += " " + note
     out += [cap, ""]
