@@ -2,6 +2,7 @@
 from __future__ import annotations
 import pathlib
 import shutil
+import subprocess
 import sys
 import tempfile
 import traceback
@@ -34,6 +35,30 @@ def expect_raises(exc_type, fn, *args, **kwargs):
     except exc_type:
         return True
     raise AssertionError(f"Expected {exc_type.__name__}, none raised")
+
+
+def _rust_target_available(target="wasm32-wasip1", rustc="rustc"):
+    """Whether rustc can actually link for ``target``.
+
+    ``rustc`` being on PATH is necessary but not sufficient: CI runners often
+    have the host toolchain without the wasm32 ``rust-std`` component, so
+    linking ``main.rs`` fails with E0463 ("can't find crate for `std`").
+    Probe the target libdir and confirm a std rlib is present before running
+    the wasm pipeline tests, otherwise skip them.
+    """
+    if shutil.which(rustc) is None:
+        return False
+    try:
+        cp = subprocess.run(
+            [rustc, "--print", "target-libdir", "--target", target],
+            capture_output=True, text=True,
+        )
+    except OSError:
+        return False
+    if cp.returncode != 0:
+        return False
+    libdir = pathlib.Path(cp.stdout.strip())
+    return libdir.is_dir() and any(libdir.glob("libstd-*.rlib"))
 
 
 def _build():
@@ -145,8 +170,8 @@ def test_wasm_simd_defaults_on_and_names():
 def test_wasm_simd_emits_v128_instructions():
     """With SIMD on, the matmul inner loops lower to packed v128 ops;
     with SIMD off they stay scalar."""
-    if shutil.which("rustc") is None:
-        return  # skip — rustc not on PATH
+    if not _rust_target_available():
+        return  # skip — rustc / wasm32 rust-std not available
     import re
     rc, exe, sample = _build()
     counts = {}
@@ -204,8 +229,8 @@ def test_wasm_compile_quantized_rejects_bad_storage():
 def test_wasm_quantized_bit_exact():
     """i8 / i16 / i32 quantized kernels cross-compiled to wasm32 reproduce
     the host quantized kernel bit-for-bit under wasmtime."""
-    if shutil.which("rustc") is None:
-        return  # skip — rustc not on PATH
+    if not _rust_target_available():
+        return  # skip — rustc / wasm32 rust-std not available
     if shutil.which("wasmtime") is None:
         return  # skip — wasmtime not on PATH
     for storage_bits, state_frac in [(32, 16), (16, 10), (8, 5)]:
@@ -235,8 +260,8 @@ def test_browser_f32_reactor():
     """The f32 browser build is a reactor: exports rc_predict/memory, imports
     only env.tanhf, and ships a JS loader + HTML demo with no leftover
     template placeholders."""
-    if shutil.which("rustc") is None:
-        return  # skip — rustc not on PATH
+    if not _rust_target_available():
+        return  # skip — rustc / wasm32 rust-std not available
     rc, exe, sample = _build()
     with tempfile.TemporaryDirectory() as td:
         target = BrowserWasm()
@@ -259,8 +284,8 @@ def test_browser_f32_reactor():
 def test_browser_quantized_zero_imports():
     """The quantized browser build has ZERO imports and instantiates/runs in
     a non-WASI host (wasmtime --invoke)."""
-    if shutil.which("rustc") is None:
-        return  # skip — rustc not on PATH
+    if not _rust_target_available():
+        return  # skip — rustc / wasm32 rust-std not available
     qm, sample = _build_quantized_wasm(16, 10)
     with tempfile.TemporaryDirectory() as td:
         target = BrowserWasm()
@@ -276,8 +301,8 @@ def test_browser_quantized_zero_imports():
 
 def test_wasm_inspect_parses_imports_exports():
     """The minimal wasm parser agrees with the metadata the linker reports."""
-    if shutil.which("rustc") is None:
-        return  # skip — rustc not on PATH
+    if not _rust_target_available():
+        return  # skip — rustc / wasm32 rust-std not available
     from rclite.targets.wasm._wasm_inspect import inspect_wasm
     rc, exe, sample = _build()
     with tempfile.TemporaryDirectory() as td:
@@ -300,8 +325,8 @@ def test_wasm_target_requires_test_inputs():
 
 
 def test_wasmtime_full_pipeline():
-    if shutil.which("rustc") is None:
-        return  # skip — rustc not on PATH
+    if not _rust_target_available():
+        return  # skip — rustc / wasm32 rust-std not available
     if shutil.which("wasmtime") is None:
         return  # skip — wasmtime not on PATH
     rc, exe, sample = _build()
