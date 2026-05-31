@@ -155,6 +155,30 @@ def _loop_strided(b: ir.IRBuilder, start, end, stride, name: str = "i"):
 
 
 # ----------------------------------------------------------------------------
+# Value specialization for baked unroll weights
+#
+# In the "unroll" sparse kernel each nonzero W_res weight is a compile-time
+# constant baked into the IR. When that constant is +-1 or +-2**k the multiply
+# can be replaced by a negate / shift (or, for floats, +-1 by add/sub), which
+# removes a multiply per nonzero MAC -- the win the roadmap flags for FPU-less
+# / multiplier-light cores. Exact zeros never reach here (SparsifyReservoir
+# prunes them), so we only special-case the power-of-two magnitudes.
+
+
+def _pow2_exp(v: int):
+    """Return k if abs(int(v)) == 2**k (k >= 0), else None.
+
+    `+-1` maps to k=0. Callers must pass an integer-valued weight (the
+    quantized integer paths do); the float path checks `+-1.0` directly
+    because a fractional float like 1.5 would truncate to a spurious k.
+    """
+    a = abs(int(v))
+    if a == 0 or (a & (a - 1)) != 0:
+        return None
+    return a.bit_length() - 1
+
+
+# ----------------------------------------------------------------------------
 # IR-driven lowering
 
 
@@ -421,8 +445,18 @@ class _Lowerer:
                             self.acc)
                 for j, wv in spec.rows[i]:
                     hv = _load1d(b, self.h, _ci(j))
-                    b.store(b.fadd(b.load(self.acc),
-                                   b.fmul(self._cf(wv), hv)), self.acc)
+                    # Value specialization: w==+-1 needs no fmul (fmul by an
+                    # exact +-1.0 is the IEEE identity / sign flip, so
+                    # fadd/fsub are bit-identical). 2**k is not specialized
+                    # for floats -- there is no cheaper exact float op.
+                    if wv == 1.0:
+                        acc = b.fadd(b.load(self.acc), hv)
+                    elif wv == -1.0:
+                        acc = b.fsub(b.load(self.acc), hv)
+                    else:
+                        acc = b.fadd(b.load(self.acc),
+                                     b.fmul(self._cf(wv), hv))
+                    b.store(acc, self.acc)
                 _store1d(b, self.pre_arr, _ci(i), b.load(self.acc))
             return
 
@@ -969,6 +1003,31 @@ class _IntLowerer:
             return self.b.trunc(shifted, self.accum_ty)
         return self.b.sext(shifted, self.accum_ty)
 
+    def _fixed_const_mul_to_accum(self, wv: int, s, shift: int):
+        """(wv * s) >> shift in accum_ty, folding the multiply when wv==+-2**k.
+
+        For wv==+-2**k the product `mul(2**k, sext(s))` equals
+        `shl(sext(s), k)` bit-for-bit in the wide product_ty (no overflow:
+        product_ty holds storage*storage), and a negative power negates the
+        shifted value -- so the subsequent ashr/convert is bit-identical to
+        `_fixed_mul_to_accum`. Falls back to the multiply otherwise.
+        """
+        k = _pow2_exp(wv)
+        if k is None:
+            return self._fixed_mul_to_accum(self._cs(int(wv)), s, shift)
+        b = self.b
+        s_p = b.sext(s, self.product_ty)
+        if k > 0:
+            s_p = b.shl(s_p, ir.Constant(self.product_ty, k))
+        if wv < 0:
+            s_p = b.sub(ir.Constant(self.product_ty, 0), s_p)
+        shifted = b.ashr(s_p, ir.Constant(self.product_ty, shift))
+        if self.product_ty == self.accum_ty:
+            return shifted
+        if self.product_ty.width > self.accum_ty.width:
+            return b.trunc(shifted, self.accum_ty)
+        return b.sext(shifted, self.accum_ty)
+
     # ------------------------------------------------------------------
     # dispatcher
 
@@ -1149,8 +1208,8 @@ class _IntLowerer:
         if i_py is not None:  # unrolled sparse
             for j, wv in spec.rows[i_py]:
                 s = _load1d(b, self.h, _ci(j))
-                prod = self._fixed_mul_to_accum(self._cs(int(wv)), s,
-                                                self.shift_res)
+                prod = self._fixed_const_mul_to_accum(int(wv), s,
+                                                      self.shift_res)
                 b.store(self._accum_add(b.load(self.acc), prod), self.acc)
         elif spec is not None:  # CSR
             self._emit_res_contrib_int_csr(spec, i)
@@ -1943,6 +2002,25 @@ class _AffineLowerer:
             new_h_q = self._emit_saturate_to_storage(new_h_total)
             _store1d(self.b, self.h_buf, i, new_h_q)
 
+    def _const_mul_accum(self, wv: int, h):
+        """wv * sext(h) in accum_ty, folding the multiply when wv==+-2**k.
+
+        `mul(2**k, sext(h))` equals `shl(sext(h), k)` bit-for-bit in accum_ty
+        (no overflow: accum_ty is wider than the storage state), and a
+        negative power negates the shifted value -- bit-identical to the
+        baked `mul`. Falls back to the multiply otherwise.
+        """
+        b = self.b
+        k = _pow2_exp(wv)
+        h_p = b.sext(h, self.accum_ty)
+        if k is None:
+            return b.mul(self._ca(int(wv)), h_p)
+        if k > 0:
+            h_p = b.shl(h_p, ir.Constant(self.accum_ty, k))
+        if wv < 0:
+            h_p = b.sub(self._ca(0), h_p)
+        return h_p
+
     def _emit_affine_row(self, op, i, g_Win, g_rs_in, g_Wres, g_rs_res,
                           spec, i_py):
         """Emit pre[row i] for the affine kernel (one body of the ipre loop).
@@ -1982,7 +2060,7 @@ class _AffineLowerer:
             if i_py is not None:  # unrolled sparse
                 for j, wv in spec.rows[i_py]:
                     h = _load1d(b, self.h_buf, _ci(j))
-                    prod = b.mul(self._ca(int(wv)), b.sext(h, self.accum_ty))
+                    prod = self._const_mul_accum(int(wv), h)
                     b.store(b.add(b.load(acc_res_var), prod), acc_res_var)
             elif spec is not None:  # CSR
                 self._emit_affine_res_csr(spec, acc_res_var, i)
