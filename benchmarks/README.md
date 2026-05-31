@@ -34,45 +34,56 @@ wasm runtime.
 | `compare_wasm.py` | rclite WASM target vs host. |
 | `scratch_c/` | Hand-written naive C templates used as the baseline. |
 
-## `sparse_mcu/` — W_res sparsification on Cortex-M0 (QEMU)
+## Per-target perf benches — unified schema
 
-On-device impact of `SparsifyReservoir`, built as real nRF51/micro:bit
-firmware and measured under `qemu -icount shift=0`. Need
+The Cortex-M0 / AVR / wasm benches below share the **same columns**
+(`_perf_schema.py`) over a common matrix: **dtype ∈ {float, i8, i16, i32} ×
+kernel ∈ {dense, csr, value-spec unroll}**. A cell a target cannot measure is
+left **blank** (AVR has no float/unroll path; wasm has no Flash/RAM). Speed is
+a per-target *deterministic* op-count proxy (SysTick ticks / AVR cycles /
+wasmtime fuel — unit per caption); the `vs float` column is the unit-free
+cross-dtype headline (float-dense ÷ row, same N). Shared model/quant/object/
+reference helpers live in `_perf_kernels.py`.
+
+## `sparse_mcu/` — Cortex-M0 (QEMU)
+
+On-device impact of `SparsifyReservoir` + quantization, built as real
+nRF51/micro:bit firmware and measured under `qemu -icount shift=0`. Need
 `arm-none-eabi-gcc` + `qemu-system-arm`.
 
 | File | What it measures |
 |------|------------------|
 | `bench.py` | C kernel template (Arduino/turnkey path): dense vs CSR Flash/RAM/speed. |
-| `bench_llvm.py` | LLVM codegen path: dense vs CSR vs **value-specialized unroll**, three-way. `--md`/`--json` outputs; this is the script the CI `qemu-bench` job runs. |
+| `bench_llvm.py` | LLVM codegen path, full **float + i8/i16/i32 × dense/csr/unroll** matrix; SysTick ticks/step + Flash/RAM. `--md`/`--json`; the CI `qemu-bench` job runs this. |
 
 Speed is a deterministic op-count proxy via SysTick (ticks ∝ executed
-instructions; **not** silicon cycles), so the dense/CSR/unroll speedup
-ratios are bit-stable run to run.
+instructions; **not** silicon cycles), so the speedup ratios are bit-stable
+run to run.
 
-## `avr_mcu/` — W_res sparsification on Arduino Uno (simavr)
+## `avr_mcu/` — Arduino Uno (simavr)
 
-ATmega328P firmware (`emit_affine_kernel_c`) measured under **simavr**
-(cycle-accurate, deterministic). Need `avr-gcc` + `avr-libc` and host
-`gcc` + `libsimavr-dev`. The C kernel has no value-specialized unroll
-(LLVM-only), so AVR compares **dense vs CSR**.
+ATmega328P (`emit_affine_kernel_c`) under **simavr** (cycle-accurate,
+deterministic). Need `avr-gcc` + `avr-libc` and host `gcc` + `libsimavr-dev`.
+The affine C kernel cleanly supports **i8 dense/csr** here; float, unroll,
+and i16/i32 are blank.
 
 | File | What it measures |
 |------|------------------|
-| `bench_avr.py` | dense vs CSR: Flash/RAM (avr-size) + AVR cycles/step (simavr). CI `avr-bench` job. |
-| `sim_driver.c` | libsimavr driver: runs the ELF, captures `avr->cycle` deltas via GPIOR markers. |
+| `bench_avr.py` | i8 dense/csr: Flash/RAM (avr-size) + AVR cycles/step (simavr). CI `avr-bench` job. |
+| `sim_driver.c` | libsimavr driver: captures `avr->cycle` deltas via GPIOR markers. |
 | `main_bench.c` | AVR harness: brackets `rc_predict` with cycle markers + parity. |
 
-## `wasm_target/` — W_res kernels on wasm32 (wasmtime fuel)
+## `wasm_target/` — wasm32 (wasmtime fuel)
 
-wasm32-wasip1 via the LLVM path (same as Cortex-M0), so the three-way
-**dense vs CSR vs value-specialized unroll** applies. Speed = **wasmtime
-fuel** (deterministic op-count proxy, two-point measurement). Need `rustc`
-(+ `rustup target add wasm32-wasip1`) and the `wasmtime` Python package.
+wasm32-wasip1 via the LLVM path (same as Cortex-M0): full float + i8/i16/i32
+× dense/csr/unroll matrix. Speed = **wasmtime fuel** (deterministic op-count
+proxy, two-point measurement). Need `rustc` (+ `rustup target add
+wasm32-wasip1`) and the `wasmtime` Python package.
 
 | File | What it measures |
 |------|------------------|
-| `bench_wasm.py` | dense/CSR/unroll: module bytes + fuel/step. CI `wasm-bench` job. |
-| `bench_fuel.rs` | harness: runs `rc_predict` N times (N from WASI arg) + parity. |
+| `bench_wasm.py` | float + i8/i16/i32 × dense/csr/unroll: module bytes + fuel/step. CI `wasm-bench` job. |
+| `bench_fuel.rs` | harness: runs `rc_predict` N times (N from WASI arg) + tolerance/exact parity. |
 
 ## `executorch_vs_rclite/` — vs ExecuTorch on Cortex-M55 (FVP)
 
