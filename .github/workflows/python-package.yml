@@ -39,3 +39,46 @@ jobs:
 
       - name: Run pytest
         run: pytest tests -v
+
+  qemu-bench:
+    # QEMU-based performance evaluation of the W_res kernels (dense vs CSR vs
+    # value-specialized unroll) via the LLVM codegen path. Runs in parallel
+    # with `test`. Report-only: it does not gate on perf thresholds, but a
+    # PARITY_FAIL (on-device bit-exactness regression) fails the job.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install ARM cross-toolchain and QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-arm-none-eabi \
+            libnewlib-arm-none-eabi \
+            qemu-system-arm
+
+      - name: Install project
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+
+      - name: Cortex-M0 QEMU performance benchmark
+        run: |
+          python benchmarks/sparse_mcu/bench_llvm.py \
+            --md bench_summary.md --json bench_results.json
+
+      - name: Publish benchmark to job summary
+        if: always()
+        run: |
+          if [ -f bench_summary.md ]; then
+            cat bench_summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Benchmark produced no summary (build/run failed before measurement)." \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi

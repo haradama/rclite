@@ -34,6 +34,21 @@ wasm runtime.
 | `compare_wasm.py` | rclite WASM target vs host. |
 | `scratch_c/` | Hand-written naive C templates used as the baseline. |
 
+## `sparse_mcu/` — W_res sparsification on Cortex-M0 (QEMU)
+
+On-device impact of `SparsifyReservoir`, built as real nRF51/micro:bit
+firmware and measured under `qemu -icount shift=0`. Need
+`arm-none-eabi-gcc` + `qemu-system-arm`.
+
+| File | What it measures |
+|------|------------------|
+| `bench.py` | C kernel template (Arduino/turnkey path): dense vs CSR Flash/RAM/speed. |
+| `bench_llvm.py` | LLVM codegen path: dense vs CSR vs **value-specialized unroll**, three-way. `--md`/`--json` outputs; this is the script the CI `qemu-bench` job runs. |
+
+Speed is a deterministic op-count proxy via SysTick (ticks ∝ executed
+instructions; **not** silicon cycles), so the dense/CSR/unroll speedup
+ratios are bit-stable run to run.
+
 ## `executorch_vs_rclite/` — vs ExecuTorch on Cortex-M55 (FVP)
 
 End-to-end comparison against ExecuTorch on an Arm FVP. See its `README.md`.
