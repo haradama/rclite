@@ -36,7 +36,7 @@ wasm runtime.
 
 ## Per-target perf benches — unified schema
 
-The Cortex-M0 / AVR / wasm benches below share the **same columns**
+The Cortex-M0 / AVR / wasm / GBA benches below share the **same columns**
 (`_perf_schema.py`) over a common matrix: **dtype ∈ {float, i8, i16, i32} ×
 kernel ∈ {dense, csr, value-spec unroll}**. A cell a target cannot measure is
 rendered **`-`** ("not measured" — AVR has no float/unroll path; wasm has no
@@ -96,6 +96,19 @@ wasm32-wasip1`) and the `wasmtime` Python package.
 |------|------------------|
 | `bench_wasm.py` | float + i8/i16/i32 × dense/csr/unroll: module bytes + fuel/step. CI `wasm-bench` job. |
 | `bench_fuel.rs` | harness: runs `rc_predict` N times (N from WASI arg) + tolerance/exact parity. |
+
+## `gba_arm7tdmi/` — Game Boy Advance (mGBA)
+
+ARM7TDMI / thumbv4t via the LLVM path (same as Cortex-M0): full float +
+i8/i16/i32 × dense/csr/unroll matrix. Speed = **GBA timer ticks** (TM0+TM1
+cascaded at the system clock) under **mGBA** — a deterministic op-count proxy
+(code runs from cartridge ROM with GBA waitstates). Need `arm-none-eabi-gcc`
+and `mgba` / `mgba-sdl`.
+
+| File | What it measures |
+|------|------------------|
+| `bench_gba.py` | float + i8/i16/i32 × dense/csr/unroll: Flash/RAM + ticks/step. CI `gba-bench` job. |
+| `main_bench.c` | GBA harness: times `rc_predict` via cascaded timers, logs ticks/parity over mGBA's debug log. |
 
 ## `executorch_vs_rclite/` — vs ExecuTorch on Cortex-M55 (FVP)
 

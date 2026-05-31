@@ -191,4 +191,32 @@ def wres_bytes(dtype, src, sparse, N):
     return len(val) * sb + len(col) * col_b + len(rowptr) * 4
 
 
+_CTYPE = {np.float32: "float", np.int8: "int8_t",
+          np.int16: "int16_t", np.int32: "int32_t"}
+
+
+def emit_c_data_h(dtype, src, x_seq):
+    """Render rc_data.h (storage typedef, dims, embedded X + reference Y) for
+    a C harness; return (header_text, T). Defines RC_IS_FLOAT for the float
+    dtype so a harness can pick float vs exact-integer parity.
+    """
+    X, Y, eps, npd, Kk, M, T = reference_data(dtype, src, x_seq)
+    ct = _CTYPE[npd]
+    if dtype == "float":
+        fmt = lambda a: ", ".join(f"{float(v)!r}f" for v in a.ravel())
+        flag = "#define RC_IS_FLOAT 1\n"
+    else:
+        fmt = lambda a: ", ".join(str(int(v)) for v in a.ravel())
+        flag = ""
+    text = "\n".join([
+        flag + f"typedef {ct} rc_fw_storage_t;",
+        f"#define RC_FW_EPS {float(eps)!r}",
+        f"#define RC_FW_T {T}", f"#define RC_FW_K {Kk}", f"#define RC_FW_M {M}",
+        f"static const rc_fw_storage_t g_x[{T * Kk}] = {{{fmt(X)}}};",
+        f"static const rc_fw_storage_t g_y_ref[{T * M}] = {{{fmt(Y)}}};",
+        "",
+    ])
+    return text, T
+
+
 KERNEL_SPARSE = {"dense": None, "csr": "csr", "unroll": "unroll"}

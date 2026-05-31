@@ -162,3 +162,45 @@ jobs:
             echo "Wasm benchmark produced no summary (build/run failed)." \
               >> "$GITHUB_STEP_SUMMARY"
           fi
+
+  gba-bench:
+    # Game Boy Advance (ARM7TDMI / thumbv4t) perf: dense vs CSR vs value-spec
+    # unroll W_res via the LLVM codegen path. Speed = deterministic GBA timer
+    # ticks under mGBA. Report-only; PARITY_FAIL fails it.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install ARM cross-toolchain and mGBA
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-arm-none-eabi \
+            libnewlib-arm-none-eabi \
+            mgba-sdl
+
+      - name: Install project
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+
+      - name: GBA (mGBA) performance benchmark
+        run: |
+          python benchmarks/gba_arm7tdmi/bench_gba.py \
+            --md bench_summary.md --json bench_results.json
+
+      - name: Publish benchmark to job summary
+        if: always()
+        run: |
+          if [ -f bench_summary.md ]; then
+            cat bench_summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "GBA benchmark produced no summary (build/run failed)." \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi
