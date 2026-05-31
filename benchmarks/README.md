@@ -49,6 +49,31 @@ Speed is a deterministic op-count proxy via SysTick (ticks ∝ executed
 instructions; **not** silicon cycles), so the dense/CSR/unroll speedup
 ratios are bit-stable run to run.
 
+## `avr_mcu/` — W_res sparsification on Arduino Uno (simavr)
+
+ATmega328P firmware (`emit_affine_kernel_c`) measured under **simavr**
+(cycle-accurate, deterministic). Need `avr-gcc` + `avr-libc` and host
+`gcc` + `libsimavr-dev`. The C kernel has no value-specialized unroll
+(LLVM-only), so AVR compares **dense vs CSR**.
+
+| File | What it measures |
+|------|------------------|
+| `bench_avr.py` | dense vs CSR: Flash/RAM (avr-size) + AVR cycles/step (simavr). CI `avr-bench` job. |
+| `sim_driver.c` | libsimavr driver: runs the ELF, captures `avr->cycle` deltas via GPIOR markers. |
+| `main_bench.c` | AVR harness: brackets `rc_predict` with cycle markers + parity. |
+
+## `wasm_target/` — W_res kernels on wasm32 (wasmtime fuel)
+
+wasm32-wasip1 via the LLVM path (same as Cortex-M0), so the three-way
+**dense vs CSR vs value-specialized unroll** applies. Speed = **wasmtime
+fuel** (deterministic op-count proxy, two-point measurement). Need `rustc`
+(+ `rustup target add wasm32-wasip1`) and the `wasmtime` Python package.
+
+| File | What it measures |
+|------|------------------|
+| `bench_wasm.py` | dense/CSR/unroll: module bytes + fuel/step. CI `wasm-bench` job. |
+| `bench_fuel.rs` | harness: runs `rc_predict` N times (N from WASI arg) + parity. |
+
 ## `executorch_vs_rclite/` — vs ExecuTorch on Cortex-M55 (FVP)
 
 End-to-end comparison against ExecuTorch on an Arm FVP. See its `README.md`.

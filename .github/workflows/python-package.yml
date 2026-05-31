@@ -82,3 +82,83 @@ jobs:
             echo "Benchmark produced no summary (build/run failed before measurement)." \
               >> "$GITHUB_STEP_SUMMARY"
           fi
+
+  avr-bench:
+    # AVR (ATmega328P / Arduino Uno) perf: dense vs CSR W_res via the
+    # emit_affine_kernel_c C kernel. Cycles counted by simavr (cycle-accurate,
+    # deterministic); Flash/RAM by avr-size. Report-only; PARITY_FAIL fails it.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install AVR toolchain and simavr
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-avr \
+            avr-libc \
+            simavr \
+            libsimavr-dev
+
+      - name: Install project
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+
+      - name: Arduino Uno (simavr) performance benchmark
+        run: |
+          python benchmarks/avr_mcu/bench_avr.py \
+            --md bench_summary.md --json bench_results.json
+
+      - name: Publish benchmark to job summary
+        if: always()
+        run: |
+          if [ -f bench_summary.md ]; then
+            cat bench_summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "AVR benchmark produced no summary (build/run failed)." \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  wasm-bench:
+    # WebAssembly (wasm32-wasip1) perf: dense vs CSR vs value-specialized
+    # unroll W_res via the LLVM codegen path. Speed = deterministic wasmtime
+    # fuel (two-point). Report-only; PARITY_FAIL fails it.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Add wasm Rust target
+        run: rustup target add wasm32-wasip1
+
+      - name: Install project + wasmtime
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e . wasmtime
+
+      - name: WebAssembly (wasmtime fuel) performance benchmark
+        run: |
+          python benchmarks/wasm_target/bench_wasm.py \
+            --md bench_summary.md --json bench_results.json
+
+      - name: Publish benchmark to job summary
+        if: always()
+        run: |
+          if [ -f bench_summary.md ]; then
+            cat bench_summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Wasm benchmark produced no summary (build/run failed)." \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi
