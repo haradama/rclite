@@ -1,11 +1,20 @@
 """Arduino Uno (ATmega328P) performance bench, unified schema.
 
-The AVR deployment is the affine C kernel (emit_affine_kernel_c), which has
-no float path and no value-specialized unroll (the C "unroll" degrades to
-CSR), so only the integer dense/csr cells are measured; the float and unroll
-cells are left blank — the columns stay common with the Cortex-M0 and WASM
-benches (benchmarks/_perf_schema.py). Speed = AVR cycles per step via simavr
-(cycle-accurate, deterministic). Size = Flash/RAM from avr-size.
+The AVR deployment is the affine C kernel (emit_affine_kernel_c). The
+**i8/i16 dense/csr** cells are measured; the rest stay blank but keep the
+columns common with the Cortex-M0 / WASM benches (benchmarks/_perf_schema.py):
+  - We quantize with a linear-interp LUT. The default DIRECT LUT has
+    2**storage_bits entries — 128 KB for i16, which overflows the Uno's 32 KB
+    Flash and reads back garbage; the small interp LUT fits and stays
+    bit-exact on the device (works on the stock avr-gcc 7.x — it is a LUT-size
+    issue, not a compiler bug).
+  - i32 is blank: affine quantization targets i8/i16; an i32 affine model
+    overflows the i64 requantize/accumulator (the Python executor itself
+    raises OverflowError). i32 uses the *symmetric* path instead, measured on
+    M0/WASM.
+  - no float path and no value-specialized unroll (the C "unroll" → CSR).
+Speed = AVR cycles per step via simavr (cycle-accurate, deterministic).
+Size = Flash/RAM from avr-size.
 
 Requires avr-gcc + avr-libc and host gcc + libsimavr-dev.
 
@@ -27,6 +36,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "sparse_mcu
 
 import numpy as np
 
+from rclite.quant import LUTStrategy
 from rclite.quant.affine import calibrate_from_data, quantize_model_affine
 from rclite.targets.arduino import emit_affine_kernel_c
 import bench as _b               # sparse_mcu/bench.py — data + wres helpers
@@ -96,16 +106,23 @@ def run(sizes):
                 for kernel in S.KERNELS:
                     r = S.row(N=N, density=density, nnz=nnz, dtype=dtype,
                               kernel=kernel)
-                    # AVR (affine C kernel): only i8 dense/csr are cleanly
-                    # measurable here. i16's Python reference diverges from the
-                    # C kernel (unverified parity), i32 affine calibration does
-                    # not converge, and there is no float / value-spec-unroll C
-                    # path — all left blank (columns stay common).
-                    if dtype == "i8" and kernel in ("dense", "csr"):
+                    # AVR (affine C kernel): i8/i16 dense/csr are measurable.
+                    #  - We use a linear-interp LUT: the default DIRECT LUT has
+                    #    2**storage_bits entries, which for i16 is 128 KB and
+                    #    overflows the Uno's 32 KB Flash (pgm_read then wraps to
+                    #    garbage). The small LUT fits and is bit-exact on AVR.
+                    #  - i32 is blank: affine targets i8/i16; an i32 affine
+                    #    model overflows the i64 requantize/accumulator (the
+                    #    Python executor itself raises) — i32 uses the symmetric
+                    #    path instead (measured on M0/WASM).
+                    #  - no float / value-spec-unroll C path.
+                    if dtype in ("i8", "i16") and kernel in ("dense", "csr"):
                         try:
                             cfg = calibrate_from_data(rc, exe, X[:900],
                                                       storage_bits=BITS[dtype])
-                            qm = quantize_model_affine(rc, exe, cfg)
+                            qm = quantize_model_affine(
+                                rc, exe, cfg,
+                                lut_strategy=LUTStrategy.linear_interp(64))
                             strat = None if kernel == "dense" else "csr"
                             fl, ram, cyc, par = _build_and_run(
                                 qm, x_seq, strat, driver,
@@ -120,7 +137,7 @@ def run(sizes):
     return rows
 
 
-TARGET = "Arduino Uno (ATmega328P) — affine i8 (C kernel)"
+TARGET = "Arduino Uno (ATmega328P) — affine i8/i16 (C kernel)"
 
 
 def main():
@@ -140,8 +157,11 @@ def main():
     if args.md:
         args.md.write_text(S.fmt_md(
             TARGET, rows, unit="AVR cycles (simavr)",
-            note="AVR uses the affine C kernel: only i8 dense/csr are "
-                 "cleanly measurable; float / unroll / i16 / i32 are blank."))
+            note="AVR uses the affine C kernel with a linear-interp LUT "
+                 "(the DIRECT LUT is 128 KB at i16, overflowing the Uno's "
+                 "32 KB Flash). i8/i16 dense/csr are measured; i32 affine "
+                 "overflows the i64 requantize (use the symmetric path), and "
+                 "there is no float / value-spec-unroll C path — blank."))
         print(f"\nwrote {args.md}")
     ok = S.all_parity_ok(rows)
     if not ok:

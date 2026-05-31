@@ -140,10 +140,25 @@ class LUTArtifacts:
     poly_a5_qf: int = 0
 
 
+# A DIRECT LUT materializes one entry per representable pre-activation value
+# (2**storage_bits of them). That is fine for i8 (256) / i16 (65536) but
+# explodes for wider storage (i32 → 4.3e9 entries ≈ 34 GB), so guard against
+# it with a clear error instead of hanging on the allocation.
+_DIRECT_MAX_STORAGE_BITS = 16
+
+
 def build_lut_artifacts(config: AffineQuantConfig,
                           strategy: LUTStrategy) -> LUTArtifacts:
     """Dispatch to the right per-strategy builder."""
     if strategy.kind == LUTKind.DIRECT:
+        if config.storage_bits > _DIRECT_MAX_STORAGE_BITS:
+            raise ValueError(
+                f"DIRECT activation LUT needs 2**storage_bits entries "
+                f"(2**{config.storage_bits} ≈ {1 << config.storage_bits:.3e} "
+                f"here), infeasible for storage_bits > "
+                f"{_DIRECT_MAX_STORAGE_BITS}. Use LUTStrategy.linear_interp(n) "
+                f"or .polynomial(), or the symmetric i32 quantization path."
+            )
         return _build_direct(config)
     if strategy.kind == LUTKind.LINEAR_INTERP:
         return _build_linear_interp(config, strategy)

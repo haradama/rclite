@@ -192,6 +192,33 @@ def test_host_parity_i16():
     _assert_host_parity(qm, X[150:175])
 
 
+def test_host_parity_i16_dense():
+    """i16 + dense W_res (ESN_STANDARD): host gcc must match the Python ref.
+
+    Pins the i16 dense kernel's algorithm (the i16xi16 matvec uses i64
+    accumulators). On a 32 KB-Flash Uno a 65536-entry DIRECT LUT does not fit,
+    so the AVR bench uses a small interp LUT; the algorithm itself is correct
+    at i16, as this exercises with a DIRECT LUT on the host.
+    """
+    _, _, qm, X = _build(topology=Topology.ESN_STANDARD, storage_bits=16,
+                          strategy=LUTStrategy.direct())
+    _assert_host_parity(qm, X[150:175])
+
+
+def test_direct_lut_rejects_oversized_storage():
+    """A DIRECT activation LUT for i32 would need 2**32 entries — quantizing
+    must raise a clear error fast, not hang on a ~34 GB allocation."""
+    from rclite.quant import calibrate_from_data, quantize_model_affine
+    rc, exe, _, X = _build(topology=Topology.SCR, storage_bits=8)
+    cfg = calibrate_from_data(rc, exe, X[:150], storage_bits=32)
+    try:
+        quantize_model_affine(rc, exe, cfg, lut_strategy=LUTStrategy.direct())
+    except ValueError as e:
+        assert "storage_bits" in str(e)
+        return
+    raise AssertionError("expected ValueError for DIRECT LUT at i32")
+
+
 def test_host_parity_with_preprocess():
     _, _, qm, X = _build(topology=Topology.SCR, input_offset=0.3,
                           input_scaling=1.5,

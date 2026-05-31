@@ -62,10 +62,13 @@ run to run.
 
 ## `avr_mcu/` — Arduino Uno (simavr)
 
-ATmega328P (`emit_affine_kernel_c`) under **simavr** (cycle-accurate,
-deterministic). Need `avr-gcc` + `avr-libc` and host `gcc` + `libsimavr-dev`.
-The affine C kernel cleanly supports **i8 dense/csr** here; float, unroll,
-and i16/i32 are blank.
+ATmega328P (`emit_affine_kernel_c`, **linear-interp LUT**) under **simavr**
+(cycle-accurate, deterministic). Need `avr-gcc` + `avr-libc` and host `gcc` +
+`libsimavr-dev`. Measures **i8/i16 dense/csr**; the rest are blank: i32 affine
+overflows the i64 requantize (i32 uses the symmetric path, on M0/WASM), and
+there is no float / value-spec unroll C path. (NB: the default DIRECT LUT is
+128 KB at i16 and overflows the Uno's 32 KB Flash, so the bench uses a small
+interp LUT — a LUT-size issue, works on the stock avr-gcc.)
 
 | File | What it measures |
 |------|------------------|
