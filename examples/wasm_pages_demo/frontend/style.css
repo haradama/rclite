@@ -89,8 +89,8 @@ canvas#scope {
 .probs { display: flex; flex-direction: column; gap: .55rem; margin-top: auto; }
 .prob { display: grid; grid-template-columns: 66px 1fr 44px; align-items: center; gap: .5rem; }
 .prob .lbl { font-size: .82rem; color: var(--ink); }
-.prob .track { height: 12px; background: #0a0d14; border-radius: 6px; overflow: hidden; border: 1px solid var(--border); }
-.prob .fill { height: 100%; width: 0%; border-radius: 6px; transition: width .12s linear; }
+.prob .track { display: block; height: 12px; background: #0a0d14; border-radius: 6px; overflow: hidden; border: 1px solid var(--border); }
+.prob .fill { display: block; height: 100%; width: 0%; border-radius: 6px; transition: width .12s linear; }
 .prob .pct { font-size: .78rem; color: var(--muted); text-align: right; font-variant-numeric: tabular-nums; }
 .prob.lead .lbl { font-weight: 700; }
 .prob.lead .pct { color: var(--ink); }
