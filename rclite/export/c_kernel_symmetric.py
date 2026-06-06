@@ -223,14 +223,9 @@ def emit_symmetric_kernel_c(qmodel: QuantizedModel,
     if is_structured:
         _emit_chain_sym(a, topo, N, chain_weight_q, chain_feedback_q, rd)
     elif use_sparse:
-        a("            { int32_t rp = RC_RD32(&rc_W_res_rowptr[i]);")
-        a("              int32_t rpe = RC_RD32(&rc_W_res_rowptr[i+1]);")
-        a("              for (j = rp; j < rpe; j++)")
-        a(f"                acc = rc_w32((int64_t)acc + rc_fmul({rd}(&rc_W_res_val[j]), "
-          f"rc_h[{rd_col}(&rc_W_res_col[j])], RC_SHIFT_RES)); }}")
+        _emit_wres_csr(a, rd, rd_col)
     else:
-        a("            for (j = 0; j < RC_N; j++)")
-        a(f"                acc = rc_w32((int64_t)acc + rc_fmul({rd}(&rc_W_res[i*RC_N + j]), rc_h[j], RC_SHIFT_RES));")
+        _emit_wres_dense(a, rd)
     a("            rc_pre[i] = rc_ws(acc);")
     a("        }")
     # activation + leaky integration
@@ -293,6 +288,21 @@ def emit_symmetric_kernel_c(qmodel: QuantizedModel,
     return "\n".join(L)
 
 
+def _emit_wres_csr(a, rd, rd_col):
+    """CSR W_res contribution into `acc` (skips exact-zero MACs, ascending col)."""
+    a("            { int32_t rp = RC_RD32(&rc_W_res_rowptr[i]);")
+    a("              int32_t rpe = RC_RD32(&rc_W_res_rowptr[i+1]);")
+    a("              for (j = rp; j < rpe; j++)")
+    a(f"                acc = rc_w32((int64_t)acc + rc_fmul({rd}(&rc_W_res_val[j]), "
+      f"rc_h[{rd_col}(&rc_W_res_col[j])], RC_SHIFT_RES)); }}")
+
+
+def _emit_wres_dense(a, rd):
+    """Dense W_res contribution into `acc`."""
+    a("            for (j = 0; j < RC_N; j++)")
+    a(f"                acc = rc_w32((int64_t)acc + rc_fmul({rd}(&rc_W_res[i*RC_N + j]), rc_h[j], RC_SHIFT_RES));")
+
+
 def _emit_chain_sym(a, topo, N, cw_q, cf_q, rd):
     """Structured-topology W_res contribution, matching the dense-CSR matmul."""
     if topo == "SCR":
@@ -308,3 +318,287 @@ def _emit_chain_sym(a, topo, N, cw_q, cf_q, rd):
         a(f"                acc = rc_w32((int64_t)acc + rc_fmul({cf_q}, rc_h[i+1], RC_SHIFT_RES));")
     else:
         raise ValueError(f"_emit_chain_sym: unexpected topology {topo}")
+
+
+def emit_symmetric_online_kernel_c(qmodel: QuantizedModel,
+                                    learning_rate: float,
+                                    *, sparse=None) -> str:
+    """Portable-C emitter for **on-device integer LMS** readout training.
+
+    Bit-exact with `rclite.quant.online.IntegerLMSLearner` (the Python
+    reference). Emits three entry points over a mutable RAM `rc_W_out`:
+
+      * ``rc_train_reset()`` — zero the reservoir state (mirrors
+        ``IntegerLMSLearner.reset``).
+      * ``rc_infer_step(u_q, y_pred_q)`` — forward one step and read out the
+        prediction without learning (mirrors ``step_no_update``; use for the
+        warmup window).
+      * ``rc_train_step(u_q, y_target_q, y_pred_q)`` — forward, read out, then
+        update ``rc_W_out`` in place by one LMS step (mirrors ``step``).
+
+    Inputs are taken **pre-quantized**: ``u_q`` is the K-vector at input scale
+    (the caller's ``_quantize_input`` output) and ``y_target_q`` is the
+    M-vector at state scale (``quantize_state`` of the float target). The host
+    owns those scalar quantizations; the device kernel is pure integer. The
+    prediction ``y_pred_q`` is returned at state scale (clipped to storage).
+
+    The forward step and readout reuse the symmetric inference arithmetic, so
+    ``rc_infer_step`` matches ``QuantizedExecutor.predict_one_q`` fed the same
+    ``u_q``. Unlike the batch inference kernel, the readout's input-passthrough
+    block multiplies ``u_q`` (not the raw stimulus), matching the online
+    reference which drives the reservoir and the readout with one vector.
+    """
+    rc = qmodel.rc
+    cfg = qmodel.config
+    ro = rc.readout
+
+    if ro.units < 1:
+        raise ValueError("online kernel needs readout.units >= 1")
+    # Online LMS is a regression learner; classification uses RIDGE/PINV.
+    sb = qmodel.target.storage_bits
+    storage_t = _C_TYPE[sb]
+    rd = _RD[sb]
+    N, K, M = qmodel.N, qmodel.K, qmodel.M
+    F = qmodel.F
+    qmin, qmax = -(1 << (sb - 1)), (1 << (sb - 1)) - 1
+
+    state_frac = cfg.state_frac
+    input_frac = cfg.input_frac
+    weight_frac = cfg.weight_frac
+    shift_in = weight_frac + input_frac - state_frac
+    if shift_in < 0:
+        raise NotImplementedError(
+            f"symmetric online C emit needs weight_frac+input_frac >= "
+            f"state_frac (shift_in={shift_in})")
+    state_scale = 1 << state_frac
+    input_scale = 1 << input_frac
+    weight_scale = 1 << weight_frac
+
+    bias_q = _sat_storage(int(float(rc.reservoir.bias) * state_scale), sb)
+    leak_q = _sat_storage(int(float(rc.reservoir.leak_rate) * state_scale), sb)
+    one_minus_leak_q = state_scale - leak_q
+    xmin_q = int(qmodel.lut.xmin * state_scale)
+    xmax_q = int(qmodel.lut.xmax * state_scale)
+    denom = xmax_q - xmin_q
+    lut_n = int(np.asarray(qmodel.lut_table_q).shape[0])
+
+    # Learning rate quantized at state scale — a compile-time constant, baked in.
+    lr_q = int(qmodel.target.quantize_state(float(learning_rate), cfg))
+
+    is_structured = rc.reservoir.topology in (
+        Topology.DLR, Topology.DLRB, Topology.SCR)
+    topo = rc.reservoir.topology.name
+    Wr = np.asarray(qmodel.W_res_q)
+    chain_weight_q = int(Wr[1, 0]) if (is_structured and N > 1) else 0
+    chain_feedback_q = int(Wr[0, 1]) if (is_structured and N > 1) else 0
+
+    use_sparse = bool(sparse) and not is_structured
+    rd_col = None
+    if use_sparse:
+        from rclite.ir.passes.sparsify import build_csr
+        _wres_val, _wres_col, _wres_rowptr = build_csr(Wr)
+        col_t = "int16_t" if N <= 32767 else "int32_t"
+        rd_col = "RC_RD16" if N <= 32767 else "RC_RD32"
+
+    include_bias = ro.include_bias
+    include_input = ro.include_input
+    off_bias = 0
+    off_input = 1 if include_bias else 0
+    off_state = off_input + (K if include_input else 0)
+
+    L: List[str] = []
+    a = L.append
+
+    a("/* Auto-generated by rclite — symmetric Q-format ONLINE (integer LMS) kernel. */")
+    a("/* Portable C99. Bit-exact with rclite.quant.online.IntegerLMSLearner. */")
+    a("/* rc_W_out lives in RAM (mutated by rc_train_step); other tables are const. */")
+    a("#include <stdint.h>")
+    a("#ifdef __AVR__")
+    a("#include <avr/pgmspace.h>")
+    a("#define RC_PROGMEM PROGMEM")
+    a("#define RC_RD8(p)  ((int8_t)pgm_read_byte(p))")
+    a("#define RC_RD16(p) ((int16_t)pgm_read_word(p))")
+    a("#define RC_RD32(p) ((int32_t)pgm_read_dword(p))")
+    a("#else")
+    a("#define RC_PROGMEM")
+    a("#define RC_RD8(p)  (*(p))")
+    a("#define RC_RD16(p) (*(p))")
+    a("#define RC_RD32(p) (*(p))")
+    a("#endif")
+    a("")
+    a(f"#define RC_N {N}")
+    a(f"#define RC_K {K}")
+    a(f"#define RC_M {M}")
+    a(f"#define RC_F {F}")
+    a(f"#define RC_QMIN ({qmin})")
+    a(f"#define RC_QMAX ({qmax})")
+    a(f"#define RC_STATE_FRAC {state_frac}")
+    a(f"#define RC_INPUT_FRAC {input_frac}")
+    a(f"#define RC_SHIFT_IN {shift_in}")
+    a(f"#define RC_SHIFT_RES {weight_frac}")
+    a(f"#define RC_LR_Q ({lr_q})")
+    a(f"typedef {storage_t} rc_storage_t;")
+    a("")
+
+    # tables — W_in / W_res / LUT are const (Flash); W_out is mutable RAM.
+    a(_arr("rc_W_in", storage_t, qmodel.W_in_q))
+    a(_arr("rc_lut", storage_t, qmodel.lut_table_q))
+    if not is_structured:
+        if use_sparse:
+            a(_arr("rc_W_res_val", storage_t, _wres_val))
+            a(_arr("rc_W_res_col", col_t, _wres_col))
+            a(_arr("rc_W_res_rowptr", "int32_t", _wres_rowptr))
+        else:
+            a(_arr("rc_W_res", storage_t, qmodel.W_res_q))
+    wout_body = ", ".join(str(int(v)) for v in np.asarray(qmodel.W_out_q).reshape(-1))
+    a(f"static rc_storage_t rc_W_out[] = {{ {wout_body} }};")
+    a("")
+    a("static rc_storage_t rc_h[RC_N];")
+    a("static rc_storage_t rc_pre[RC_N];")
+    a("")
+
+    # helpers (shared with the inference kernel)
+    a("static int32_t rc_w32(int64_t v){ return (int32_t)(uint32_t)(uint64_t)v; }")
+    a(f"static rc_storage_t rc_ws(int32_t v){{ return ({storage_t})v; }}")
+    a("static int32_t rc_fmul(int32_t a, int32_t b, int s){")
+    a("    return rc_w32(((int64_t)a * (int64_t)b) >> s);")
+    a("}")
+    # saturating add: saturate the sum to int32 (like numpy's _sadd_sat_i32),
+    # then narrow to storage width via two's-complement wrap (matches numpy's
+    # in-place assignment to the storage-dtype W_out array).
+    a("static rc_storage_t rc_sadd_sat(int32_t cur, int64_t dw){")
+    a("    int64_t s = (int64_t)cur + dw;")
+    a("    if (s > (int64_t)INT32_MAX) s = (int64_t)INT32_MAX;")
+    a("    else if (s < (int64_t)INT32_MIN) s = (int64_t)INT32_MIN;")
+    a("    return (rc_storage_t)s;")
+    a("}")
+    a("")
+
+    # tanh LUT (linear interp), identical to the inference kernel
+    a("static rc_storage_t rc_tanh(int32_t x){")
+    a(f"    if (x < {xmin_q}) x = {xmin_q};")
+    a(f"    if (x > {xmax_q}) x = {xmax_q};")
+    a(f"    int64_t num = (int64_t)x - ({xmin_q});")
+    a(f"    int32_t tq = rc_w32((num << RC_STATE_FRAC) / ({denom}));")
+    a(f"    int32_t pos = rc_w32((int64_t)tq * ({lut_n - 1}));")
+    a("    int32_t i0 = pos >> RC_STATE_FRAC;")
+    a(f"    if (i0 < 0) i0 = 0; if (i0 > {lut_n - 2}) i0 = {lut_n - 2};")
+    a("    int32_t frac = pos - rc_w32((int64_t)i0 << RC_STATE_FRAC);")
+    a(f"    int32_t y0 = {rd}(&rc_lut[i0]);")
+    a(f"    int32_t y1 = {rd}(&rc_lut[i0 + 1]);")
+    a("    int32_t interp = rc_w32((int64_t)y0 + (((int64_t)(y1 - y0) * frac) >> RC_STATE_FRAC));")
+    a("    return rc_ws(interp);")
+    a("}")
+    a("")
+
+    # forward one step (advance rc_h) + readout into y_pred_q (state scale).
+    # The readout mirrors predict_one_q fed `u_q`.
+    a("static void rc_forward_predict(const rc_storage_t *u_q, int32_t *y_pred_q){")
+    a("    int32_t i, j, k, m;")
+    a("    for (i = 0; i < RC_N; i++) {")
+    a(f"        int32_t acc = {bias_q};")
+    a("        for (k = 0; k < RC_K; k++)")
+    a(f"            acc = rc_w32((int64_t)acc + rc_fmul({rd}(&rc_W_in[i*RC_K + k]), u_q[k], RC_SHIFT_IN));")
+    # W_res accumulation (reuses the inference-kernel snippets, indentation-aligned)
+    _OnlineWres(a, is_structured, topo, N, chain_weight_q, chain_feedback_q,
+                use_sparse, rd, rd_col)
+    a("        rc_pre[i] = rc_ws(acc);")
+    a("    }")
+    a("    for (i = 0; i < RC_N; i++) {")
+    a("        rc_storage_t act = rc_tanh((int32_t)rc_pre[i]);")
+    a(f"        rc_storage_t t1 = rc_ws(rc_fmul(rc_h[i], {one_minus_leak_q}, RC_STATE_FRAC));")
+    a(f"        rc_storage_t t2 = rc_ws(rc_fmul(act, {leak_q}, RC_STATE_FRAC));")
+    a("        rc_h[i] = rc_ws((int32_t)t1 + (int32_t)t2);")
+    a("    }")
+    a("    for (m = 0; m < RC_M; m++) {")
+    a("        int64_t out = 0;")
+    if include_bias:
+        a(f"        out += ((int64_t)1 << RC_STATE_FRAC) * (int64_t)rc_W_out[m*RC_F + {off_bias}];")
+    if include_input:
+        a("        for (k = 0; k < RC_K; k++)")
+        a(f"            out += (int64_t)rc_W_out[m*RC_F + {off_input} + k] * (int64_t)u_q[k];")
+    a("        for (j = 0; j < RC_N; j++)")
+    a(f"            out += (int64_t)rc_W_out[m*RC_F + {off_state} + j] * (int64_t)rc_h[j];")
+    a("        int64_t sh = out >> RC_STATE_FRAC;")
+    a("        if (sh < RC_QMIN) sh = RC_QMIN;")
+    a("        if (sh > RC_QMAX) sh = RC_QMAX;")
+    a("        y_pred_q[m] = (int32_t)sh;")
+    a("    }")
+    a("}")
+    a("")
+
+    a("void rc_train_reset(void){ int32_t i; for (i = 0; i < RC_N; i++) rc_h[i] = 0; }")
+    a("")
+    a("void rc_infer_step(const rc_storage_t *u_q, int32_t *y_pred_q){")
+    a("    rc_forward_predict(u_q, y_pred_q);")
+    a("}")
+    a("")
+
+    # train: forward + readout, then one LMS update of rc_W_out with
+    # column-specific shifts (bias >> state_frac, input >> 2*input_frac,
+    # state >> 2*state_frac). dw is kept full-width (int64) and the sum is
+    # saturated, matching IntegerLMSLearner._apply_lms_update.
+    a("void rc_train_step(const rc_storage_t *u_q, const int32_t *y_target_q,")
+    a("                   int32_t *y_pred_q){")
+    a("    int32_t j, k, m;")
+    a("    rc_forward_predict(u_q, y_pred_q);")
+    a("    for (m = 0; m < RC_M; m++) {")
+    a("        int64_t err = (int64_t)y_target_q[m] - (int64_t)y_pred_q[m];")
+    if include_bias:
+        a(f"        {{ int64_t dw = ((int64_t)RC_LR_Q * err) >> RC_STATE_FRAC;")
+        a(f"          rc_W_out[m*RC_F + {off_bias}] = "
+          f"rc_sadd_sat(rc_W_out[m*RC_F + {off_bias}], dw); }}")
+    if include_input:
+        a("        for (k = 0; k < RC_K; k++) {")
+        a("            int64_t prod = (int64_t)RC_LR_Q * err * (int64_t)u_q[k];")
+        a("            int64_t dw = prod >> (2 * RC_INPUT_FRAC);")
+        a(f"            rc_W_out[m*RC_F + {off_input} + k] = "
+          f"rc_sadd_sat(rc_W_out[m*RC_F + {off_input} + k], dw);")
+        a("        }")
+    a("        for (j = 0; j < RC_N; j++) {")
+    a("            int64_t prod = (int64_t)RC_LR_Q * err * (int64_t)rc_h[j];")
+    a("            int64_t dw = prod >> (2 * RC_STATE_FRAC);")
+    a(f"            rc_W_out[m*RC_F + {off_state} + j] = "
+      f"rc_sadd_sat(rc_W_out[m*RC_F + {off_state} + j], dw);")
+    a("        }")
+    a("    }")
+    a("}")
+    a("")
+    # checkpoint accessor: copy the (possibly learned) readout out as int32.
+    a("void rc_export_W_out(int32_t *dst){")
+    a("    int32_t i; for (i = 0; i < RC_M * RC_F; i++) dst[i] = (int32_t)rc_W_out[i];")
+    a("}")
+    a("")
+    return "\n".join(L)
+
+
+def _OnlineWres(a, is_structured, topo, N, chain_weight_q, chain_feedback_q,
+                use_sparse, rd, rd_col):
+    """W_res accumulation for the online forward step (8-space indent body).
+
+    Mirrors the inference kernel's accumulation but one indent level shallower
+    (the online forward loop body is indented 8 spaces, not 12).
+    """
+    if is_structured:
+        if topo == "SCR":
+            a(f"        {{ int32_t ip = (i == 0) ? {N - 1} : (i - 1);")
+            a(f"          acc = rc_w32((int64_t)acc + rc_fmul({chain_weight_q}, rc_h[ip], RC_SHIFT_RES)); }}")
+        elif topo == "DLR":
+            a("        if (i > 0)")
+            a(f"            acc = rc_w32((int64_t)acc + rc_fmul({chain_weight_q}, rc_h[i-1], RC_SHIFT_RES));")
+        elif topo == "DLRB":
+            a("        if (i > 0)")
+            a(f"            acc = rc_w32((int64_t)acc + rc_fmul({chain_weight_q}, rc_h[i-1], RC_SHIFT_RES));")
+            a("        if (i < RC_N - 1)")
+            a(f"            acc = rc_w32((int64_t)acc + rc_fmul({chain_feedback_q}, rc_h[i+1], RC_SHIFT_RES));")
+        else:
+            raise ValueError(f"_OnlineWres: unexpected topology {topo}")
+    elif use_sparse:
+        a("        { int32_t rp = RC_RD32(&rc_W_res_rowptr[i]);")
+        a("          int32_t rpe = RC_RD32(&rc_W_res_rowptr[i+1]);")
+        a("          for (j = rp; j < rpe; j++)")
+        a(f"            acc = rc_w32((int64_t)acc + rc_fmul({rd}(&rc_W_res_val[j]), "
+          f"rc_h[{rd_col}(&rc_W_res_col[j])], RC_SHIFT_RES)); }}")
+    else:
+        a("        for (j = 0; j < RC_N; j++)")
+        a(f"            acc = rc_w32((int64_t)acc + rc_fmul({rd}(&rc_W_res[i*RC_N + j]), rc_h[j], RC_SHIFT_RES));")
