@@ -322,11 +322,15 @@ def _emit_chain_sym(a, topo, N, cw_q, cf_q, rd):
 
 def emit_symmetric_online_kernel_c(qmodel: QuantizedModel,
                                     learning_rate: float,
-                                    *, sparse=None) -> str:
-    """Portable-C emitter for **on-device integer LMS** readout training.
+                                    *, normalized: bool = False,
+                                    delta: float = 1.0, sparse=None) -> str:
+    """Portable-C emitter for **on-device integer LMS / NLMS** readout training.
 
     Bit-exact with `rclite.quant.online.IntegerLMSLearner` (the Python
-    reference). Emits three entry points over a mutable RAM `rc_W_out`:
+    reference). With ``normalized=True`` the per-step update is divided by the
+    squared norm of φ = [1, u, h] (normalized LMS) — one integer division per
+    step — making the effective rate scale-invariant. Emits three entry points
+    over a mutable RAM `rc_W_out`:
 
       * ``rc_train_reset()`` — zero the reservoir state (mirrors
         ``IntegerLMSLearner.reset``).
@@ -385,6 +389,14 @@ def emit_symmetric_online_kernel_c(qmodel: QuantizedModel,
     # Learning rate quantized at state scale — a compile-time constant, baked in.
     lr_q = int(qmodel.target.quantize_state(float(learning_rate), cfg))
 
+    # NLMS squared-norm fixed point: Q*||phi||^2 accumulated at state scale.
+    shift_u = 2 * input_frac - state_frac
+    if normalized and shift_u < 0:
+        raise NotImplementedError(
+            "NLMS needs 2*input_frac >= state_frac for the squared-norm fixed "
+            f"point (input_frac={input_frac}, state_frac={state_frac})")
+    delta_q = int(float(delta) * state_scale)
+
     is_structured = rc.reservoir.topology in (
         Topology.DLR, Topology.DLRB, Topology.SCR)
     topo = rc.reservoir.topology.name
@@ -437,6 +449,10 @@ def emit_symmetric_online_kernel_c(qmodel: QuantizedModel,
     a(f"#define RC_SHIFT_IN {shift_in}")
     a(f"#define RC_SHIFT_RES {weight_frac}")
     a(f"#define RC_LR_Q ({lr_q})")
+    if normalized:
+        a(f"#define RC_NLMS 1")
+        a(f"#define RC_DELTA_Q ({delta_q})")
+        a(f"#define RC_SHIFT_U {shift_u}")
     a(f"typedef {storage_t} rc_storage_t;")
     a("")
 
@@ -463,13 +479,14 @@ def emit_symmetric_online_kernel_c(qmodel: QuantizedModel,
     a("static int32_t rc_fmul(int32_t a, int32_t b, int s){")
     a("    return rc_w32(((int64_t)a * (int64_t)b) >> s);")
     a("}")
-    # saturating add: saturate the sum to int32 (like numpy's _sadd_sat_i32),
-    # then narrow to storage width via two's-complement wrap (matches numpy's
-    # in-place assignment to the storage-dtype W_out array).
+    # saturating add into the storage range [RC_QMIN, RC_QMAX] (mirrors
+    # IntegerLMSLearner._sadd_sat). Saturating to the storage width — not
+    # int32 — is what actually prevents wrap-around: W_out is the storage
+    # dtype, so an int32 saturate would still wrap on store for narrow types.
     a("static rc_storage_t rc_sadd_sat(int32_t cur, int64_t dw){")
     a("    int64_t s = (int64_t)cur + dw;")
-    a("    if (s > (int64_t)INT32_MAX) s = (int64_t)INT32_MAX;")
-    a("    else if (s < (int64_t)INT32_MIN) s = (int64_t)INT32_MIN;")
+    a("    if (s > RC_QMAX) s = RC_QMAX;")
+    a("    else if (s < RC_QMIN) s = RC_QMIN;")
     a("    return (rc_storage_t)s;")
     a("}")
     a("")
@@ -534,30 +551,52 @@ def emit_symmetric_online_kernel_c(qmodel: QuantizedModel,
     a("}")
     a("")
 
-    # train: forward + readout, then one LMS update of rc_W_out with
+    # train: forward + readout, then one LMS / NLMS update of rc_W_out with
     # column-specific shifts (bias >> state_frac, input >> 2*input_frac,
-    # state >> 2*state_frac). dw is kept full-width (int64) and the sum is
-    # saturated, matching IntegerLMSLearner._apply_lms_update.
+    # state >> 2*state_frac). For NLMS the raw product is first divided by the
+    # squared norm (truncate toward zero, like Python's _tdiv) and the shift
+    # drops by state_frac. dw is full-width (int64); the sum saturates.
+    # Matches IntegerLMSLearner._apply_lms_update.
+    if normalized:
+        bias_dw = "((int64_t)RC_LR_Q * err) / norm"
+        input_dw = "(prod / norm) >> RC_SHIFT_U"
+        state_dw = "(prod / norm) >> RC_STATE_FRAC"
+    else:
+        bias_dw = "((int64_t)RC_LR_Q * err) >> RC_STATE_FRAC"
+        input_dw = "prod >> (2 * RC_INPUT_FRAC)"
+        state_dw = "prod >> (2 * RC_STATE_FRAC)"
     a("void rc_train_step(const rc_storage_t *u_q, const int32_t *y_target_q,")
     a("                   int32_t *y_pred_q){")
     a("    int32_t j, k, m;")
     a("    rc_forward_predict(u_q, y_pred_q);")
+    if normalized:
+        # squared norm of phi = [1, u, h] at state-scale fixed point (shared
+        # across all m; depends only on u_q and the post-step state rc_h).
+        a("    int64_t norm = RC_DELTA_Q;")
+        if include_bias:
+            a("    norm += ((int64_t)1 << RC_STATE_FRAC);")
+        if include_input:
+            a("    for (k = 0; k < RC_K; k++)")
+            a("        norm += ((int64_t)u_q[k] * (int64_t)u_q[k]) >> RC_SHIFT_U;")
+        a("    for (j = 0; j < RC_N; j++)")
+        a("        norm += ((int64_t)rc_h[j] * (int64_t)rc_h[j]) >> RC_STATE_FRAC;")
+        a("    if (norm < 1) norm = 1;")
     a("    for (m = 0; m < RC_M; m++) {")
     a("        int64_t err = (int64_t)y_target_q[m] - (int64_t)y_pred_q[m];")
     if include_bias:
-        a(f"        {{ int64_t dw = ((int64_t)RC_LR_Q * err) >> RC_STATE_FRAC;")
+        a(f"        {{ int64_t dw = {bias_dw};")
         a(f"          rc_W_out[m*RC_F + {off_bias}] = "
           f"rc_sadd_sat(rc_W_out[m*RC_F + {off_bias}], dw); }}")
     if include_input:
         a("        for (k = 0; k < RC_K; k++) {")
         a("            int64_t prod = (int64_t)RC_LR_Q * err * (int64_t)u_q[k];")
-        a("            int64_t dw = prod >> (2 * RC_INPUT_FRAC);")
+        a(f"            int64_t dw = {input_dw};")
         a(f"            rc_W_out[m*RC_F + {off_input} + k] = "
           f"rc_sadd_sat(rc_W_out[m*RC_F + {off_input} + k], dw);")
         a("        }")
     a("        for (j = 0; j < RC_N; j++) {")
     a("            int64_t prod = (int64_t)RC_LR_Q * err * (int64_t)rc_h[j];")
-    a("            int64_t dw = prod >> (2 * RC_STATE_FRAC);")
+    a(f"            int64_t dw = {state_dw};")
     a(f"            rc_W_out[m*RC_F + {off_state} + j] = "
       f"rc_sadd_sat(rc_W_out[m*RC_F + {off_state} + j], dw);")
     a("        }")

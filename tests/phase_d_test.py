@@ -218,6 +218,36 @@ def test_lms_reset_clears_state():
     assert np.allclose(s1, s2, atol=10), "reset + replay should reproduce state"
 
 
+def test_nlms_learns_constant_target_eta_near_one():
+    """Normalized LMS with eta=0.5 (no scale tuning) converges a zero readout."""
+    _, _, qm, X = _build_for_quant(target=I32FixedPoint(),
+                                       state_frac=18, input_frac=12,
+                                       weight_frac=12)
+    qm.W_out_q[:] = 0
+    learner = IntegerLMSLearner(qm, learning_rate=0.5, normalized=True)
+
+    target_val = 0.4
+    errs = []
+    for t in range(400):
+        x = X[t % len(X)].ravel()
+        y = learner.step(x, np.array([target_val]))
+        errs.append((float(y[0]) - target_val) ** 2)
+
+    mse_early = float(np.mean(errs[20:60]))
+    mse_late = float(np.mean(errs[-100:]))
+    assert mse_late < mse_early * 0.25, \
+        f"NLMS on constant target: early={mse_early:.4e}, late={mse_late:.4e}"
+
+
+def test_nlms_requires_norm_fixed_point_headroom():
+    """NLMS raises when 2*input_frac < state_frac (squared-norm underflows)."""
+    _, _, qm, _ = _build_for_quant(target=I32FixedPoint(),
+                                       state_frac=18, input_frac=8,
+                                       weight_frac=12)
+    expect_raises(NotImplementedError,
+                  IntegerLMSLearner, qm, learning_rate=0.5, normalized=True)
+
+
 TESTS = [v for k, v in list(globals().items())
          if k.startswith("test_") and callable(v)]
 

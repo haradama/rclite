@@ -26,7 +26,8 @@ from rclite import (
 )
 from rclite.runtime import RCExecutor
 from rclite.quant import (
-    QuantConfig, TanhLUTSpec, I32FixedPoint, quantize_model, IntegerLMSLearner,
+    QuantConfig, TanhLUTSpec, I32FixedPoint, I16FixedPoint,
+    quantize_model, IntegerLMSLearner,
 )
 from rclite.export.c_kernel_symmetric import emit_symmetric_online_kernel_c
 
@@ -55,14 +56,15 @@ def _model(topology=Topology.ESN_STANDARD, units=24, density=0.2, seed=7):
     return rc, exe, X, Y
 
 
-def _python_reference(qm, X, Y, lr, warmup):
+def _python_reference(qm, X, Y, lr, warmup, *, normalized=False, delta=1.0):
     """Drive IntegerLMSLearner step-by-step; capture the integer I/O streams.
 
     Mutates qm.W_out_q in place (the learned readout). Returns the per-step
     quantized inputs / targets / predictions so the C kernel can be fed the
     exact same integer stream.
     """
-    learner = IntegerLMSLearner(qm, learning_rate=lr)
+    learner = IntegerLMSLearner(qm, learning_rate=lr,
+                                normalized=normalized, delta=delta)
     exe = learner._executor
     cfg = learner.cfg
     target = learner.target
@@ -141,20 +143,23 @@ def _run_c(kernel_src, u_stream, yt_stream, warm_flags, T, K, M, F, ctype):
         return preds, final_w
 
 
-def _check(topology, *, sparse=None, lr=1e-2, warmup=20):
+def _check(topology, *, sparse=None, lr=1e-2, warmup=20,
+           target=None, cfg=None, normalized=False, delta=1.0):
     if not HAVE_GCC:
         print("  (skip: gcc not on PATH)")
         return
+    target = target or I32FixedPoint()
+    cfg = cfg or QuantConfig(state_frac=18, input_frac=12, weight_frac=12)
     rc, exe, X, Y = _model(topology=topology)
-    cfg = QuantConfig(state_frac=18, input_frac=12, weight_frac=12)
-    qm = quantize_model(rc, exe, cfg, target=I32FixedPoint(),
-                        lut=TanhLUTSpec(n=64))
+    qm = quantize_model(rc, exe, cfg, target=target, lut=TanhLUTSpec(n=64))
 
     # Generate C from the INITIAL weights before the reference mutates them.
-    kernel_src = emit_symmetric_online_kernel_c(qm, lr, sparse=sparse)
+    kernel_src = emit_symmetric_online_kernel_c(
+        qm, lr, normalized=normalized, delta=delta, sparse=sparse)
 
     T, K, M, F = X.shape[0], qm.K, qm.M, qm.F
-    u_stream, yt_stream, yp_ref, warm = _python_reference(qm, X, Y, lr, warmup)
+    u_stream, yt_stream, yp_ref, warm = _python_reference(
+        qm, X, Y, lr, warmup, normalized=normalized, delta=delta)
     w_ref = np.asarray(qm.W_out_q, dtype=np.int64)
 
     ctype = {8: "int8_t", 16: "int16_t", 32: "int32_t"}[qm.target.storage_bits]
@@ -180,6 +185,68 @@ def test_online_lms_c_structured_scr_bit_exact():
 
 def test_online_lms_c_sparse_csr_bit_exact():
     _check(Topology.ESN_STANDARD, sparse="csr")
+
+
+def test_online_lms_c_i16_bit_exact():
+    """i16 storage: saturation must clamp to the i16 range, not int32.
+
+    A deliberately large learning rate drives updates past the i16 range so
+    the saturating-add path is exercised; C must still match the reference
+    bit-for-bit (both saturate to [-32768, 32767])."""
+    _check(Topology.ESN_STANDARD, target=I16FixedPoint(),
+           cfg=QuantConfig(state_frac=10, input_frac=8, weight_frac=8),
+           lr=5e-2)
+
+
+def test_online_lms_c_i16_structured_bit_exact():
+    _check(Topology.SCR, target=I16FixedPoint(),
+           cfg=QuantConfig(state_frac=10, input_frac=8, weight_frac=8))
+
+
+def test_online_nlms_c_dense_bit_exact():
+    """Normalized LMS (η≈1): per-step squared-norm division, C vs reference."""
+    _check(Topology.ESN_STANDARD, normalized=True, lr=0.5, delta=1.0)
+
+
+def test_online_nlms_c_structured_bit_exact():
+    _check(Topology.SCR, normalized=True, lr=0.5, delta=1.0)
+
+
+def test_online_nlms_c_sparse_bit_exact():
+    _check(Topology.ESN_STANDARD, sparse="csr", normalized=True, lr=0.5)
+
+
+def test_online_nlms_c_i16_bit_exact():
+    _check(Topology.ESN_STANDARD, target=I16FixedPoint(),
+           cfg=QuantConfig(state_frac=10, input_frac=8, weight_frac=8),
+           normalized=True, lr=0.5)
+
+
+def test_online_nlms_converges_faster_than_lms():
+    """NLMS with η≈1 should learn a constant target without lr hand-tuning."""
+    if not HAVE_GCC:
+        print("  (skip: gcc not on PATH)")
+        return
+    rc, exe, X, _ = _model(topology=Topology.ESN_STANDARD)
+    cfg = QuantConfig(state_frac=18, input_frac=12, weight_frac=12)
+    qm = quantize_model(rc, exe, cfg, target=I32FixedPoint(),
+                        lut=TanhLUTSpec(n=64))
+    qm.W_out_q[:] = 0
+    lr = 0.5
+    kernel_src = emit_symmetric_online_kernel_c(qm, lr, normalized=True)
+    target_val = 0.4
+    Tn = 400
+    Xrep = np.array([X[t % X.shape[0]] for t in range(Tn)])
+    Yrep = np.full((Tn, 1), target_val)
+    u_stream, yt_stream, yp_ref, warm = _python_reference(
+        qm, Xrep, Yrep, lr, warmup=0, normalized=True)
+    yp_c, _ = _run_c(kernel_src, u_stream, yt_stream, warm,
+                     Tn, qm.K, qm.M, qm.F, "int32_t")
+    pred_f = yp_c[:, 0].astype(np.float64) / cfg.state_scale
+    mse_early = float(np.mean((pred_f[20:60] - target_val) ** 2))
+    mse_late = float(np.mean((pred_f[-100:] - target_val) ** 2))
+    assert mse_late < mse_early * 0.25, \
+        f"NLMS on constant target: early={mse_early:.4e}, late={mse_late:.4e}"
 
 
 def test_online_lms_c_learns_constant_target():
@@ -214,6 +281,13 @@ TESTS = [
     test_online_lms_c_dense_bit_exact,
     test_online_lms_c_structured_scr_bit_exact,
     test_online_lms_c_sparse_csr_bit_exact,
+    test_online_lms_c_i16_bit_exact,
+    test_online_lms_c_i16_structured_bit_exact,
+    test_online_nlms_c_dense_bit_exact,
+    test_online_nlms_c_structured_bit_exact,
+    test_online_nlms_c_sparse_bit_exact,
+    test_online_nlms_c_i16_bit_exact,
+    test_online_nlms_converges_faster_than_lms,
     test_online_lms_c_learns_constant_target,
 ]
 
