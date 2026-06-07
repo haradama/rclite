@@ -1,0 +1,5 @@
+# Default runner image for `act` (local GitHub Actions). The medium
+# catthehacker image has python + common tooling, avoiding the first-run
+# image-size prompt. Used by `mise run ci-local`.
+-P ubuntu-latest=catthehacker/ubuntu:act-latest
+--container-architecture linux/amd64

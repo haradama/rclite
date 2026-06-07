@@ -46,3 +46,50 @@ run = "nix --extra-experimental-features 'nix-command flakes' develop -c uv run 
 [tasks.bench-repro]
 description = "Run host benchmarks inside the nix devShell"
 run = "nix --extra-experimental-features 'nix-command flakes' develop -c uv run python benchmarks/compare_host_full.py"
+
+# --- Pre-commit: fast, staged-files-only quality gate ---------------------
+# Checks ONLY the Python files staged for this commit (the repo isn't fully
+# ruff-formatted yet, so a whole-repo check would block every commit). Runs
+# ruff format --check + unused-import/redefinition lint. `uvx` fetches ruff
+# ephemerally — no project dependency. Fix failures with `mise run fmt`.
+[tasks.pre-commit]
+description = "Fast pre-commit checks (ruff format + unused imports) on staged files"
+run = '''
+files=$(git diff --cached --name-only --diff-filter=ACM -- '*.py')
+if [ -z "$files" ]; then echo "pre-commit: no staged Python files"; exit 0; fi
+rc=0
+uvx ruff format --check -- $files || rc=1
+uvx ruff check --select F401,F811 -- $files || rc=1
+if [ $rc -ne 0 ]; then
+  echo ""
+  echo "pre-commit failed. Auto-fix with:  mise run fmt   (then re-stage)"
+fi
+exit $rc
+'''
+
+[tasks.fmt]
+description = "Auto-format + fix unused imports on staged Python files (ruff)"
+run = '''
+files=$(git diff --cached --name-only --diff-filter=ACM -- '*.py')
+if [ -z "$files" ]; then echo "fmt: no staged Python files"; exit 0; fi
+uvx ruff format -- $files
+uvx ruff check --select F401,F811 --fix -- $files
+echo ""
+echo "Formatted. Re-stage the changes:  git add $files"
+'''
+
+[tasks.setup-hooks]
+description = "Activate the tracked git hooks (.githooks/) for this clone"
+run = "git config core.hooksPath .githooks && echo 'git hooks -> .githooks (pre-commit active)'"
+
+# --- Local GitHub Actions via act (manual; needs Docker) ------------------
+# Runs the real CI workflow in a container. Heavy (minutes); intentionally NOT
+# in pre-commit. Requires Docker access (add yourself to the docker group:
+# `sudo usermod -aG docker $USER && newgrp docker`).
+[tasks.ci-local]
+description = "Run the GitHub Actions CI workflow locally with act (needs Docker)"
+run = '''
+command -v act >/dev/null 2>&1 || { echo "act not found (brew install act)"; exit 1; }
+docker info >/dev/null 2>&1 || { echo "Docker not accessible. Run: sudo usermod -aG docker \$USER && newgrp docker"; exit 1; }
+act push -W .github/workflows/python-package.yml
+'''

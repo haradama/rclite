@@ -20,6 +20,16 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["rclite"]
 
+[tool.ruff]
+# Match the project's hand-formatted ~79-col style.
+line-length = 79
+
+[tool.ruff.lint]
+# Pre-commit enforces a small, high-signal set (see `mise run pre-commit`):
+# F401 unused imports, F811 redefinitions. `ruff check` here also surfaces the
+# default pyflakes/pycodestyle rules when run manually.
+extend-select = ["F401", "F811"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["*_test.py"]

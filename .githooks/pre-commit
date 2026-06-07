@@ -1,0 +1,9 @@
+#!/bin/sh
+# rclite pre-commit hook (tracked; activated via `mise run setup-hooks`, i.e.
+# git config core.hooksPath .githooks). Runs the fast staged-files quality gate
+# defined in mise.toml: ruff format --check + unused-import lint.
+if command -v mise >/dev/null 2>&1; then
+    exec mise run pre-commit
+fi
+echo "pre-commit: mise not on PATH — skipping checks (install mise, or run 'mise run pre-commit')." >&2
+exit 0
