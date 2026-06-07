@@ -24,3 +24,25 @@ uv sync --extra docs
 PKGS=$(find rclite -name "__init__.py" -exec dirname {} \; | sed "s|/|.|g" | sort)
 uv run pdoc $PKGS -o docs
 '''
+
+# --- Reproducible native toolchain (flake.nix devShell) -------------------
+# These run the same commands as above, but inside `nix develop` so llc /
+# mlir-opt / qemu / simavr / avr-gcc come from the pinned LLVM-20 + cross
+# layer instead of whatever happens to be on PATH (which today resolves llc
+# to ~/opt/circt and breaks the thumbv6m/thumbv4t/wasm32 cross-compile tests).
+# Requires Nix with flakes enabled. The plain `test`/`bench` tasks above are
+# left untouched so contributors without Nix keep working as before.
+
+# `-f` enables flakes inline, so these work even if nix.conf doesn't set
+# experimental-features = nix-command flakes (the host currently does not).
+[tasks.dev]
+description = "Enter the pinned native-toolchain devShell (nix develop)"
+run = "nix --extra-experimental-features 'nix-command flakes' develop"
+
+[tasks.test-repro]
+description = "Run the full test suite inside the nix devShell (incl. MLIR/cross tests)"
+run = "nix --extra-experimental-features 'nix-command flakes' develop -c uv run python -m pytest tests"
+
+[tasks.bench-repro]
+description = "Run host benchmarks inside the nix devShell"
+run = "nix --extra-experimental-features 'nix-command flakes' develop -c uv run python benchmarks/compare_host_full.py"
