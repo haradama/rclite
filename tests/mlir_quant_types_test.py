@@ -28,16 +28,32 @@ from rclite import (
 )
 from rclite.runtime import RCExecutor
 from rclite.quant.affine import calibrate_from_data, quantize_model_affine
-from rclite.codegen.mlir_quant_types import (
-    emit_quant_types,
-    uniform_type,
-    verify,
-)
-
 
 PASS = "\033[32m[PASS]\033[0m"
 FAIL = "\033[31m[FAIL]\033[0m"
-HAVE = shutil.which("mlir-opt") is not None
+try:
+    import xdsl  # noqa: F401
+    from rclite.codegen.mlir_quant_types_xdsl import (
+        emit_quant_types_xdsl,
+        uniform_type,
+        verify,
+    )
+
+    _HAVE_XDSL = True
+except ImportError:
+    _HAVE_XDSL = False
+
+HAVE = shutil.which("mlir-opt") is not None and _HAVE_XDSL
+
+
+def _show(attr):
+    """Render an xDSL type/attribute to its MLIR text form."""
+    import io
+    from xdsl.printer import Printer
+
+    buf = io.StringIO()
+    Printer(stream=buf).print_attribute(attr)
+    return buf.getvalue()
 
 
 def _qm(pcr=False, pco=False, topology=Topology.ESN_STANDARD):
@@ -81,9 +97,15 @@ def _qm(pcr=False, pco=False, topology=Topology.ESN_STANDARD):
 
 
 def test_uniform_type_strings():
-    assert uniform_type(8, 0.031) == "!quant.uniform<i8:f32, 3.10000000e-02>"
-    assert uniform_type(8, 0.031, 15).endswith(":15>")
-    pa = uniform_type(8, np.array([0.1, 0.2, 0.3]))
+    if not _HAVE_XDSL:
+        print("  (skip: xdsl not installed)")
+        return
+    assert (
+        _show(uniform_type(8, 0.031))
+        == "!quant.uniform<i8:f32, 3.10000000e-02>"
+    )
+    assert _show(uniform_type(8, 0.031, 15)).endswith(":15>")
+    pa = _show(uniform_type(8, np.array([0.1, 0.2, 0.3])))
     assert ":f32:0, {" in pa and pa.count(",") >= 2
     print("  uniform_type: per-tensor / asymmetric / per-axis strings correct")
 
@@ -93,7 +115,7 @@ def test_per_tensor_verifies():
         print("  (skip: mlir-opt not on PATH)")
         return
     for topo in (Topology.ESN_STANDARD, Topology.SCR):
-        txt = emit_quant_types(_qm(topology=topo))
+        txt = emit_quant_types_xdsl(_qm(topology=topo))
         assert verify(txt), f"per-tensor {topo.name} did not verify"
         assert ":f32:0" not in txt  # no per-axis
     print("  per-tensor quant.uniform signature verifies (dense + structured)")
@@ -104,7 +126,7 @@ def test_per_channel_per_axis_verifies():
         print("  (skip)")
         return
     for pcr, pco in [(True, False), (False, True), (True, True)]:
-        txt = emit_quant_types(_qm(pcr=pcr, pco=pco))
+        txt = emit_quant_types_xdsl(_qm(pcr=pcr, pco=pco))
         assert verify(txt), f"per-channel ({pcr},{pco}) did not verify"
         assert ":f32:0, {" in txt, "expected per-axis quant type"
     print("  per-channel models emit verifiable per-axis quant.uniform types")

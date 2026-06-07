@@ -37,12 +37,22 @@ from rclite.quant import (
     QuantizedExecutor,
 )
 from rclite.quant.softmax_lut import SoftmaxLUTSpec, build_params, softmax_q
-from rclite.codegen import mlir_symmetric
+from rclite.codegen import mlir_jit
 
 
 PASS = "\033[32m[PASS]\033[0m"
 FAIL = "\033[31m[FAIL]\033[0m"
-HAVE = mlir_symmetric.tools_available()
+try:
+    import xdsl  # noqa: F401
+    from rclite.codegen.mlir_symmetric_xdsl import (
+        emit_symmetric_mlir_xdsl,
+    )
+
+    _HAVE_XDSL = True
+except ImportError:
+    _HAVE_XDSL = False
+
+HAVE = mlir_jit.tools_available() and _HAVE_XDSL
 
 
 def _model(M=3, K=2, units=22, topology=Topology.ESN_STANDARD, seed=4):
@@ -115,7 +125,7 @@ def _check(qm, Xt, label, head=None, sparse=None):
         ref = logits
     qx = qm.target.quantize_input_array(Xt, qm.config)
     got = (
-        mlir_symmetric.CompiledSymmetricMLIR(qm, head=head, sparse=sparse)
+        mlir_jit.jit_symmetric(qm, head=head, sparse=sparse)
         .predict_q(qx)
         .astype(np.int64)
     )
@@ -172,6 +182,9 @@ def test_heads():
 
 
 def test_i32_unsupported():
+    if not _HAVE_XDSL:
+        print("  (skip: xdsl not installed)")
+        return
     from rclite.quant import I32FixedPoint
 
     rc, exe, X = _model(M=2)
@@ -180,7 +193,7 @@ def test_i32_unsupported():
         rc, exe, cfg, lut=TanhLUTSpec(n=128), target=I32FixedPoint()
     )
     try:
-        mlir_symmetric.emit_symmetric_mlir(qm)
+        emit_symmetric_mlir_xdsl(qm)
         raise AssertionError("expected NotImplementedError for i32")
     except NotImplementedError:
         pass

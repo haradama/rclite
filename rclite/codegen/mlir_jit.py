@@ -1,0 +1,260 @@
+"""Execute MLIR kernels via the llvmlite MCJIT backend (MLIR -> LLVM IR -> JIT).
+
+This is the *bridge* in rclite's codegen story:
+
+    MLIR (arith/memref/scf, built by the xDSL constructors mlir_*_xdsl)
+      --mlir-opt-->        LLVM dialect
+      --mlir-translate-->  LLVM IR (text)
+      --llvmlite-->        MCJIT  (host execution)
+
+Why bridge to llvmlite instead of MLIR's own ExecutionEngine: rclite kernels
+bake every weight / LUT into `memref.global` constants. llvmlite's MCJIT
+materialises those constant globals correctly (it is the same backend the
+production `CompiledQuantizedRC` / `CompiledAffineRC` already use); the MLIR
+Python bindings' ExecutionEngine in the current wheels does not (reads zero /
+segfaults). This path therefore drops `llc` + `gcc` + the `.so`/dlopen step
+*and* the broken ExecutionEngine — lowering+translate stay on the (nix-pinned)
+CLI tools, execution unifies on the production MCJIT.
+
+llvmlite stays the single execution substrate; MLIR is the opt-in
+representation layer. Needs `mlir-opt` + `mlir-translate` on PATH (use the nix
+devShell for an LLVM-20 toolchain); llvmlite is already a core dependency.
+"""
+
+from __future__ import annotations
+
+import ctypes
+import pathlib
+import shutil
+import subprocess
+import tempfile
+from typing import Optional
+
+import numpy as np
+
+import llvmlite.binding as llvm
+
+# mlir-opt lowering pipeline (arith/memref/scf -> LLVM dialect), shared by the
+# JIT and cross-compile paths.
+_LOWER_PASSES = [
+    "--convert-scf-to-cf",
+    "--expand-strided-metadata",
+    "--finalize-memref-to-llvm",
+    "--convert-cf-to-llvm",
+    "--convert-arith-to-llvm",
+    "--convert-func-to-llvm",
+    "--reconcile-unrealized-casts",
+]
+# Host JIT needs only lower+translate (llvmlite does codegen); cross-compile to
+# an embedded object also needs llc.
+_TRANSLATE_TOOLS = ("mlir-opt", "mlir-translate")
+_CROSS_TOOLS = ("mlir-opt", "mlir-translate", "llc")
+_C_STORAGE = {8: ctypes.c_int8, 16: ctypes.c_int16, 32: ctypes.c_int32}
+_NP_STORAGE = {8: np.int8, 16: np.int16, 32: np.int32}
+
+
+class _MemRef1D(ctypes.Structure):
+    """1-D MLIR memref descriptor for the `_mlir_ciface_` ABI."""
+
+    _fields_ = [
+        ("alloc", ctypes.c_void_p),
+        ("align", ctypes.c_void_p),
+        ("offset", ctypes.c_int64),
+        ("size", ctypes.c_int64),
+        ("stride", ctypes.c_int64),
+    ]
+
+
+def _desc(arr: np.ndarray) -> _MemRef1D:
+    p = arr.ctypes.data_as(ctypes.c_void_p)
+    return _MemRef1D(p, p, 0, arr.shape[0], 1)
+
+
+_LLVM_READY = False
+
+
+def _ensure_llvm() -> None:
+    global _LLVM_READY
+    if not _LLVM_READY:
+        llvm.initialize_native_target()
+        llvm.initialize_native_asmprinter()
+        _LLVM_READY = True
+
+
+def tools_available() -> bool:
+    """True if the MLIR->LLVMIR CLI tools are on PATH (execution uses llvmlite)."""
+    return all(shutil.which(t) for t in _TRANSLATE_TOOLS)
+
+
+def mlir_to_llvm_ir(mlir_text: str) -> str:
+    """Lower + translate MLIR to LLVM IR text.
+
+    `mlir-opt <_LOWER_PASSES>` then `mlir-translate --mlir-to-llvmir`. The same
+    lowering pipeline the text/xDSL emitters target; only the final object
+    emission (llc/gcc) is replaced — by llvmlite downstream.
+    """
+    missing = [t for t in _TRANSLATE_TOOLS if shutil.which(t) is None]
+    if missing:
+        raise RuntimeError(f"MLIR->LLVMIR bridge needs {missing} on PATH")
+
+    def run(cmd, inp):
+        r = subprocess.run(cmd, input=inp, capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(f"{cmd[0]} failed:\n{r.stderr[:4000]}")
+        return r.stdout
+
+    lowered = run(["mlir-opt", *_LOWER_PASSES], mlir_text)
+    return run(["mlir-translate", "--mlir-to-llvmir", "-"], lowered)
+
+
+def cross_compile_object(
+    mlir_text: str, *, triple: str, cpu: str = "", features: str = ""
+) -> bytes:
+    """Cross-compile MLIR to a relocatable object for `triple` (no host link).
+
+    The MCJIT path above is host-only; this is the embedded counterpart —
+    emits a `.o` for e.g. thumbv6m (Cortex-M0), thumbv4t (GBA), wasm32 (WASM),
+    the same triples the llvmlite production path serves. Uses the same
+    lowering+translate, then retargets `llc`.
+
+    NOTE: the integer kernel stays scalar — saturating/wrapping quantized
+    arithmetic is non-associative, so SIMD vectorization would break
+    host<->device bit-exactness. `features` (e.g. "+simd128") only selects the
+    target ISA; the kernel is not vectorized.
+    """
+    missing = [t for t in _CROSS_TOOLS if shutil.which(t) is None]
+    if missing:
+        raise RuntimeError(f"MLIR cross-compile needs {missing} on PATH")
+    with tempfile.TemporaryDirectory() as td:
+        td = pathlib.Path(td)
+        (td / "rc.mlir").write_text(mlir_text)
+
+        def run(cmd):
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            if r.returncode != 0:
+                raise RuntimeError(f"{cmd[0]} failed:\n{r.stderr[:3000]}")
+            return r.stdout
+
+        (td / "rc.ll.mlir").write_text(
+            run(["mlir-opt", str(td / "rc.mlir"), *_LOWER_PASSES])
+        )
+        (td / "rc.ll").write_text(
+            run(["mlir-translate", "--mlir-to-llvmir", str(td / "rc.ll.mlir")])
+        )
+        llc = [
+            "llc",
+            "-O2",
+            f"-mtriple={triple}",
+            "-filetype=obj",
+            str(td / "rc.ll"),
+            "-o",
+            str(td / "rc.o"),
+        ]
+        if cpu:
+            llc.append(f"-mcpu={cpu}")
+        if features:
+            llc.append(f"-mattr={features}")
+        run(llc)
+        return (td / "rc.o").read_bytes()
+
+
+class CompiledMLIRJit:
+    """JIT-compile an MLIR kernel via llvmlite MCJIT and run it through ctypes.
+
+    The lowered IR is executed in-process by MCJIT (the same llvmlite backend
+    the production path uses) — no llc+gcc+.so link. Use `jit_symmetric` /
+    `jit_affine` to build + JIT from a quantized model in one call.
+
+    `mlir_text` is whatever the emitters produce (e.g.
+    `emit_symmetric_mlir_xdsl(qm)` / `emit_affine_mlir_xdsl(qm, head=...)`).
+    `classify=True` selects the i32 class-id output ABI.
+    """
+
+    def __init__(
+        self,
+        mlir_text: str,
+        *,
+        storage_bits: int,
+        M: int,
+        K: int,
+        classify: bool = False,
+        opt_level: int = 3,
+    ):
+        if storage_bits not in _C_STORAGE:
+            raise NotImplementedError(
+                f"storage width {storage_bits} unsupported"
+            )
+        _ensure_llvm()
+        self.M, self.K = M, K
+        self._classify = classify
+        self._np_in = _NP_STORAGE[storage_bits]
+        self._np_out = np.int32 if classify else self._np_in
+
+        ir_text = mlir_to_llvm_ir(mlir_text)
+        self._mod = llvm.parse_assembly(ir_text)
+        self._mod.verify()
+        tm = llvm.Target.from_triple(
+            llvm.get_default_triple()
+        ).create_target_machine(opt=opt_level)
+        self._engine = llvm.create_mcjit_compiler(self._mod, tm)
+        self._engine.finalize_object()
+        self._engine.run_static_constructors()
+
+        # The c-interface wrapper takes (i64 T, memref* X, memref* Y); the memref
+        # descriptor (_MemRef1D) is element-type agnostic, so one signature fits
+        # every storage width / head.
+        addr = self._engine.get_function_address("_mlir_ciface_rc_predict")
+        self._fn = ctypes.CFUNCTYPE(
+            None,
+            ctypes.c_int64,
+            ctypes.POINTER(_MemRef1D),
+            ctypes.POINTER(_MemRef1D),
+        )(addr)
+
+    def predict_q(self, X_q: np.ndarray) -> np.ndarray:
+        """Run the JIT kernel on pre-quantized inputs (storage dtype)."""
+        X_q = np.ascontiguousarray(X_q, dtype=self._np_in).reshape(-1)
+        T = X_q.size // self.K
+        out_len = T if self._classify else T * self.M
+        Y = np.zeros(out_len, dtype=self._np_out)
+        dx, dy = _desc(X_q), _desc(Y)
+        self._fn(ctypes.c_int64(T), ctypes.byref(dx), ctypes.byref(dy))
+        return Y if self._classify else Y.reshape(T, self.M)
+
+
+def jit_symmetric(
+    qmodel,
+    *,
+    head: Optional[str] = None,
+    sparse: Optional[str] = None,
+) -> CompiledMLIRJit:
+    """Build the symmetric MLIR (xDSL constructor) and JIT it via llvmlite."""
+    from rclite.codegen.mlir_symmetric_xdsl import emit_symmetric_mlir_xdsl
+
+    mlir_text = emit_symmetric_mlir_xdsl(qmodel, head=head, sparse=sparse)
+    return CompiledMLIRJit(
+        mlir_text,
+        storage_bits=qmodel.target.storage_bits,
+        M=qmodel.M,
+        K=qmodel.K,
+        classify=head == "classify",
+    )
+
+
+def jit_affine(
+    qmodel,
+    *,
+    head: Optional[str] = None,
+    sparse: Optional[str] = None,
+) -> CompiledMLIRJit:
+    """Build the affine MLIR (xDSL constructor) and JIT it via llvmlite."""
+    from rclite.codegen.mlir_affine_xdsl import emit_affine_mlir_xdsl
+
+    mlir_text = emit_affine_mlir_xdsl(qmodel, head=head, sparse=sparse)
+    return CompiledMLIRJit(
+        mlir_text,
+        storage_bits=qmodel.storage_bits,
+        M=qmodel.M,
+        K=qmodel.K,
+        classify=head == "classify",
+    )

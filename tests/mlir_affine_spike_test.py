@@ -36,12 +36,20 @@ from rclite.quant.affine import (
 )
 from rclite.quant.affine.lut import LUTStrategy
 from rclite.quant.softmax_lut import SoftmaxLUTSpec, build_params, softmax_q
-from rclite.codegen import mlir_affine
+from rclite.codegen import mlir_jit
 
 
 PASS = "\033[32m[PASS]\033[0m"
 FAIL = "\033[31m[FAIL]\033[0m"
-HAVE = mlir_affine.tools_available()
+try:
+    import xdsl  # noqa: F401
+    from rclite.codegen.mlir_affine_xdsl import emit_affine_mlir_xdsl
+
+    _HAVE_XDSL = True
+except ImportError:
+    _HAVE_XDSL = False
+
+HAVE = mlir_jit.tools_available() and _HAVE_XDSL
 
 
 def _model(
@@ -117,9 +125,8 @@ def _check(qm, Xt, label, head=None, sparse=None):
         )
     else:
         ref = logits
-    got = mlir_affine.CompiledAffineMLIR(qm, head=head, sparse=sparse).predict(
-        Xt
-    )
+    qx = qm.config.input.quantize_array(Xt)
+    got = mlir_jit.jit_affine(qm, head=head, sparse=sparse).predict_q(qx)
     got = got.astype(np.int64)
     d = int(np.max(np.abs(ref.reshape(got.shape) - got)))
     assert d == 0, f"{label}: MLIR vs executor max|diff|={d}"
@@ -216,13 +223,16 @@ def test_heads():
 
 
 def test_per_channel_unsupported():
+    if not _HAVE_XDSL:
+        print("  (skip: xdsl not installed)")
+        return
     rc, exe, X = _model(M=2)
     cfg = calibrate_from_data(
         rc, exe, X[:240], storage_bits=8, per_channel_W_res=True
     )
     qm = quantize_model_affine(rc, exe, cfg)
     try:
-        mlir_affine.emit_affine_mlir(qm)
+        emit_affine_mlir_xdsl(qm)
         raise AssertionError("expected NotImplementedError for per-channel")
     except NotImplementedError:
         pass

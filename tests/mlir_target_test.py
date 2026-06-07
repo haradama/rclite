@@ -10,6 +10,7 @@ only selects the ISA. Skipped when the MLIR toolchain is absent.
 
 from __future__ import annotations
 import pathlib
+import shutil
 import sys
 import traceback
 
@@ -28,13 +29,28 @@ from rclite import (
 from rclite.runtime import RCExecutor
 from rclite.quant.affine import calibrate_from_data, quantize_model_affine
 from rclite.quant import QuantConfig, TanhLUTSpec, I8Symmetric, quantize_model
-from rclite.codegen import mlir_affine, mlir_symmetric
-from rclite.codegen.mlir_affine import cross_compile_object
+from rclite.codegen import mlir_jit
+from rclite.codegen.mlir_jit import cross_compile_object
 
 
 PASS = "\033[32m[PASS]\033[0m"
 FAIL = "\033[31m[FAIL]\033[0m"
-HAVE = mlir_affine.tools_available()
+try:
+    import xdsl  # noqa: F401
+    from rclite.codegen.mlir_affine_xdsl import emit_affine_mlir_xdsl
+    from rclite.codegen.mlir_symmetric_xdsl import (
+        emit_symmetric_mlir_xdsl,
+    )
+
+    _HAVE_XDSL = True
+except ImportError:
+    _HAVE_XDSL = False
+
+HAVE = (
+    mlir_jit.tools_available()
+    and shutil.which("llc") is not None
+    and _HAVE_XDSL
+)
 
 # (triple, cpu, features)
 TARGETS = [
@@ -111,7 +127,7 @@ def test_affine_cross_compile():
     if not HAVE:
         print("  (skip: MLIR toolchain not on PATH)")
         return
-    mlir = mlir_affine.emit_affine_mlir(_affine_qm())
+    mlir = emit_affine_mlir_xdsl(_affine_qm())
     for triple, cpu, feat in TARGETS:
         obj = cross_compile_object(mlir, triple=triple, cpu=cpu, features=feat)
         assert obj and len(obj) > 0, f"{triple} {feat}: empty object"
@@ -122,7 +138,7 @@ def test_symmetric_cross_compile():
     if not HAVE:
         print("  (skip)")
         return
-    mlir = mlir_symmetric.emit_symmetric_mlir(_symmetric_qm())
+    mlir = emit_symmetric_mlir_xdsl(_symmetric_qm())
     for triple, cpu, feat in TARGETS:
         obj = cross_compile_object(mlir, triple=triple, cpu=cpu, features=feat)
         assert obj and len(obj) > 0, f"{triple} {feat}: empty object"
