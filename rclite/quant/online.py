@@ -205,3 +205,67 @@ class IntegerLMSLearner:
         ro = QuantizedExecutor(self.qmodel)
         ro.state_q = self.state_q.copy()
         return ro.predict(X)
+
+
+def collect_training_stream(qmodel: QuantizedModel, X: np.ndarray,
+                            Y: np.ndarray, *, learning_rate: float,
+                            normalized: bool = False, delta: float = 1.0,
+                            warmup: int = 0) -> dict:
+    """Drive `IntegerLMSLearner` over (X, Y); return the integer I/O streams a
+    deployed kernel must reproduce, plus the final learned readout.
+
+    This is the single source of truth for "what the on-device online kernel
+    should compute": both the bit-exact tests and the Arduino build path embed
+    these streams and assert the device reproduces them. The per-step records
+    are the *pre-quantized* integer inputs/targets (so the device stays pure
+    integer) and the reference predictions / final W_out.
+
+    NOTE: this MUTATES ``qmodel.W_out_q`` in place (online learning evolves the
+    readout). Emit any device kernel from the model BEFORE calling this, so the
+    kernel bakes the *initial* weights while the returned ``final_W_out`` is the
+    *post-training* checkpoint.
+
+    Returns a dict with keys: ``u_q`` (T, K) int32, ``y_target_q`` (T, M) int32,
+    ``y_pred_q`` (T, M) int32, ``warm`` (T,) uint8 (1 = inference-only step),
+    ``final_W_out`` (M, F) storage-dtype, ``lr_q`` int.
+    """
+    X = np.asarray(X, dtype=np.float64)
+    Y = np.asarray(Y, dtype=np.float64)
+    if X.ndim == 1:
+        X = X[:, None]
+    if Y.ndim == 1:
+        Y = Y[:, None]
+    learner = IntegerLMSLearner(qmodel, learning_rate=learning_rate,
+                                normalized=normalized, delta=delta)
+    exe = learner._executor
+    cfg = learner.cfg
+    target = learner.target
+    T, M = X.shape[0], qmodel.M
+    u_stream = np.zeros((T, qmodel.K), dtype=np.int32)
+    yt_stream = np.zeros((T, M), dtype=np.int32)
+    yp_stream = np.zeros((T, M), dtype=np.int32)
+    warm = np.zeros(T, dtype=np.uint8)
+    for t in range(T):
+        u_q = learner._quantize_input(X[t]).astype(np.int32)
+        exe.step_q(u_q)
+        state_q = exe.state_q
+        y_pred_q = exe.predict_one_q(u_q, state_q).astype(np.int32)
+        if t < warmup:
+            warm[t] = 1
+        else:
+            y_target_q = np.array(
+                [target.quantize_state(float(v), cfg) for v in Y[t]],
+                dtype=np.int32)
+            error_q = y_target_q.astype(np.int64) - y_pred_q.astype(np.int64)
+            learner._apply_lms_update(error_q, u_q, state_q)
+            yt_stream[t] = y_target_q
+        u_stream[t] = u_q
+        yp_stream[t] = y_pred_q
+    return {
+        "u_q": u_stream,
+        "y_target_q": yt_stream,
+        "y_pred_q": yp_stream,
+        "warm": warm,
+        "final_W_out": np.asarray(qmodel.W_out_q).copy(),
+        "lr_q": int(learner.lr_q),
+    }

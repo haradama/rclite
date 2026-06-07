@@ -26,7 +26,7 @@ from .quantize import quantize_model, quantize_W_out
 from .executor import QuantizedExecutor
 from .search import search_quantization, derive_frac_bits, SearchResult
 from .ir_builder import build_ir_from_quantized
-from .online import IntegerLMSLearner
+from .online import IntegerLMSLearner, collect_training_stream
 from .affine import (
     AffineParams, AffineQuantConfig,
     calibrate_from_data,
@@ -48,6 +48,7 @@ __all__ = [
     "search_quantization", "derive_frac_bits", "SearchResult",
     "build_ir_from_quantized",
     "IntegerLMSLearner",
+    "collect_training_stream",
     # Affine
     "AffineParams", "AffineQuantConfig",
     "calibrate_from_data",
