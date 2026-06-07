@@ -10,24 +10,37 @@ kernel); the float reference is the host f64 kernel cast to f32 (compared
 with a small tolerance — the dense/csr/unroll f32 kernels are mutually
 bit-exact, but f32-vs-f64 differs by rounding).
 """
+
 from __future__ import annotations
-import pathlib
 
 import numpy as np
 import llvmlite.binding as llvm
 
 from rclite import (
-    InputNode, ReservoirNode, ReadoutNode, ReservoirComputer,
-    Topology, Trainer,
+    InputNode,
+    ReservoirNode,
+    ReadoutNode,
+    ReservoirComputer,
+    Topology,
+    Trainer,
 )
 from rclite.runtime import RCExecutor
 from rclite.quant import (
-    QuantConfig, TanhLUTSpec, I32FixedPoint, LUTStrategy, quantize_model,
+    QuantConfig,
+    TanhLUTSpec,
+    I32FixedPoint,
+    LUTStrategy,
+    quantize_model,
 )
 from rclite.quant.affine import calibrate_from_data, quantize_model_affine
 from rclite.codegen.llvm import (
-    CompiledRC, CompiledQuantizedRC, CompiledAffineRC, cross_compile_rc,
-    emit_quantized_module, emit_quantized_affine_module, _ensure_all_targets,
+    CompiledRC,
+    CompiledQuantizedRC,
+    CompiledAffineRC,
+    cross_compile_rc,
+    emit_quantized_module,
+    emit_quantized_affine_module,
+    _ensure_all_targets,
 )
 from rclite.ir import sparse_passes
 
@@ -43,8 +56,8 @@ _AFFINE_BITS = {"i8": 8, "i16": 16}
 _BITS = {"i8": 8, "i16": 16, "i32": 32}
 _NP = {8: np.int8, 16: np.int16, 32: np.int32}
 
-FLOAT_EPS = 1e-2   # f32 device vs f64 host tolerance (contractive ESN, bounded)
-INT_EPS = 0.5      # integer kernels are exact → diff must round to 0
+FLOAT_EPS = 1e-2  # f32 device vs f64 host tolerance (contractive ESN, bounded)
+INT_EPS = 0.5  # integer kernels are exact → diff must round to 0
 
 
 def train_model(units, density, t_seq, seed=7):
@@ -56,12 +69,23 @@ def train_model(units, density, t_seq, seed=7):
     """
     rc = ReservoirComputer(
         input=InputNode(units=1, name="in"),
-        reservoir=ReservoirNode(units=units, topology=Topology.ESN_STANDARD,
-                                leak_rate=0.3, density=density, seed=seed,
-                                name="res"),
-        readout=ReadoutNode(units=1, trainer=Trainer.RIDGE,
-                            regularization=1e-6, washout=60,
-                            include_bias=True, include_input=True, name="out"),
+        reservoir=ReservoirNode(
+            units=units,
+            topology=Topology.ESN_STANDARD,
+            leak_rate=0.3,
+            density=density,
+            seed=seed,
+            name="res",
+        ),
+        readout=ReadoutNode(
+            units=1,
+            trainer=Trainer.RIDGE,
+            regularization=1e-6,
+            washout=60,
+            include_bias=True,
+            include_input=True,
+            name="out",
+        ),
     )
     exe = RCExecutor(rc)
     rng = np.random.default_rng(seed)
@@ -69,19 +93,22 @@ def train_model(units, density, t_seq, seed=7):
     X = series[:-1, None]
     Yt = series[1:, None]
     exe.fit(X[:900], Yt[:900])
-    return rc, exe, X[900:900 + t_seq], Yt[900:900 + t_seq], X[:900]
+    return rc, exe, X[900 : 900 + t_seq], Yt[900 : 900 + t_seq], X[:900]
 
 
 def quant_model(dtype, rc, exe, x_cal):
     """Build the quantized model for `dtype`: affine for i8/i16, symmetric i32."""
     if dtype in _AFFINE_BITS:
-        cfg = calibrate_from_data(rc, exe, x_cal,
-                                  storage_bits=_AFFINE_BITS[dtype])
+        cfg = calibrate_from_data(
+            rc, exe, x_cal, storage_bits=_AFFINE_BITS[dtype]
+        )
         return quantize_model_affine(
-            rc, exe, cfg, lut_strategy=LUTStrategy.linear_interp(64))
+            rc, exe, cfg, lut_strategy=LUTStrategy.linear_interp(64)
+        )
     cfg = QuantConfig(state_frac=16, input_frac=12, weight_frac=12)
-    return quantize_model(rc, exe, cfg, lut=TanhLUTSpec(n=128),
-                          target=I32FixedPoint())
+    return quantize_model(
+        rc, exe, cfg, lut=TanhLUTSpec(n=128), target=I32FixedPoint()
+    )
 
 
 def _host_predict(dtype, src, x_seq):
@@ -100,8 +127,9 @@ def accuracy_mse(dtype, src, x_seq, y_true):
     The on-device kernel is bit-exact with this host reference (parity gate),
     so the host MSE equals the device MSE. Depends on dtype, not the kernel.
     """
-    out = np.asarray(_host_predict(dtype, src, x_seq),
-                     dtype=np.float64).reshape(y_true.shape)
+    out = np.asarray(
+        _host_predict(dtype, src, x_seq), dtype=np.float64
+    ).reshape(y_true.shape)
     return float(np.mean((out - y_true) ** 2))
 
 
@@ -131,12 +159,20 @@ def build_object(dtype, src, sparse, *, triple, cpu, out_path):
     if dtype == "float":
         rc, exe = src
         cc = cross_compile_rc(
-            rc, exe, triple=triple, cpu=cpu, dtype="f32",
-            passes=sparse_passes(sparse, include_structural=True))
+            rc,
+            exe,
+            triple=triple,
+            cpu=cpu,
+            dtype="f32",
+            passes=sparse_passes(sparse, include_structural=True),
+        )
         cc.emit_object(str(out_path))
         return out_path
-    emit = (emit_quantized_affine_module if dtype in _AFFINE_BITS
-            else emit_quantized_module)
+    emit = (
+        emit_quantized_affine_module
+        if dtype in _AFFINE_BITS
+        else emit_quantized_module
+    )
     mod = emit(src, passes=sparse_passes(sparse, include_structural=False))
     return _optimize_and_emit(mod, triple, cpu, out_path)
 
@@ -156,8 +192,15 @@ def reference_data(dtype, src, x_seq):
         Yf = np.asarray(CompiledRC(rc, exe).predict(x_in))
         if Yf.ndim == 1:
             Yf = Yf[:, None]
-        return X, np.ascontiguousarray(Yf, np.float32), FLOAT_EPS, \
-            np.float32, K, Yf.shape[1], T
+        return (
+            X,
+            np.ascontiguousarray(Yf, np.float32),
+            FLOAT_EPS,
+            np.float32,
+            K,
+            Yf.shape[1],
+            T,
+        )
 
     npd = _NP[_BITS[dtype]]
     cfg = src.config
@@ -179,20 +222,25 @@ def reference_data(dtype, src, x_seq):
 def wres_bytes(dtype, src, sparse, N):
     """W_res table bytes for the size column (None for float / unroll)."""
     if dtype == "float":
-        return None            # float W_res table size not the headline here
+        return None  # float W_res table size not the headline here
     if sparse == "unroll":
-        return 0               # baked into code
+        return 0  # baked into code
     sb = _BITS[dtype] // 8
     if sparse is None:
         return N * N * sb
     from rclite.ir.passes.sparsify import build_csr
+
     val, col, rowptr = build_csr(np.asarray(src.W_res_q))
     col_b = 2 if N <= 32767 else 4
     return len(val) * sb + len(col) * col_b + len(rowptr) * 4
 
 
-_CTYPE = {np.float32: "float", np.int8: "int8_t",
-          np.int16: "int16_t", np.int32: "int32_t"}
+_CTYPE = {
+    np.float32: "float",
+    np.int8: "int8_t",
+    np.int16: "int16_t",
+    np.int32: "int32_t",
+}
 
 
 def emit_c_data_h(dtype, src, x_seq):
@@ -208,14 +256,18 @@ def emit_c_data_h(dtype, src, x_seq):
     else:
         fmt = lambda a: ", ".join(str(int(v)) for v in a.ravel())
         flag = ""
-    text = "\n".join([
-        flag + f"typedef {ct} rc_fw_storage_t;",
-        f"#define RC_FW_EPS {float(eps)!r}",
-        f"#define RC_FW_T {T}", f"#define RC_FW_K {Kk}", f"#define RC_FW_M {M}",
-        f"static const rc_fw_storage_t g_x[{T * Kk}] = {{{fmt(X)}}};",
-        f"static const rc_fw_storage_t g_y_ref[{T * M}] = {{{fmt(Y)}}};",
-        "",
-    ])
+    text = "\n".join(
+        [
+            flag + f"typedef {ct} rc_fw_storage_t;",
+            f"#define RC_FW_EPS {float(eps)!r}",
+            f"#define RC_FW_T {T}",
+            f"#define RC_FW_K {Kk}",
+            f"#define RC_FW_M {M}",
+            f"static const rc_fw_storage_t g_x[{T * Kk}] = {{{fmt(X)}}};",
+            f"static const rc_fw_storage_t g_y_ref[{T * M}] = {{{fmt(Y)}}};",
+            "",
+        ]
+    )
     return text, T
 
 

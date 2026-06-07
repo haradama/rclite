@@ -6,6 +6,7 @@ sources (header, startup, main, linker script, ...) needed to use it,
 and optionally provides a `run()` hook that executes the artifact on an
 emulator or host process.
 """
+
 from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -16,6 +17,7 @@ from typing import Any, Dict, List, Optional
 @dataclass
 class CompiledArtifact:
     """Files produced by `Target.compile()`."""
+
     target_name: str
     output_dir: Path
     binary: Optional[Path] = None
@@ -27,6 +29,7 @@ class CompiledArtifact:
 @dataclass
 class RunResult:
     """Outcome of `Target.run()`."""
+
     success: bool
     output: str
     returncode: int

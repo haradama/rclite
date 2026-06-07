@@ -12,6 +12,7 @@ not guarantee deterministically:
   1. the specialization *fires* (the IR shows shl / fewer fmul), and
   2. it stays bit-exact against the dense kernel on controlled weights.
 """
+
 from __future__ import annotations
 import pathlib
 import sys
@@ -22,7 +23,10 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import numpy as np
 
 from rclite.codegen.llvm import (
-    _pow2_exp, CompiledRC, CompiledQuantizedRC, CompiledAffineRC,
+    _pow2_exp,
+    CompiledRC,
+    CompiledQuantizedRC,
+    CompiledAffineRC,
 )
 from rclite.ir import SparsifyReservoir
 from rclite.ir.passes import StructuralSpecialize
@@ -36,6 +40,7 @@ FAIL = "\033[31m[FAIL]\033[0m"
 
 
 # ---------------------------------------------------------------------------
+
 
 def test_pow2_exp():
     assert _pow2_exp(1) == 0
@@ -97,9 +102,9 @@ def test_affine_int_fires_and_exact():
 
 def _float_fmul_count(exe_W_res, rc, exe, Xt):
     exe.W_res = exe_W_res
-    comp = CompiledRC(rc, exe,
-                      passes=[StructuralSpecialize(),
-                              SparsifyReservoir("unroll")])
+    comp = CompiledRC(
+        rc, exe, passes=[StructuralSpecialize(), SparsifyReservoir("unroll")]
+    )
     return comp, comp.llvm_ir.count("fmul")
 
 
@@ -111,18 +116,24 @@ def test_float_pm1_fires_and_exact():
     # Same sparsity structure, different magnitudes: the +-1 variant must
     # emit exactly two fewer fmul than the all-multiply variant.
     base = np.zeros((N, N))
-    pm1 = base.copy(); pm1[0, 1], pm1[0, 2], pm1[0, 3] = 1.0, -1.0, 0.5
-    mul = base.copy(); mul[0, 1], mul[0, 2], mul[0, 3] = 0.7, 0.6, 0.5
+    pm1 = base.copy()
+    pm1[0, 1], pm1[0, 2], pm1[0, 3] = 1.0, -1.0, 0.5
+    mul = base.copy()
+    mul[0, 1], mul[0, 2], mul[0, 3] = 0.7, 0.6, 0.5
 
     comp_pm1, n_pm1 = _float_fmul_count(pm1, rc, exe, Xt)
-    dense_pm1 = CompiledRC(rc, exe,
-                           passes=[StructuralSpecialize()]).predict(Xt)
+    dense_pm1 = CompiledRC(rc, exe, passes=[StructuralSpecialize()]).predict(
+        Xt
+    )
     _bit_exact_float = np.max(np.abs(dense_pm1 - comp_pm1.predict(Xt)))
-    assert _bit_exact_float == 0.0, f"float unroll not bit-exact: {_bit_exact_float}"
+    assert _bit_exact_float == 0.0, (
+        f"float unroll not bit-exact: {_bit_exact_float}"
+    )
 
     _, n_mul = _float_fmul_count(mul, rc, exe, Xt)
     assert n_mul - n_pm1 == 2, (
-        f"expected 2 fewer fmul for +-1 weights, got {n_mul - n_pm1}")
+        f"expected 2 fewer fmul for +-1 weights, got {n_mul - n_pm1}"
+    )
     print(f"  float: +-1 removes 2 fmul ({n_mul}->{n_pm1}), bit-exact")
 
 

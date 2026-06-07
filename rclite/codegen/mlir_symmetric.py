@@ -16,6 +16,7 @@ Scope: dense (RANDOM/ESN_STANDARD) + structured (DLR/SCR/DLRB) + CSR-sparse,
 identity preprocess, i8/i16/i32, logits/argmax/softmax heads.
 Link with gcc (PATH clang is the llvm-mos cross compiler).
 """
+
 from __future__ import annotations
 import ctypes
 import shutil
@@ -31,9 +32,12 @@ from rclite.quant.model import QuantizedModel
 
 _TOOLS = ("mlir-opt", "mlir-translate", "llc")
 _LOWER_PASSES = [
-    "--convert-scf-to-cf", "--expand-strided-metadata",
-    "--finalize-memref-to-llvm", "--convert-cf-to-llvm",
-    "--convert-arith-to-llvm", "--convert-func-to-llvm",
+    "--convert-scf-to-cf",
+    "--expand-strided-metadata",
+    "--finalize-memref-to-llvm",
+    "--convert-cf-to-llvm",
+    "--convert-arith-to-llvm",
+    "--convert-func-to-llvm",
     "--reconcile-unrealized-casts",
 ]
 _STRUCTURED = (Topology.DLR, Topology.DLRB, Topology.SCR)
@@ -42,22 +46,32 @@ _HEADS = (None, "logits", "classify", "proba")
 
 def _flat_i(arr, bits):
     np_t = {8: np.int8, 16: np.int16, 32: np.int32}[bits]
-    return ", ".join(str(int(v)) for v in np.asarray(arr).reshape(-1).astype(np_t))
+    return ", ".join(
+        str(int(v)) for v in np.asarray(arr).reshape(-1).astype(np_t)
+    )
 
 
 def _global(name, arr, bits):
     n = int(np.asarray(arr).size)
-    return (f'memref.global "private" constant @{name} : memref<{n}xi{bits}> '
-            f"= dense<[{_flat_i(arr, bits)}]>")
+    return (
+        f'memref.global "private" constant @{name} : memref<{n}xi{bits}> '
+        f"= dense<[{_flat_i(arr, bits)}]>"
+    )
 
 
 def tools_available() -> bool:
-    return all(shutil.which(t) for t in _TOOLS) and shutil.which("gcc") is not None
+    return (
+        all(shutil.which(t) for t in _TOOLS)
+        and shutil.which("gcc") is not None
+    )
 
 
-def emit_symmetric_mlir(qmodel: QuantizedModel, *,
-                        head: Optional[str] = None,
-                        sparse: Optional[str] = None) -> str:
+def emit_symmetric_mlir(
+    qmodel: QuantizedModel,
+    *,
+    head: Optional[str] = None,
+    sparse: Optional[str] = None,
+) -> str:
     if head not in _HEADS:
         raise ValueError(f"head must be one of {_HEADS}, got {head!r}")
     rc = qmodel.rc
@@ -75,7 +89,9 @@ def emit_symmetric_mlir(qmodel: QuantizedModel, *,
     if sb not in (8, 16):
         # i32 storage needs i32<->i32 cast special-casing throughout; the
         # embedded-relevant widths are i8/i16 (matches the affine emitter).
-        raise NotImplementedError("symmetric MLIR: i8/i16 storage only (i32 TODO)")
+        raise NotImplementedError(
+            "symmetric MLIR: i8/i16 storage only (i32 TODO)"
+        )
     sf = cfg.state_frac
     shift_in = cfg.weight_frac + cfg.input_frac - cfg.state_frac
     shift_res = cfg.weight_frac
@@ -97,7 +113,9 @@ def emit_symmetric_mlir(qmodel: QuantizedModel, *,
     has_logits_buf = classify or proba
     out_bits = 32 if classify else sb
     if shift_in < 0:
-        raise NotImplementedError(f"symmetric MLIR needs shift_in>=0 ({shift_in})")
+        raise NotImplementedError(
+            f"symmetric MLIR needs shift_in>=0 ({shift_in})"
+        )
     if structured:
         wsc = 1 << cfg.weight_frac
         cw_q = int(round(float(rc.reservoir.chain_weight) * wsc))
@@ -112,6 +130,7 @@ def emit_symmetric_mlir(qmodel: QuantizedModel, *,
     if not structured:
         if use_sparse:
             from rclite.ir.passes.sparsify import build_csr
+
             val, col, rptr = build_csr(np.asarray(qmodel.W_res_q))
             a(_global("Wres_val", val, sb))
             a(_global("Wres_col", col, 32))
@@ -120,10 +139,20 @@ def emit_symmetric_mlir(qmodel: QuantizedModel, *,
             a(_global("W_res", qmodel.W_res_q, sb))
     if proba:
         from rclite.quant.softmax_lut import SoftmaxLUTSpec, build_params
-        sm = build_params(SoftmaxLUTSpec(), s_diff=1.0 / state_scale,
-                          storage_bits=sb, storage_dtype=np.dtype(f"int{sb}"))
+
+        sm = build_params(
+            SoftmaxLUTSpec(),
+            s_diff=1.0 / state_scale,
+            storage_bits=sb,
+            storage_dtype=np.dtype(f"int{sb}"),
+        )
         a(_global("sm_lut", sm.lut_q, sb))
-        sm_n, sm_dmin, sm_idxf, sm_pf = sm.n, sm.dmin_q, sm.idx_frac, sm.prob_frac
+        sm_n, sm_dmin, sm_idxf, sm_pf = (
+            sm.n,
+            sm.dmin_q,
+            sm.idx_frac,
+            sm.prob_frac,
+        )
         sm_size = int(np.asarray(sm.lut_q).size)
 
     # fixed-point multiply -> i32 (wrapping): (sext(a,i64)*sext(b,i64))>>shift
@@ -192,8 +221,10 @@ def emit_symmetric_mlir(qmodel: QuantizedModel, *,
     a("}")
 
     # ---- main ----
-    a(f"func.func @rc_predict(%T: i64, %X: memref<?xi{sb}>, "
-      f"%Y: memref<?xi{out_bits}>) attributes {{llvm.emit_c_interface}} {{")
+    a(
+        f"func.func @rc_predict(%T: i64, %X: memref<?xi{sb}>, "
+        f"%Y: memref<?xi{out_bits}>) attributes {{llvm.emit_c_interface}} {{"
+    )
     a("  %c0 = arith.constant 0 : index")
     a("  %c1 = arith.constant 1 : index")
     a(f"  %cN = arith.constant {N} : index")
@@ -202,15 +233,19 @@ def emit_symmetric_mlir(qmodel: QuantizedModel, *,
     a("  %z32 = arith.constant 0 : i32")
     a("  %z64 = arith.constant 0 : i64")
     a("  %Ti = arith.index_cast %T : i64 to index")
-    a(f"  %Win = memref.get_global @W_in : memref<{N*K}xi{sb}>")
-    a(f"  %Wout = memref.get_global @W_out : memref<{M*F}xi{sb}>")
+    a(f"  %Win = memref.get_global @W_in : memref<{N * K}xi{sb}>")
+    a(f"  %Wout = memref.get_global @W_out : memref<{M * F}xi{sb}>")
     if not structured:
         if use_sparse:
-            a(f"  %WrV = memref.get_global @Wres_val : memref<{val.size}xi{sb}>")
+            a(
+                f"  %WrV = memref.get_global @Wres_val : memref<{val.size}xi{sb}>"
+            )
             a(f"  %WrC = memref.get_global @Wres_col : memref<{col.size}xi32>")
-            a(f"  %WrP = memref.get_global @Wres_rptr : memref<{rptr.size}xi32>")
+            a(
+                f"  %WrP = memref.get_global @Wres_rptr : memref<{rptr.size}xi32>"
+            )
         else:
-            a(f"  %Wres = memref.get_global @W_res : memref<{N*N}xi{sb}>")
+            a(f"  %Wres = memref.get_global @W_res : memref<{N * N}xi{sb}>")
     if proba:
         a(f"  %SM = memref.get_global @sm_lut : memref<{sm_size}xi{sb}>")
     a(f"  %h = memref.alloca() : memref<{N}xi{sb}>")
@@ -232,11 +267,13 @@ def emit_symmetric_mlir(qmodel: QuantizedModel, *,
     a("    scf.for %i = %c0 to %cN step %c1 {")
     a(f"      %biasc = arith.constant {bias_q} : i32")
     # acc_in: wrapping i32 over k
-    a("      %accin = scf.for %k = %c0 to %cK step %c1 "
-      "iter_args(%ai = %biasc) -> (i32) {")
+    a(
+        "      %accin = scf.for %k = %c0 to %cK step %c1 "
+        "iter_args(%ai = %biasc) -> (i32) {"
+    )
     a("        %iKin = arith.muli %i, %cK : index")
     a("        %widx = arith.addi %iKin, %k : index")
-    a(f"        %w = memref.load %Win[%widx] : memref<{N*K}xi{sb}>")
+    a(f"        %w = memref.load %Win[%widx] : memref<{N * K}xi{sb}>")
     a("        %xidx = arith.addi %tK, %k : index")
     a(f"        %x = memref.load %X[%xidx] : memref<?xi{sb}>")
     fmul_i32("%w", "%x", shift_in, "tin")
@@ -284,11 +321,16 @@ def emit_symmetric_mlir(qmodel: QuantizedModel, *,
     elif use_sparse:
         a("      %rp0 = memref.load %WrP[%i] : memref<" + f"{rptr.size}xi32>")
         a("      %ip1 = arith.addi %i, %c1 : index")
-        a("      %rp1 = memref.load %WrP[%ip1] : memref<" + f"{rptr.size}xi32>")
+        a(
+            "      %rp1 = memref.load %WrP[%ip1] : memref<"
+            + f"{rptr.size}xi32>"
+        )
         a("      %rp0i = arith.index_cast %rp0 : i32 to index")
         a("      %rp1i = arith.index_cast %rp1 : i32 to index")
-        a("      %accres = scf.for %p = %rp0i to %rp1i step %c1 "
-          "iter_args(%ar = %accin) -> (i32) {")
+        a(
+            "      %accres = scf.for %p = %rp0i to %rp1i step %c1 "
+            "iter_args(%ar = %accin) -> (i32) {"
+        )
         a(f"        %w = memref.load %WrV[%p] : memref<{val.size}xi{sb}>")
         a(f"        %cj = memref.load %WrC[%p] : memref<{col.size}xi32>")
         a("        %cji = arith.index_cast %cj : i32 to index")
@@ -299,10 +341,12 @@ def emit_symmetric_mlir(qmodel: QuantizedModel, *,
         a("      }")
     else:
         a("      %iN = arith.muli %i, %cN : index")
-        a("      %accres = scf.for %j = %c0 to %cN step %c1 "
-          "iter_args(%ar = %accin) -> (i32) {")
+        a(
+            "      %accres = scf.for %j = %c0 to %cN step %c1 "
+            "iter_args(%ar = %accin) -> (i32) {"
+        )
         a("        %widx = arith.addi %iN, %j : index")
-        a(f"        %w = memref.load %Wres[%widx] : memref<{N*N}xi{sb}>")
+        a(f"        %w = memref.load %Wres[%widx] : memref<{N * N}xi{sb}>")
         a(f"        %hv = memref.load %h[%j] : memref<{N}xi{sb}>")
         fmul_i32("%w", "%hv", shift_res, "tr")
         a("        %na = arith.addi %ar, %tr : i32")
@@ -315,7 +359,12 @@ def emit_symmetric_mlir(qmodel: QuantizedModel, *,
     # activation + leaky integration
     a("    scf.for %i = %c0 to %cN step %c1 {")
     a(f"      %p = memref.load %pre[%i] : memref<{N}xi{sb}>")
-    a("      %act = func.call @activate(%p) : (i" + str(sb) + ") -> i" + str(sb))
+    a(
+        "      %act = func.call @activate(%p) : (i"
+        + str(sb)
+        + ") -> i"
+        + str(sb)
+    )
     a(f"      %hold = memref.load %h[%i] : memref<{N}xi{sb}>")
     a(f"      %omlc = arith.constant {one_ml_q} : i{sb}")
     a(f"      %leakc = arith.constant {leak_q} : i{sb}")
@@ -334,17 +383,19 @@ def emit_symmetric_mlir(qmodel: QuantizedModel, *,
     if inc_b:
         a(f"      %ssc = arith.constant {state_scale} : i64")
         a(f"      %obidx = arith.addi %mF, %c0 : index")
-        a(f"      %w0 = memref.load %Wout[%obidx] : memref<{M*F}xi{sb}>")
+        a(f"      %w0 = memref.load %Wout[%obidx] : memref<{M * F}xi{sb}>")
         a("      %w064 = arith.extsi %w0 : i" + str(sb) + " to i64")
         a("      %yb = arith.muli %ssc, %w064 : i64")
     yb = "%yb" if inc_b else "%z64"
     if inc_i:
         a(f"      %ci = arith.constant {off_i} : index")
-        a("      %accoi = scf.for %k = %c0 to %cK step %c1 "
-          f"iter_args(%ao = {yb}) -> (i64) {{")
+        a(
+            "      %accoi = scf.for %k = %c0 to %cK step %c1 "
+            f"iter_args(%ao = {yb}) -> (i64) {{"
+        )
         a("        %coff = arith.addi %ci, %k : index")
         a("        %widx = arith.addi %mF, %coff : index")
-        a(f"        %w = memref.load %Wout[%widx] : memref<{M*F}xi{sb}>")
+        a(f"        %w = memref.load %Wout[%widx] : memref<{M * F}xi{sb}>")
         a("        %xidx = arith.addi %tK, %k : index")
         a(f"        %x = memref.load %X[%xidx] : memref<?xi{sb}>")
         a(f"        %w64 = arith.extsi %w : i{sb} to i64")
@@ -355,11 +406,13 @@ def emit_symmetric_mlir(qmodel: QuantizedModel, *,
         a("      }")
     yi = "%accoi" if inc_i else yb
     a(f"      %cs = arith.constant {off_s} : index")
-    a("      %accos = scf.for %j = %c0 to %cN step %c1 "
-      f"iter_args(%ao = {yi}) -> (i64) {{")
+    a(
+        "      %accos = scf.for %j = %c0 to %cN step %c1 "
+        f"iter_args(%ao = {yi}) -> (i64) {{"
+    )
     a("        %coff = arith.addi %cs, %j : index")
     a("        %widx = arith.addi %mF, %coff : index")
-    a(f"        %w = memref.load %Wout[%widx] : memref<{M*F}xi{sb}>")
+    a(f"        %w = memref.load %Wout[%widx] : memref<{M * F}xi{sb}>")
     a(f"        %hv = memref.load %h[%j] : memref<{N}xi{sb}>")
     a(f"        %w64 = arith.extsi %w : i{sb} to i64")
     a(f"        %h64 = arith.extsi %hv : i{sb} to i64")
@@ -384,8 +437,10 @@ def emit_symmetric_mlir(qmodel: QuantizedModel, *,
     # head
     if classify:
         a(f"      %bv0 = memref.load %logits[%c0] : memref<{M}xi{sb}>")
-        a("      %best:2 = scf.for %m = %c1 to %cM step %c1 "
-          f"iter_args(%bv = %bv0, %bi = %c0) -> (i{sb}, index) {{")
+        a(
+            "      %best:2 = scf.for %m = %c1 to %cM step %c1 "
+            f"iter_args(%bv = %bv0, %bi = %c0) -> (i{sb}, index) {{"
+        )
         a(f"        %v = memref.load %logits[%m] : memref<{M}xi{sb}>")
         a(f"        %gt = arith.cmpi sgt, %v, %bv : i{sb}")
         a(f"        %nv = arith.select %gt, %v, %bv : i{sb}")
@@ -397,8 +452,10 @@ def emit_symmetric_mlir(qmodel: QuantizedModel, *,
     elif proba:
         a(f"      %mx0 = memref.load %logits[%c0] : memref<{M}xi{sb}>")
         a(f"      %mx032 = arith.extsi %mx0 : i{sb} to i32")
-        a("      %mx = scf.for %m = %c1 to %cM step %c1 "
-          "iter_args(%mxa = %mx032) -> (i32) {")
+        a(
+            "      %mx = scf.for %m = %c1 to %cM step %c1 "
+            "iter_args(%mxa = %mx032) -> (i32) {"
+        )
         a(f"        %v = memref.load %logits[%m] : memref<{M}xi{sb}>")
         a(f"        %v32 = arith.extsi %v : i{sb} to i32")
         a("        %gt = arith.cmpi sgt, %v32, %mxa : i32")
@@ -410,8 +467,10 @@ def emit_symmetric_mlir(qmodel: QuantizedModel, *,
         a(f"      %smnm1 = arith.constant {sm_n - 1} : i64")
         a(f"      %idxf64 = arith.constant {sm_idxf} : i64")
         a(f"      %smnm2 = arith.constant {sm_n - 2} : i64")
-        a("      %sum = scf.for %m = %c0 to %cM step %c1 "
-          "iter_args(%sa = %z64) -> (i64) {")
+        a(
+            "      %sum = scf.for %m = %c0 to %cM step %c1 "
+            "iter_args(%sa = %z64) -> (i64) {"
+        )
         a(f"        %v = memref.load %logits[%m] : memref<{M}xi{sb}>")
         a(f"        %v32 = arith.extsi %v : i{sb} to i32")
         a("        %d0 = arith.subi %v32, %mx : i32")
@@ -475,20 +534,41 @@ def build_shared_lib(mlir_text: str, out_dir: pathlib.Path) -> pathlib.Path:
         return r.stdout
 
     (out_dir / "rc.llvm.mlir").write_text(
-        run(["mlir-opt", str(out_dir / "rc.mlir"), *_LOWER_PASSES]))
+        run(["mlir-opt", str(out_dir / "rc.mlir"), *_LOWER_PASSES])
+    )
     (out_dir / "rc.ll").write_text(
-        run(["mlir-translate", "--mlir-to-llvmir", str(out_dir / "rc.llvm.mlir")]))
-    run(["llc", "-O3", "-relocation-model=pic", "-filetype=obj",
-         str(out_dir / "rc.ll"), "-o", str(out_dir / "rc.o")])
+        run(
+            [
+                "mlir-translate",
+                "--mlir-to-llvmir",
+                str(out_dir / "rc.llvm.mlir"),
+            ]
+        )
+    )
+    run(
+        [
+            "llc",
+            "-O3",
+            "-relocation-model=pic",
+            "-filetype=obj",
+            str(out_dir / "rc.ll"),
+            "-o",
+            str(out_dir / "rc.o"),
+        ]
+    )
     so = out_dir / "rc.so"
     run(["gcc", "-shared", "-o", str(so), str(out_dir / "rc.o")])
     return so
 
 
 class _MemRef1D(ctypes.Structure):
-    _fields_ = [("alloc", ctypes.c_void_p), ("align", ctypes.c_void_p),
-                ("offset", ctypes.c_int64),
-                ("size", ctypes.c_int64), ("stride", ctypes.c_int64)]
+    _fields_ = [
+        ("alloc", ctypes.c_void_p),
+        ("align", ctypes.c_void_p),
+        ("offset", ctypes.c_int64),
+        ("size", ctypes.c_int64),
+        ("stride", ctypes.c_int64),
+    ]
 
 
 def _desc(arr):
@@ -497,8 +577,13 @@ def _desc(arr):
 
 
 class CompiledSymmetricMLIR:
-    def __init__(self, qmodel: QuantizedModel, *,
-                 head: Optional[str] = None, sparse: Optional[str] = None):
+    def __init__(
+        self,
+        qmodel: QuantizedModel,
+        *,
+        head: Optional[str] = None,
+        sparse: Optional[str] = None,
+    ):
         self.qmodel = qmodel
         self.head = head
         self.sb = qmodel.target.storage_bits
@@ -508,11 +593,15 @@ class CompiledSymmetricMLIR:
         self._tmp = tempfile.TemporaryDirectory(prefix="rc_mlir_sym_")
         so = build_shared_lib(
             emit_symmetric_mlir(qmodel, head=head, sparse=sparse),
-            pathlib.Path(self._tmp.name))
+            pathlib.Path(self._tmp.name),
+        )
         self._lib = ctypes.CDLL(str(so))
         self._fn = self._lib._mlir_ciface_rc_predict
-        self._fn.argtypes = [ctypes.c_int64,
-                             ctypes.POINTER(_MemRef1D), ctypes.POINTER(_MemRef1D)]
+        self._fn.argtypes = [
+            ctypes.c_int64,
+            ctypes.POINTER(_MemRef1D),
+            ctypes.POINTER(_MemRef1D),
+        ]
         self._fn.restype = None
 
     def predict_q(self, X_q: np.ndarray) -> np.ndarray:

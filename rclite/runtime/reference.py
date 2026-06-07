@@ -6,6 +6,7 @@ against ndarray time series.
 
 Requires numpy. Importing this module fails gracefully if numpy is missing.
 """
+
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
@@ -19,7 +20,12 @@ except ImportError as e:
 
 from rclite.core.composite import ReservoirComputer
 from rclite.core.profile import (
-    Activation, Aggregation, Distribution, Task, Topology, Trainer,
+    Activation,
+    Aggregation,
+    Distribution,
+    Task,
+    Topology,
+    Trainer,
 )
 
 
@@ -66,12 +72,15 @@ def _sample(rng, shape, distribution: Distribution):
         return rng.uniform(-1.0, 1.0, size=shape)
     if distribution == Distribution.BERNOULLI:
         return rng.choice([-1.0, 1.0], size=shape).astype(float)
-    raise NotImplementedError(f"Distribution {distribution.name} not implemented")
+    raise NotImplementedError(
+        f"Distribution {distribution.name} not implemented"
+    )
 
 
 @dataclass
 class RCExecutor:
     """Materializes a ReservoirComputer IDL description into runnable weights."""
+
     rc: ReservoirComputer
 
     W_in: "np.ndarray" = field(init=False)
@@ -168,7 +177,9 @@ class RCExecutor:
         parts.append(H)
         return np.concatenate(parts, axis=1)
 
-    def _augment_one(self, x_raw: "np.ndarray", h: "np.ndarray") -> "np.ndarray":
+    def _augment_one(
+        self, x_raw: "np.ndarray", h: "np.ndarray"
+    ) -> "np.ndarray":
         parts = []
         if self.rc.readout.include_bias:
             parts.append(np.ones(1))
@@ -207,7 +218,11 @@ class RCExecutor:
         for t in range(T):
             pre = self.W_in @ Xp[t] + self.W_res @ h + bias
             if use_fb:
-                y_prev = Y_teach[t - 1] if t > 0 else np.zeros(self.rc.readout.units)
+                y_prev = (
+                    Y_teach[t - 1]
+                    if t > 0
+                    else np.zeros(self.rc.readout.units)
+                )
                 pre = pre + self.W_fb @ y_prev
             h = (1.0 - leak) * h + leak * act(pre)
             H[t] = h
@@ -261,7 +276,9 @@ class RCExecutor:
 
     def predict(self, X: "np.ndarray") -> "np.ndarray":
         if self.W_out is None:
-            raise RuntimeError("Readout has not been trained — call fit() first")
+            raise RuntimeError(
+                "Readout has not been trained — call fit() first"
+            )
         if X.ndim == 1:
             X = X[:, None]
         H = self.collect_states(X)
@@ -275,7 +292,9 @@ class RCExecutor:
                 "readout.task == Task.CLASSIFICATION"
             )
         if self.classes_ is None:
-            raise RuntimeError("Classifier has not been trained — call fit() first")
+            raise RuntimeError(
+                "Classifier has not been trained — call fit() first"
+            )
 
     def predict_proba(self, X: "np.ndarray") -> "np.ndarray":
         """Per-step class probabilities (T, C) via softmax of the readout."""
@@ -364,7 +383,9 @@ class RCExecutor:
     def predict_sequences(self, seqs) -> "np.ndarray":
         """Per-sequence output. Regression: (S, M). Classification: labels (S,)."""
         if self.W_out is None:
-            raise RuntimeError("Readout has not been trained — call fit_sequences() first")
+            raise RuntimeError(
+                "Readout has not been trained — call fit_sequences() first"
+            )
         Z = self._sequence_features(seqs) @ self.W_out.T
         if self.rc.readout.task == Task.CLASSIFICATION:
             return self.classes_[np.argmax(Z, axis=1)]
@@ -378,7 +399,9 @@ class RCExecutor:
 
     def free_run(self, X_seed: "np.ndarray", n_steps: int) -> "np.ndarray":
         if self.W_out is None:
-            raise RuntimeError("Readout has not been trained — call fit() first")
+            raise RuntimeError(
+                "Readout has not been trained — call fit() first"
+            )
         if X_seed.ndim == 1:
             X_seed = X_seed[:, None]
         K = self.rc.input.units
@@ -551,10 +574,12 @@ class FORCETrainer(RLSTrainer):
             y_prev = np.zeros(rc.readout.units)
         else:
             y_prev = self.last_pred
-        z = (self.executor.W_in @ xp
-             + self.executor.W_res @ self.h
-             + self.executor.W_fb @ y_prev
-             + bias)
+        z = (
+            self.executor.W_in @ xp
+            + self.executor.W_res @ self.h
+            + self.executor.W_fb @ y_prev
+            + bias
+        )
         self.h = (1.0 - leak) * self.h + leak * act(z)
 
     def step(self, x, y):

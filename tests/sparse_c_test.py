@@ -7,6 +7,7 @@ for these Flash/SRAM-constrained targets; "unroll"/"auto" resolve to CSR
 here). This compiles the dense and sparse C with host gcc and asserts the
 runtime outputs are bit-identical (atol=0), for affine i8/i16 and symmetric.
 """
+
 from __future__ import annotations
 import pathlib
 import shutil
@@ -20,8 +21,12 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import numpy as np
 
 from rclite import (
-    InputNode, ReservoirNode, ReadoutNode, ReservoirComputer,
-    Activation, Topology, Trainer,
+    InputNode,
+    ReservoirNode,
+    ReadoutNode,
+    ReservoirComputer,
+    Topology,
+    Trainer,
 )
 from rclite.runtime import RCExecutor
 from rclite.quant import QuantConfig, TanhLUTSpec, quantize_model
@@ -38,12 +43,23 @@ HAVE_GCC = shutil.which("gcc") is not None
 def _model(units=40, density=0.15, seed=9):
     rc = ReservoirComputer(
         input=InputNode(units=1, name="in"),
-        reservoir=ReservoirNode(units=units, topology=Topology.ESN_STANDARD,
-                                leak_rate=0.3, density=density, seed=seed,
-                                name="res"),
-        readout=ReadoutNode(units=1, trainer=Trainer.RIDGE,
-                            regularization=1e-6, washout=40,
-                            include_bias=True, include_input=True, name="out"),
+        reservoir=ReservoirNode(
+            units=units,
+            topology=Topology.ESN_STANDARD,
+            leak_rate=0.3,
+            density=density,
+            seed=seed,
+            name="res",
+        ),
+        readout=ReadoutNode(
+            units=1,
+            trainer=Trainer.RIDGE,
+            regularization=1e-6,
+            washout=40,
+            include_bias=True,
+            include_input=True,
+            name="out",
+        ),
     )
     exe = RCExecutor(rc)
     X = np.random.default_rng(seed).standard_normal((320, 1)) * 0.15
@@ -58,25 +74,35 @@ def _run_c(kernel_src, q_x, T, K, M, ctype):
         (td / "kernel.c").write_text(kernel_src)
         xs = ", ".join(str(int(v)) for v in q_x)
         main = (
-            '#include <stdint.h>\n#include <stdio.h>\n'
-            f'extern void rc_predict(int32_t, const {ctype}*, {ctype}*);\n'
-            'int main(void){\n'
-            f'  {ctype} X[{T * K}] = {{ {xs} }};\n'
-            f'  {ctype} Y[{T * M}];\n'
-            f'  rc_predict({T}, X, Y);\n'
+            "#include <stdint.h>\n#include <stdio.h>\n"
+            f"extern void rc_predict(int32_t, const {ctype}*, {ctype}*);\n"
+            "int main(void){\n"
+            f"  {ctype} X[{T * K}] = {{ {xs} }};\n"
+            f"  {ctype} Y[{T * M}];\n"
+            f"  rc_predict({T}, X, Y);\n"
             f'  for (int i = 0; i < {T * M}; i++) printf("%d\\n", (int)Y[i]);\n'
-            '  return 0;\n}\n'
+            "  return 0;\n}\n"
         )
         (td / "main.c").write_text(main)
         exe_path = td / "a.out"
         r = subprocess.run(
-            ["gcc", "-O2", "-std=c99", "-o", str(exe_path),
-             str(td / "main.c"), str(td / "kernel.c")],
-            capture_output=True, text=True)
+            [
+                "gcc",
+                "-O2",
+                "-std=c99",
+                "-o",
+                str(exe_path),
+                str(td / "main.c"),
+                str(td / "kernel.c"),
+            ],
+            capture_output=True,
+            text=True,
+        )
         if r.returncode != 0:
             raise RuntimeError("gcc failed:\n" + r.stderr)
-        out = subprocess.run([str(exe_path)], capture_output=True,
-                             text=True).stdout
+        out = subprocess.run(
+            [str(exe_path)], capture_output=True, text=True
+        ).stdout
         vals = [int(v) for v in out.strip().split("\n")]
         return np.array(vals, dtype=np.int64).reshape(T, M)
 
@@ -95,8 +121,14 @@ def test_affine_c_sparse_bit_exact():
         q_x = cfg.input.quantize_array(Xe).astype(np.int64).reshape(-1)
         dense = _run_c(emit_affine_kernel_c(qm), q_x, T, qm.K, qm.M, ctype)
         for strat in ("csr", "auto", "unroll"):
-            sp = _run_c(emit_affine_kernel_c(qm, sparse=strat),
-                        q_x, T, qm.K, qm.M, ctype)
+            sp = _run_c(
+                emit_affine_kernel_c(qm, sparse=strat),
+                q_x,
+                T,
+                qm.K,
+                qm.M,
+                ctype,
+            )
             d = int(np.max(np.abs(dense - sp)))
             assert d == 0, f"affine i{sb} C [{strat}] diff={d}"
     print("  affine C i8/i16 sparse(csr/auto/unroll) bit-exact vs dense")
@@ -108,16 +140,25 @@ def test_symmetric_c_sparse_bit_exact():
         return
     rc, exe, X = _model(units=40)
     qm = quantize_model(
-        rc, exe, QuantConfig(state_frac=16, input_frac=12, weight_frac=12),
-        lut=TanhLUTSpec(n=128))
+        rc,
+        exe,
+        QuantConfig(state_frac=16, input_frac=12, weight_frac=12),
+        lut=TanhLUTSpec(n=128),
+    )
     Xe = X[270:295]
     T = Xe.shape[0]
     # symmetric i32 storage: input quantized at input_scale
     q_x = np.round(Xe * (1 << 12)).astype(np.int64).reshape(-1)
     dense = _run_c(emit_symmetric_kernel_c(qm), q_x, T, qm.K, qm.M, "int32_t")
     for strat in ("csr", "auto", "unroll"):
-        sp = _run_c(emit_symmetric_kernel_c(qm, sparse=strat),
-                    q_x, T, qm.K, qm.M, "int32_t")
+        sp = _run_c(
+            emit_symmetric_kernel_c(qm, sparse=strat),
+            q_x,
+            T,
+            qm.K,
+            qm.M,
+            "int32_t",
+        )
         d = int(np.max(np.abs(dense - sp)))
         assert d == 0, f"symmetric C [{strat}] diff={d}"
     print("  symmetric C sparse(csr/auto/unroll) bit-exact vs dense")

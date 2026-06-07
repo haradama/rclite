@@ -13,6 +13,7 @@ W_res storage and the per-step op count are unchanged.
 
     python benchmarks/host/per_channel_accuracy.py
 """
+
 from __future__ import annotations
 import pathlib
 import sys
@@ -22,24 +23,41 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 import numpy as np
 
 from rclite import (
-    InputNode, ReservoirNode, ReadoutNode, ReservoirComputer,
-    Activation, Topology, Trainer,
+    InputNode,
+    ReservoirNode,
+    ReadoutNode,
+    ReservoirComputer,
+    Topology,
+    Trainer,
 )
 from rclite.runtime import RCExecutor
 from rclite.quant.affine import (
-    calibrate_from_data, quantize_model_affine, AffineQuantizedExecutor,
+    calibrate_from_data,
+    quantize_model_affine,
+    AffineQuantizedExecutor,
 )
 
 
 def _train(units, density, seed):
     rc = ReservoirComputer(
         input=InputNode(units=1, name="in"),
-        reservoir=ReservoirNode(units=units, topology=Topology.ESN_STANDARD,
-                                leak_rate=0.3, density=density, seed=seed,
-                                name="res"),
-        readout=ReadoutNode(units=1, trainer=Trainer.RIDGE,
-                            regularization=1e-6, washout=100,
-                            include_bias=True, include_input=False, name="out"),
+        reservoir=ReservoirNode(
+            units=units,
+            topology=Topology.ESN_STANDARD,
+            leak_rate=0.3,
+            density=density,
+            seed=seed,
+            name="res",
+        ),
+        readout=ReadoutNode(
+            units=1,
+            trainer=Trainer.RIDGE,
+            regularization=1e-6,
+            washout=100,
+            include_bias=True,
+            include_input=False,
+            name="out",
+        ),
     )
     exe = RCExecutor(rc)
     rng = np.random.default_rng(seed)
@@ -50,18 +68,23 @@ def _train(units, density, seed):
 
 
 def _mse(rc, exe, X, Y, sb, per_channel):
-    cfg = calibrate_from_data(rc, exe, X[:800], storage_bits=sb,
-                              per_channel_W_res=per_channel)
+    cfg = calibrate_from_data(
+        rc, exe, X[:800], storage_bits=sb, per_channel_W_res=per_channel
+    )
     qm = quantize_model_affine(rc, exe, cfg)
     yq = AffineQuantizedExecutor(qm).predict(X[800:1000])
     return float(np.mean((yq - Y[800:1000]) ** 2))
 
 
 def main():
-    print("per-tensor vs per-channel W_res — affine i8 quantized MSE "
-          "(float-ref target)\n")
-    header = (f"{'N':>4} {'dens':>5} {'seed':>4} {'float MSE':>11} "
-              f"{'per-tensor':>11} {'per-channel':>12} {'ratio':>7}")
+    print(
+        "per-tensor vs per-channel W_res — affine i8 quantized MSE "
+        "(float-ref target)\n"
+    )
+    header = (
+        f"{'N':>4} {'dens':>5} {'seed':>4} {'float MSE':>11} "
+        f"{'per-tensor':>11} {'per-channel':>12} {'ratio':>7}"
+    )
     print(header)
     print("-" * len(header))
     ratios = []
@@ -74,12 +97,16 @@ def main():
             mc = _mse(rc, exe, X, Y, 8, True)
             r = mc / max(mt, 1e-12)
             ratios.append(r)
-            print(f"{units:>4} {density:>5.2f} {seed:>4} {mse_f:>11.3e} "
-                  f"{mt:>11.3e} {mc:>12.3e} {r:>6.2f}x")
+            print(
+                f"{units:>4} {density:>5.2f} {seed:>4} {mse_f:>11.3e} "
+                f"{mt:>11.3e} {mc:>12.3e} {r:>6.2f}x"
+            )
     arr = np.array(ratios)
-    print(f"\nper-channel/per-tensor MSE ratio: mean={arr.mean():.3f} "
-          f"min={arr.min():.3f} max={arr.max():.3f} "
-          f"(<1 = per-channel better). Mixed for random ESN — task-dependent.")
+    print(
+        f"\nper-channel/per-tensor MSE ratio: mean={arr.mean():.3f} "
+        f"min={arr.min():.3f} max={arr.max():.3f} "
+        f"(<1 = per-channel better). Mixed for random ESN — task-dependent."
+    )
     print("Cost: +2*N int32 (M0,n); W_res bytes and per-step ops unchanged.")
 
 

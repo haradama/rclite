@@ -1,4 +1,5 @@
 """Lower a trained ReservoirComputer into rclite IR."""
+
 from __future__ import annotations
 
 from rclite.core.composite import ReservoirComputer
@@ -7,8 +8,15 @@ from rclite.runtime.reference import RCExecutor
 
 from .module import Module
 from .ops import (
-    PreprocessInput, ReservoirStep, BuildPhi, ReadoutLinear, TimeLoop,
-    Argmax, Softmax, AccumulateState, FinalizeAggregate,
+    PreprocessInput,
+    ReservoirStep,
+    BuildPhi,
+    ReadoutLinear,
+    TimeLoop,
+    Argmax,
+    Softmax,
+    AccumulateState,
+    FinalizeAggregate,
 )
 
 
@@ -58,7 +66,9 @@ def build_ir(rc: ReservoirComputer, exe: RCExecutor, *, head=None) -> Module:
     agg = rc.readout.aggregation
 
     is_structured = rc.reservoir.topology in (
-        Topology.DLR, Topology.DLRB, Topology.SCR
+        Topology.DLR,
+        Topology.DLRB,
+        Topology.SCR,
     )
 
     weights = {"W_in": exe.W_in, "W_out": exe.W_out}
@@ -73,7 +83,8 @@ def build_ir(rc: ReservoirComputer, exe: RCExecutor, *, head=None) -> Module:
     step = ReservoirStep(
         leak=float(rc.reservoir.leak_rate),
         bias=float(rc.reservoir.bias),
-        N=N, K=K,
+        N=N,
+        K=K,
         topology=rc.reservoir.topology,
         chain_weight=float(rc.reservoir.chain_weight),
         chain_feedback=float(rc.reservoir.chain_feedback),
@@ -83,7 +94,8 @@ def build_ir(rc: ReservoirComputer, exe: RCExecutor, *, head=None) -> Module:
     build_phi = BuildPhi(
         include_bias=bool(rc.readout.include_bias),
         include_input=bool(rc.readout.include_input),
-        K=K, N=N,
+        K=K,
+        N=N,
     )
     readout = ReadoutLinear(M=M, F=F)
     head_op = _head_op(head, M)
@@ -101,17 +113,26 @@ def build_ir(rc: ReservoirComputer, exe: RCExecutor, *, head=None) -> Module:
             )
         mode = "mean" if agg == Aggregation.MEAN else "last"
         washout = int(rc.readout.washout)
-        loop = TimeLoop(body=(
-            preprocess, step,
-            AccumulateState(N=N, mode=mode, washout=washout),
-        ))
-        ops = [loop, FinalizeAggregate(N=N, mode=mode, washout=washout),
-               build_phi, readout]
+        loop = TimeLoop(
+            body=(
+                preprocess,
+                step,
+                AccumulateState(N=N, mode=mode, washout=washout),
+            )
+        )
+        ops = [
+            loop,
+            FinalizeAggregate(N=N, mode=mode, washout=washout),
+            build_phi,
+            readout,
+        ]
         if head_op is not None:
             ops.append(head_op)
 
     return Module(
-        K=K, N=N, M=M,
+        K=K,
+        N=N,
+        M=M,
         weights=weights,
         ops=ops,
         metadata={

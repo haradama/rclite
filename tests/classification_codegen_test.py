@@ -5,6 +5,7 @@ Each test trains a classifier in the reference runtime, compiles it with a
 classification head, and checks the JIT output matches the runtime
 bit-closely (logits / probabilities) or exactly (argmax class id).
 """
+
 from __future__ import annotations
 import sys
 import pathlib
@@ -15,8 +16,15 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import numpy as np
 
 from rclite import (
-    InputNode, ReservoirNode, ReadoutNode, ReservoirComputer,
-    Activation, Topology, Trainer, Task, Aggregation,
+    InputNode,
+    ReservoirNode,
+    ReadoutNode,
+    ReservoirComputer,
+    Activation,
+    Topology,
+    Trainer,
+    Task,
+    Aggregation,
 )
 from rclite.runtime import RCExecutor
 from rclite.codegen import compile_rc
@@ -29,8 +37,13 @@ ATOL = 1e-9
 
 def _reservoir(units=80, seed=1):
     return ReservoirNode(
-        units=units, activation=Activation.TANH, spectral_radius=0.9,
-        leak_rate=0.3, density=0.1, topology=Topology.RANDOM, seed=seed,
+        units=units,
+        activation=Activation.TANH,
+        spectral_radius=0.9,
+        leak_rate=0.3,
+        density=0.1,
+        topology=Topology.RANDOM,
+        seed=seed,
         name="reservoir",
     )
 
@@ -49,9 +62,14 @@ def _per_step_clf(include_input):
         input=InputNode(units=1, activation=Activation.IDENTITY, name="in"),
         reservoir=_reservoir(seed=3),
         readout=ReadoutNode(
-            units=2, activation=Activation.IDENTITY, trainer=Trainer.RIDGE,
-            regularization=1e-4, washout=100, include_input=include_input,
-            task=Task.CLASSIFICATION, name="ro",
+            units=2,
+            activation=Activation.IDENTITY,
+            trainer=Trainer.RIDGE,
+            regularization=1e-4,
+            washout=100,
+            include_input=include_input,
+            task=Task.CLASSIFICATION,
+            name="ro",
         ),
     )
     exe = RCExecutor(rc)
@@ -112,9 +130,15 @@ def _sequence_clf(aggregation):
         input=InputNode(units=1, activation=Activation.IDENTITY, name="in"),
         reservoir=_reservoir(units=120, seed=9),
         readout=ReadoutNode(
-            units=3, activation=Activation.IDENTITY, trainer=Trainer.RIDGE,
-            regularization=1e-3, washout=10, include_input=False,
-            task=Task.CLASSIFICATION, aggregation=aggregation, name="ro",
+            units=3,
+            activation=Activation.IDENTITY,
+            trainer=Trainer.RIDGE,
+            regularization=1e-3,
+            washout=10,
+            include_input=False,
+            task=Task.CLASSIFICATION,
+            aggregation=aggregation,
+            name="ro",
         ),
     )
     exe = RCExecutor(rc)
@@ -160,9 +184,15 @@ def test_sequence_include_input_not_supported():
         input=InputNode(units=1, activation=Activation.IDENTITY, name="in"),
         reservoir=_reservoir(seed=2),
         readout=ReadoutNode(
-            units=3, activation=Activation.IDENTITY, trainer=Trainer.RIDGE,
-            regularization=1e-2, washout=2, include_input=True,
-            task=Task.CLASSIFICATION, aggregation=Aggregation.MEAN, name="ro",
+            units=3,
+            activation=Activation.IDENTITY,
+            trainer=Trainer.RIDGE,
+            regularization=1e-2,
+            washout=2,
+            include_input=True,
+            task=Task.CLASSIFICATION,
+            aggregation=Aggregation.MEAN,
+            name="ro",
         ),
     )
     exe = RCExecutor(rc)
@@ -171,7 +201,9 @@ def test_sequence_include_input_not_supported():
         compile_rc(rc, exe, head="classify")
     except NotImplementedError:
         return
-    raise AssertionError("expected NotImplementedError for include_input + aggregation")
+    raise AssertionError(
+        "expected NotImplementedError for include_input + aggregation"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +213,7 @@ def test_sequence_include_input_not_supported():
 def test_classify_header_declares_int_output():
     rc, exe, _ = _per_step_clf(include_input=False)
     import tempfile
+
     jit = compile_rc(rc, exe, head="classify")
     with tempfile.NamedTemporaryFile(suffix=".h", delete=False, mode="w") as f:
         path = f.name
@@ -194,8 +227,11 @@ def test_classify_header_declares_int_output():
         pathlib.Path(path).unlink(missing_ok=True)
 
 
-TESTS = [v for k, v in list(globals().items())
-         if k.startswith("test_") and callable(v)]
+TESTS = [
+    v
+    for k, v in list(globals().items())
+    if k.startswith("test_") and callable(v)
+]
 
 
 def main() -> int:

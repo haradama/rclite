@@ -4,6 +4,7 @@ Verifies target metadata, quantize_model storage dtype, IR dtype mapping,
 and bit-exact parity between the Python `QuantizedExecutor` and the LLVM
 JIT-compiled i8 kernel.
 """
+
 from __future__ import annotations
 import pathlib
 import sys
@@ -14,13 +15,21 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import numpy as np
 
 from rclite import (
-    InputNode, ReservoirNode, ReadoutNode, ReservoirComputer,
-    Activation, Distribution, Topology, Trainer,
+    InputNode,
+    ReservoirNode,
+    ReadoutNode,
+    ReservoirComputer,
+    Distribution,
+    Topology,
+    Trainer,
 )
 from rclite.runtime import RCExecutor
 from rclite.quant import (
-    QuantConfig, TanhLUTSpec, I8Symmetric,
-    quantize_model, QuantizedExecutor,
+    QuantConfig,
+    TanhLUTSpec,
+    I8Symmetric,
+    quantize_model,
+    QuantizedExecutor,
     build_ir_from_quantized,
 )
 from rclite.quant._intops import wrap_to_storage
@@ -39,29 +48,52 @@ def expect_raises(exc_type, fn, *args, **kwargs):
     raise AssertionError(f"Expected {exc_type.__name__}, none raised")
 
 
-def _build_for_i8(units=24, topology=Topology.SCR, state_frac=5,
-                   input_frac=4, weight_frac=4,
-                   input_offset=0.0, input_scaling=1.0):
+def _build_for_i8(
+    units=24,
+    topology=Topology.SCR,
+    state_frac=5,
+    input_frac=4,
+    weight_frac=4,
+    input_offset=0.0,
+    input_scaling=1.0,
+):
     rc = ReservoirComputer(
-        input=InputNode(units=1, input_offset=input_offset,
-                        input_scaling=input_scaling,
-                        input_distribution=Distribution.BERNOULLI, name="in"),
-        reservoir=ReservoirNode(units=units, topology=topology,
-                                 chain_weight=0.9, leak_rate=0.3, seed=42,
-                                 name="res"),
-        readout=ReadoutNode(units=1, trainer=Trainer.RIDGE,
-                             regularization=1e-6, washout=40,
-                             include_bias=True, include_input=True, name="out"),
+        input=InputNode(
+            units=1,
+            input_offset=input_offset,
+            input_scaling=input_scaling,
+            input_distribution=Distribution.BERNOULLI,
+            name="in",
+        ),
+        reservoir=ReservoirNode(
+            units=units,
+            topology=topology,
+            chain_weight=0.9,
+            leak_rate=0.3,
+            seed=42,
+            name="res",
+        ),
+        readout=ReadoutNode(
+            units=1,
+            trainer=Trainer.RIDGE,
+            regularization=1e-6,
+            washout=40,
+            include_bias=True,
+            include_input=True,
+            name="out",
+        ),
     )
     exe = RCExecutor(rc)
     rng = np.random.default_rng(0)
     X = rng.standard_normal((250, 1)) * 0.15
     Y = np.sin(np.arange(250) * 0.1)[:, None]
     exe.fit(X, Y)
-    cfg = QuantConfig(state_frac=state_frac, input_frac=input_frac,
-                       weight_frac=weight_frac)
-    qm = quantize_model(rc, exe, cfg, target=I8Symmetric(),
-                         lut=TanhLUTSpec(n=32))
+    cfg = QuantConfig(
+        state_frac=state_frac, input_frac=input_frac, weight_frac=weight_frac
+    )
+    qm = quantize_model(
+        rc, exe, cfg, target=I8Symmetric(), lut=TanhLUTSpec(n=32)
+    )
     return rc, exe, qm, X
 
 
@@ -94,18 +126,19 @@ def test_i8_rejects_too_large_state_frac():
     cfg_bad = QuantConfig(state_frac=7, input_frac=4, weight_frac=4)
     rc = ReservoirComputer(
         input=InputNode(units=1, input_distribution=Distribution.BERNOULLI),
-        reservoir=ReservoirNode(units=8, topology=Topology.SCR,
-                                 chain_weight=0.9, leak_rate=0.3),
-        readout=ReadoutNode(units=1, trainer=Trainer.RIDGE,
-                             include_bias=True),
+        reservoir=ReservoirNode(
+            units=8, topology=Topology.SCR, chain_weight=0.9, leak_rate=0.3
+        ),
+        readout=ReadoutNode(units=1, trainer=Trainer.RIDGE, include_bias=True),
     )
     exe = RCExecutor(rc)
     rng = np.random.default_rng(0)
     X = rng.standard_normal((100, 1)) * 0.2
     Y = np.zeros((100, 1))
     exe.fit(X, Y)
-    expect_raises(ValueError, quantize_model, rc, exe, cfg_bad,
-                   target=I8Symmetric())
+    expect_raises(
+        ValueError, quantize_model, rc, exe, cfg_bad, target=I8Symmetric()
+    )
 
 
 def test_i8_accepts_state_frac_up_to_6():
@@ -213,7 +246,9 @@ def test_i8_parity_dlrb():
 
 def test_i8_parity_with_input_offset_and_scaling():
     _, _, qm, X = _build_for_i8(
-        topology=Topology.SCR, input_offset=0.3, input_scaling=1.5,
+        topology=Topology.SCR,
+        input_offset=0.3,
+        input_scaling=1.5,
     )
     _assert_jit_parity(qm, X[150:180])
 
@@ -230,17 +265,27 @@ def test_i8_parity_across_state_frac():
 def test_i8_weight_footprint_quarter_of_i32():
     """i8 weight globals should occupy 1/4 the bytes of the equivalent i32."""
     from rclite.quant import I32FixedPoint
+
     rc, exe, qm_i8, _ = _build_for_i8()
-    qm_i32 = quantize_model(rc, exe, qm_i8.config,
-                              target=I32FixedPoint(), lut=TanhLUTSpec(n=32))
-    bytes_i8 = qm_i8.W_in_q.nbytes + qm_i8.W_res_q.nbytes + qm_i8.W_out_q.nbytes
-    bytes_i32 = qm_i32.W_in_q.nbytes + qm_i32.W_res_q.nbytes + qm_i32.W_out_q.nbytes
-    assert bytes_i8 * 4 == bytes_i32, \
+    qm_i32 = quantize_model(
+        rc, exe, qm_i8.config, target=I32FixedPoint(), lut=TanhLUTSpec(n=32)
+    )
+    bytes_i8 = (
+        qm_i8.W_in_q.nbytes + qm_i8.W_res_q.nbytes + qm_i8.W_out_q.nbytes
+    )
+    bytes_i32 = (
+        qm_i32.W_in_q.nbytes + qm_i32.W_res_q.nbytes + qm_i32.W_out_q.nbytes
+    )
+    assert bytes_i8 * 4 == bytes_i32, (
         f"i8 bytes={bytes_i8} i32 bytes={bytes_i32}"
+    )
 
 
-TESTS = [v for k, v in list(globals().items())
-         if k.startswith("test_") and callable(v)]
+TESTS = [
+    v
+    for k, v in list(globals().items())
+    if k.startswith("test_") and callable(v)
+]
 
 
 def main() -> int:

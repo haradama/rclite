@@ -14,10 +14,10 @@ Currently supports: tanh / sigmoid / relu / identity activations; any
 topology (DLR/DLRB/SCR/RANDOM); include_bias / include_input readout
 features; RIDGE/PINV-trained readouts.
 """
+
 from __future__ import annotations
 import ctypes
 from contextlib import contextmanager
-from typing import Optional
 
 import numpy as np
 from llvmlite import ir
@@ -59,7 +59,10 @@ _I32 = ir.IntType(32)
 # Float activations the LLVM backend can emit (matches the reference runtime).
 # tanh/sigmoid import libm (tanh[f]/exp[f]); relu/identity import nothing.
 _SUPPORTED_ACTIVATIONS = (
-    Activation.TANH, Activation.SIGMOID, Activation.RELU, Activation.IDENTITY,
+    Activation.TANH,
+    Activation.SIGMOID,
+    Activation.RELU,
+    Activation.IDENTITY,
 )
 
 
@@ -187,8 +190,12 @@ class _Lowerer:
 
     def __init__(self, ir_module, dtype: str):
         from rclite.ir.ops import (
-            ReadoutLinear, BuildPhi, FusedStepReadout, TimeLoop,
-            Argmax, Softmax, AccumulateState,
+            ReadoutLinear,
+            BuildPhi,
+            FusedStepReadout,
+            Argmax,
+            Softmax,
+            AccumulateState,
         )
 
         self.ir_module = ir_module
@@ -209,7 +216,8 @@ class _Lowerer:
         self.out_int = any(isinstance(op, Argmax) for op in flat)
         self.has_head = any(isinstance(op, (Argmax, Softmax)) for op in flat)
         self.needs_state_sum = any(
-            isinstance(op, AccumulateState) and op.mode == "mean" for op in flat
+            isinstance(op, AccumulateState) and op.mode == "mean"
+            for op in flat
         )
         out_ty = _I32 if self.out_int else self.fty
 
@@ -225,36 +233,46 @@ class _Lowerer:
         )
         self.fn = ir.Function(self.module, fnty, name="rc_predict")
         self.T_arg, self.X_arg, self.Y_arg = self.fn.args
-        self.T_arg.name = "T"; self.X_arg.name = "X"; self.Y_arg.name = "Y"
+        self.T_arg.name = "T"
+        self.X_arg.name = "X"
+        self.Y_arg.name = "Y"
 
         entry = self.fn.append_basic_block("entry")
         self.b = ir.IRBuilder(entry)
 
         # Determine scratch sizes
         needs_phi = any(
-            isinstance(op, (ReadoutLinear, BuildPhi))
-            for op in flat
+            isinstance(op, (ReadoutLinear, BuildPhi)) for op in flat
         )
-        max_F = max((op.F for op in flat
-                      if isinstance(op, (ReadoutLinear, FusedStepReadout))),
-                     default=self.N + self.K + 1)
+        max_F = max(
+            (
+                op.F
+                for op in flat
+                if isinstance(op, (ReadoutLinear, FusedStepReadout))
+            ),
+            default=self.N + self.K + 1,
+        )
 
         self.h = self.b.alloca(self.fty, size=_ci(self.N), name="h")
         self.u_pre = self.b.alloca(self.fty, size=_ci(self.K), name="u_pre")
         self.pre_arr = self.b.alloca(self.fty, size=_ci(self.N), name="pre")
         self.phi_arr = (
             self.b.alloca(self.fty, size=_ci(max(max_F, 1)), name="phi")
-            if needs_phi else None
+            if needs_phi
+            else None
         )
         self.acc = self.b.alloca(self.fty, name="acc")
         # Logits scratch when a classification head consumes the readout.
         self.logits = (
             self.b.alloca(self.fty, size=_ci(max(self.M, 1)), name="logits")
-            if self.has_head else None
+            if self.has_head
+            else None
         )
         # Running state sum + step count for MEAN time-pooling.
         if self.needs_state_sum:
-            self.h_sum = self.b.alloca(self.fty, size=_ci(self.N), name="h_sum")
+            self.h_sum = self.b.alloca(
+                self.fty, size=_ci(self.N), name="h_sum"
+            )
             with _loop(self.b, _ci(self.N), "sinit") as i:
                 _store1d(self.b, self.h_sum, i, self._cf(0.0))
         else:
@@ -264,7 +282,7 @@ class _Lowerer:
         with _loop(self.b, _ci(self.N), "init") as i:
             _store1d(self.b, self.h, i, self._cf(0.0))
 
-        self.t = None    # current time index, valid inside a TimeLoop body
+        self.t = None  # current time index, valid inside a TimeLoop body
         self.row = None  # current output row (= t per-step, = 0 post-loop)
 
     def _cf(self, v):
@@ -279,7 +297,9 @@ class _Lowerer:
         fn = self._libm_cache.get(name)
         if fn is None:
             fn = ir.Function(
-                self.module, ir.FunctionType(self.fty, [self.fty]), name=name,
+                self.module,
+                ir.FunctionType(self.fty, [self.fty]),
+                name=name,
             )
             self._libm_cache[name] = fn
         return fn
@@ -328,6 +348,7 @@ class _Lowerer:
 
     def _flatten_ops(self):
         from rclite.ir.ops import TimeLoop
+
         for op in self.ir_module.ops:
             yield op
             if isinstance(op, TimeLoop):
@@ -341,10 +362,18 @@ class _Lowerer:
 
     def _lower(self, op):
         from rclite.ir.ops import (
-            TimeLoop, PreprocessInput, ReservoirStep, BuildPhi,
-            ReadoutLinear, FusedStepReadout,
-            Argmax, Softmax, AccumulateState, FinalizeAggregate,
+            TimeLoop,
+            PreprocessInput,
+            ReservoirStep,
+            BuildPhi,
+            ReadoutLinear,
+            FusedStepReadout,
+            Argmax,
+            Softmax,
+            AccumulateState,
+            FinalizeAggregate,
         )
+
         if isinstance(op, TimeLoop):
             return self._lower_time_loop(op)
         if isinstance(op, PreprocessInput):
@@ -382,10 +411,15 @@ class _Lowerer:
         # Unroll body by `K_unroll` over [0, T_unrolled), tail loop for remainder.
         K_const = _ci(K_unroll)
         T_unrolled = self.b.mul(self.b.sdiv(T, K_const), K_const)
-        with _loop_strided(self.b, _ci(0), T_unrolled, K_const, "tu") as t_base:
+        with _loop_strided(
+            self.b, _ci(0), T_unrolled, K_const, "tu"
+        ) as t_base:
             for k in range(K_unroll):
-                self.t = (t_base if k == 0
-                          else self.b.add(t_base, _ci(k), name=f"t_{k}"))
+                self.t = (
+                    t_base
+                    if k == 0
+                    else self.b.add(t_base, _ci(k), name=f"t_{k}")
+                )
                 self.row = self.t
                 for body_op in op.body:
                     self._lower(body_op)
@@ -441,8 +475,9 @@ class _Lowerer:
                 with _loop(b, _ci(op.K), "kin") as k:
                     w = _load2d_global(b, g_Win, op.K, _ci(i), k)
                     u_val = _load1d(b, self.u_pre, k)
-                    b.store(b.fadd(b.load(self.acc), b.fmul(w, u_val)),
-                            self.acc)
+                    b.store(
+                        b.fadd(b.load(self.acc), b.fmul(w, u_val)), self.acc
+                    )
                 for j, wv in spec.rows[i]:
                     hv = _load1d(b, self.h, _ci(j))
                     # Value specialization: w==+-1 needs no fmul (fmul by an
@@ -454,8 +489,9 @@ class _Lowerer:
                     elif wv == -1.0:
                         acc = b.fsub(b.load(self.acc), hv)
                     else:
-                        acc = b.fadd(b.load(self.acc),
-                                     b.fmul(self._cf(wv), hv))
+                        acc = b.fadd(
+                            b.load(self.acc), b.fmul(self._cf(wv), hv)
+                        )
                     b.store(acc, self.acc)
                 _store1d(b, self.pre_arr, _ci(i), b.load(self.acc))
             return
@@ -469,8 +505,14 @@ class _Lowerer:
             if spec is not None:
                 self._emit_res_contrib_csr(spec, i)
             else:
-                self._emit_res_contrib(op.topology, op.N, op.chain_weight,
-                                        op.chain_feedback, g_Wres, i)
+                self._emit_res_contrib(
+                    op.topology,
+                    op.N,
+                    op.chain_weight,
+                    op.chain_feedback,
+                    g_Wres,
+                    i,
+                )
             _store1d(b, self.pre_arr, i, b.load(self.acc))
 
     def _emit_res_contrib_csr(self, spec, i):
@@ -487,8 +529,9 @@ class _Lowerer:
             hv = _load1d(b, self.h, j)
             b.store(b.fadd(b.load(self.acc), b.fmul(w, hv)), self.acc)
 
-    def _emit_res_contrib(self, topology, N, chain_weight, chain_feedback,
-                           g_Wres, i):
+    def _emit_res_contrib(
+        self, topology, N, chain_weight, chain_feedback, g_Wres, i
+    ):
         b = self.b
         cf = self._cf
         if topology == Topology.DLR:
@@ -501,23 +544,27 @@ class _Lowerer:
             is_zero = b.icmp_signed("==", i, _ci(0))
             i_prev = b.select(is_zero, _ci(N - 1), b.sub(i, _ci(1)))
             val = _load1d(b, self.h, i_prev)
-            b.store(b.fadd(b.load(self.acc),
-                            b.fmul(cf(chain_weight), val)), self.acc)
+            b.store(
+                b.fadd(b.load(self.acc), b.fmul(cf(chain_weight), val)),
+                self.acc,
+            )
         elif topology == Topology.DLRB:
             is_pos = b.icmp_signed(">", i, _ci(0))
             i_back = b.select(is_pos, b.sub(i, _ci(1)), _ci(0))
             val_back = _load1d(b, self.h, i_back)
-            contrib_back = b.select(is_pos,
-                                     b.fmul(cf(chain_weight), val_back),
-                                     cf(0.0))
+            contrib_back = b.select(
+                is_pos, b.fmul(cf(chain_weight), val_back), cf(0.0)
+            )
             is_lt_last = b.icmp_signed("<", i, _ci(N - 1))
             i_fwd = b.select(is_lt_last, b.add(i, _ci(1)), _ci(N - 1))
             val_fwd = _load1d(b, self.h, i_fwd)
-            contrib_fwd = b.select(is_lt_last,
-                                    b.fmul(cf(chain_feedback), val_fwd),
-                                    cf(0.0))
-            b.store(b.fadd(b.fadd(b.load(self.acc), contrib_back),
-                            contrib_fwd), self.acc)
+            contrib_fwd = b.select(
+                is_lt_last, b.fmul(cf(chain_feedback), val_fwd), cf(0.0)
+            )
+            b.store(
+                b.fadd(b.fadd(b.load(self.acc), contrib_back), contrib_fwd),
+                self.acc,
+            )
         else:
             with _loop(b, _ci(N), "jres") as j:
                 w = _load2d_global(b, g_Wres, N, i, j)
@@ -535,13 +582,15 @@ class _Lowerer:
         if op.include_input:
             with _loop(self.b, _ci(op.K), "kphi") as k:
                 x_val = _load1d(self.b, self.X_arg, self.b.add(tK, k))
-                _store1d(self.b, self.phi_arr,
-                          self.b.add(_ci(off), k), x_val)
+                _store1d(self.b, self.phi_arr, self.b.add(_ci(off), k), x_val)
             off += op.K
         with _loop(self.b, _ci(op.N), "iphi") as i:
-            _store1d(self.b, self.phi_arr,
-                      self.b.add(_ci(off), i),
-                      _load1d(self.b, self.h, i))
+            _store1d(
+                self.b,
+                self.phi_arr,
+                self.b.add(_ci(off), i),
+                _load1d(self.b, self.h, i),
+            )
 
     def _lower_readout_linear(self, op):
         g_Wout = self.globals[op.W_out_name]
@@ -558,8 +607,12 @@ class _Lowerer:
             if self.logits is not None:
                 _store1d(self.b, self.logits, m, self.b.load(self.acc))
             else:
-                _store1d(self.b, self.Y_arg, self.b.add(tM, m),
-                          self.b.load(self.acc))
+                _store1d(
+                    self.b,
+                    self.Y_arg,
+                    self.b.add(tM, m),
+                    self.b.load(self.acc),
+                )
 
     def _lower_fused(self, op):
         """Step + readout in one op: no phi buffer materialization."""
@@ -595,14 +648,17 @@ class _Lowerer:
                 b.store(b.fadd(b.load(self.acc), w_bias), self.acc)
             if op.include_input_phi:
                 with _loop(b, _ci(op.K), "kfo") as k:
-                    w = _load2d_global(b, g_Wout, op.F, m,
-                                        b.add(_ci(bias_off), k))
+                    w = _load2d_global(
+                        b, g_Wout, op.F, m, b.add(_ci(bias_off), k)
+                    )
                     x_val = _load1d(b, self.X_arg, b.add(tK, k))
-                    b.store(b.fadd(b.load(self.acc), b.fmul(w, x_val)),
-                             self.acc)
+                    b.store(
+                        b.fadd(b.load(self.acc), b.fmul(w, x_val)), self.acc
+                    )
             with _loop(b, _ci(op.N), "ifo") as i:
-                w = _load2d_global(b, g_Wout, op.F, m,
-                                    b.add(_ci(input_off), i))
+                w = _load2d_global(
+                    b, g_Wout, op.F, m, b.add(_ci(input_off), i)
+                )
                 hv = _load1d(b, self.h, i)
                 b.store(b.fadd(b.load(self.acc), b.fmul(w, hv)), self.acc)
             if self.logits is not None:
@@ -618,8 +674,9 @@ class _Lowerer:
         b = self.b
         w_const = _ci(washout)
         t_minus1 = b.sub(self.T_arg, _ci(1))
-        return b.select(b.icmp_signed("<", w_const, self.T_arg),
-                        w_const, t_minus1)
+        return b.select(
+            b.icmp_signed("<", w_const, self.T_arg), w_const, t_minus1
+        )
 
     def _lower_accumulate_state(self, op):
         """mode='mean': h_sum += h for t >= min(washout, T-1).
@@ -697,8 +754,14 @@ class _Lowerer:
             _store1d(b, self.Y_arg, b.add(tM, m), b.fdiv(e, denom))
 
 
-def emit_module(rc: ReservoirComputer, exe: RCExecutor,
-                *, dtype: str = "f64", passes=None, head=None) -> ir.Module:
+def emit_module(
+    rc: ReservoirComputer,
+    exe: RCExecutor,
+    *,
+    dtype: str = "f64",
+    passes=None,
+    head=None,
+) -> ir.Module:
     """Build an rclite IR module, apply passes, and lower to LLVM IR.
 
     `dtype` selects f64 (host) vs f32 (Cortex-M cross-compile).
@@ -726,8 +789,9 @@ def emit_module(rc: ReservoirComputer, exe: RCExecutor,
     return _Lowerer(ir_module, dtype=dtype).lower()
 
 
-def emit_quantized_module(qmodel, *, passes=None,
-                            saturating: bool = True, head=None) -> ir.Module:
+def emit_quantized_module(
+    qmodel, *, passes=None, saturating: bool = True, head=None
+) -> ir.Module:
     """Build LLVM IR for the integer quantized path (i32, i16, or i8).
 
     Function signature:
@@ -785,8 +849,11 @@ class _IntLowerer:
 
     def __init__(self, ir_module, *, saturating: bool = True):
         from rclite.ir.ops import (
-            TimeLoop, ReservoirStep, BuildPhi, ReadoutLinear, FusedStepReadout,
-            Argmax, Softmax,
+            BuildPhi,
+            ReadoutLinear,
+            FusedStepReadout,
+            Argmax,
+            Softmax,
         )
 
         self.ir_module = ir_module
@@ -877,40 +944,53 @@ class _IntLowerer:
         )
         self.fn = ir.Function(self.module, fnty, name="rc_predict")
         self.T_arg, self.X_arg, self.Y_arg = self.fn.args
-        self.T_arg.name = "T"; self.X_arg.name = "X"; self.Y_arg.name = "Y"
+        self.T_arg.name = "T"
+        self.X_arg.name = "X"
+        self.Y_arg.name = "Y"
 
         entry = self.fn.append_basic_block("entry")
         self.b = ir.IRBuilder(entry)
 
         needs_phi = any(
-            isinstance(op, (ReadoutLinear, BuildPhi))
-            for op in flat
+            isinstance(op, (ReadoutLinear, BuildPhi)) for op in flat
         )
         max_F = max(
-            (op.F for op in flat
-              if isinstance(op, (ReadoutLinear, FusedStepReadout))),
+            (
+                op.F
+                for op in flat
+                if isinstance(op, (ReadoutLinear, FusedStepReadout))
+            ),
             default=self.N + self.K + 1,
         )
 
         self.h = self.b.alloca(self.storage_ty, size=_ci(self.N), name="h")
-        self.pre_arr = self.b.alloca(self.storage_ty, size=_ci(self.N), name="pre")
+        self.pre_arr = self.b.alloca(
+            self.storage_ty, size=_ci(self.N), name="pre"
+        )
         self.u_pre = self.b.alloca(
-            self.storage_ty, size=_ci(max(self.K, 1)), name="u_pre",
+            self.storage_ty,
+            size=_ci(max(self.K, 1)),
+            name="u_pre",
         )
         self.phi_arr = (
             self.b.alloca(self.storage_ty, size=_ci(max(max_F, 1)), name="phi")
-            if needs_phi else None
+            if needs_phi
+            else None
         )
         # Logits scratch (storage_ty) when a classification head consumes the
         # readout; argmax compares these monotone-quantized scores.
         self.logits = (
-            self.b.alloca(self.storage_ty, size=_ci(max(self.M, 1)), name="logits")
-            if self.has_head else None
+            self.b.alloca(
+                self.storage_ty, size=_ci(max(self.M, 1)), name="logits"
+            )
+            if self.has_head
+            else None
         )
         # exp() scratch (i32, Q.sm_prob_frac) for the softmax head.
         self.exp_scratch = (
             self.b.alloca(_I32, size=_ci(max(self.M, 1)), name="exp_q")
-            if self.has_softmax else None
+            if self.has_softmax
+            else None
         )
         # Accumulator is in accum_ty (wider) — protects against per-row overflow
         # in the matmul over N terms.
@@ -941,6 +1021,7 @@ class _IntLowerer:
 
     def _emit_int_global(self, name, arr):
         import numpy as np
+
         # CSR index arrays (col / rowptr) are always i32 regardless of the
         # storage width; only quantized weight/val arrays use storage_ty.
         if name.endswith(("_col", "_rowptr")):
@@ -973,6 +1054,7 @@ class _IntLowerer:
 
     def _flatten_ops(self):
         from rclite.ir.ops import TimeLoop
+
         for op in self.ir_module.ops:
             yield op
             if isinstance(op, TimeLoop):
@@ -1039,9 +1121,15 @@ class _IntLowerer:
 
     def _lower(self, op):
         from rclite.ir.ops import (
-            TimeLoop, PreprocessInput, ReservoirStep, BuildPhi, ReadoutLinear,
-            Argmax, Softmax,
+            TimeLoop,
+            PreprocessInput,
+            ReservoirStep,
+            BuildPhi,
+            ReadoutLinear,
+            Argmax,
+            Softmax,
         )
+
         if isinstance(op, TimeLoop):
             return self._lower_time_loop(op)
         if isinstance(op, PreprocessInput):
@@ -1100,29 +1188,38 @@ class _IntLowerer:
         b.store(b.sext(_load1d(b, self.logits, _ci(0)), _I32), mx)
         with _loop(b, _ci(M), "smx") as m:
             v = b.sext(_load1d(b, self.logits, m), _I32)
-            b.store(b.select(b.icmp_signed(">", v, b.load(mx)), v, b.load(mx)), mx)
+            b.store(
+                b.select(b.icmp_signed(">", v, b.load(mx)), v, b.load(mx)), mx
+            )
 
         # exp(d) via clamped, linearly-interpolated LUT; accumulate sum (i64)
         sum_acc = b.alloca(_I64, name="sm_sum")
         b.store(self._ci64(0), sum_acc)
         with _loop(b, _ci(M), "sme") as m:
             v = b.sext(_load1d(b, self.logits, m), _I32)
-            d = b.sub(v, b.load(mx))                       # <= 0
-            d = b.select(b.icmp_signed("<", d, self._ci32(dmin)),
-                         self._ci32(dmin), d)
-            num = b.sub(d, self._ci32(dmin))               # [0, -dmin]
+            d = b.sub(v, b.load(mx))  # <= 0
+            d = b.select(
+                b.icmp_signed("<", d, self._ci32(dmin)), self._ci32(dmin), d
+            )
+            num = b.sub(d, self._ci32(dmin))  # [0, -dmin]
             # pos = (num * (n-1) << idxf) / (-dmin)   in i64
             num64 = b.sext(num, _I64)
             posn = b.shl(b.mul(num64, self._ci64(n - 1)), self._ci64(idxf))
             pos = b.sdiv(posn, self._ci64(-dmin))
-            i0 = b.ashr(pos, self._ci64(idxf))             # i64 index
-            i0 = b.select(b.icmp_signed("<", i0, self._ci64(0)),
-                          self._ci64(0), i0)
-            i0 = b.select(b.icmp_signed(">", i0, self._ci64(n - 2)),
-                          self._ci64(n - 2), i0)
+            i0 = b.ashr(pos, self._ci64(idxf))  # i64 index
+            i0 = b.select(
+                b.icmp_signed("<", i0, self._ci64(0)), self._ci64(0), i0
+            )
+            i0 = b.select(
+                b.icmp_signed(">", i0, self._ci64(n - 2)),
+                self._ci64(n - 2),
+                i0,
+            )
             frac = b.sub(pos, b.shl(i0, self._ci64(idxf)))
             y0 = b.sext(_load1d_global(b, g_lut, i0), _I64)
-            y1 = b.sext(_load1d_global(b, g_lut, b.add(i0, self._ci64(1))), _I64)
+            y1 = b.sext(
+                _load1d_global(b, g_lut, b.add(i0, self._ci64(1))), _I64
+            )
             e = b.add(y0, b.ashr(b.mul(b.sub(y1, y0), frac), self._ci64(idxf)))
             _store1d(b, self.exp_scratch, m, b.trunc(e, _I32))
             b.store(b.add(b.load(sum_acc), e), sum_acc)
@@ -1132,8 +1229,9 @@ class _IntLowerer:
         with _loop(b, _ci(M), "smn") as m:
             e = b.sext(_load1d(b, self.exp_scratch, m), _I64)
             p = b.sdiv(b.shl(e, self._ci64(pf)), s)
-            p = b.select(b.icmp_signed(">", p, self._ci64(qmax)),
-                         self._ci64(qmax), p)
+            p = b.select(
+                b.icmp_signed(">", p, self._ci64(qmax)), self._ci64(qmax), p
+            )
             tM = b.mul(self.t, _ci(M))
             _store1d(b, self.Y_arg, b.add(tM, m), b.trunc(p, self.storage_ty))
 
@@ -1160,7 +1258,9 @@ class _IntLowerer:
             x_raw_q = _load1d(self.b, self.X_arg, self.b.add(tK, k))
             diff = self.b.sub(x_raw_q, offset_const)
             u_pre_val = self._fixed_mul_to_storage(
-                diff, scale_const, self.weight_frac,
+                diff,
+                scale_const,
+                self.weight_frac,
             )
             _store1d(self.b, self.u_pre, k, u_pre_val)
 
@@ -1183,10 +1283,12 @@ class _IntLowerer:
             pre_i = _load1d(self.b, self.pre_arr, i)
             activated = self._emit_lut_lookup(pre_i, g_lut)
             h_old = _load1d(self.b, self.h, i)
-            t1 = self._fixed_mul_to_storage(h_old, self._cs(self.one_minus_leak_q),
-                                              self.state_frac)
-            t2 = self._fixed_mul_to_storage(activated, self._cs(self.leak_q),
-                                              self.state_frac)
+            t1 = self._fixed_mul_to_storage(
+                h_old, self._cs(self.one_minus_leak_q), self.state_frac
+            )
+            t2 = self._fixed_mul_to_storage(
+                activated, self._cs(self.leak_q), self.state_frac
+            )
             new_h = self.b.add(t1, t2)
             _store1d(self.b, self.h, i, new_h)
 
@@ -1208,12 +1310,13 @@ class _IntLowerer:
         if i_py is not None:  # unrolled sparse
             for j, wv in spec.rows[i_py]:
                 s = _load1d(b, self.h, _ci(j))
-                prod = self._fixed_const_mul_to_accum(int(wv), s,
-                                                      self.shift_res)
+                prod = self._fixed_const_mul_to_accum(
+                    int(wv), s, self.shift_res
+                )
                 b.store(self._accum_add(b.load(self.acc), prod), self.acc)
         elif spec is not None:  # CSR
             self._emit_res_contrib_int_csr(spec, i)
-        else:                   # dense / structured chain
+        else:  # dense / structured chain
             self._emit_res_contrib_int(op, g_Wres, i)
         pre_val = b.trunc(b.load(self.acc), self.storage_ty)
         _store1d(b, self.pre_arr, i, pre_val)
@@ -1253,7 +1356,9 @@ class _IntLowerer:
             is_pos = b.icmp_signed(">", i, _ci(0))
             i_safe = b.select(is_pos, b.sub(i, _ci(1)), _ci(0))
             val = _load1d(b, self.h, i_safe)
-            prod = self._fixed_mul_to_accum(self._cs(cw_q), val, self.shift_res)
+            prod = self._fixed_mul_to_accum(
+                self._cs(cw_q), val, self.shift_res
+            )
             contrib = b.select(is_pos, prod, self._ca(0))
             b.store(self._accum_add(b.load(self.acc), contrib), self.acc)
         elif op.topology == Topology.SCR:
@@ -1262,7 +1367,9 @@ class _IntLowerer:
             is_zero = b.icmp_signed("==", i, _ci(0))
             i_prev = b.select(is_zero, _ci(N - 1), b.sub(i, _ci(1)))
             val = _load1d(b, self.h, i_prev)
-            prod = self._fixed_mul_to_accum(self._cs(cw_q), val, self.shift_res)
+            prod = self._fixed_mul_to_accum(
+                self._cs(cw_q), val, self.shift_res
+            )
             b.store(self._accum_add(b.load(self.acc), prod), self.acc)
         elif op.topology == Topology.DLRB:
             cw_q = int(round(op.chain_weight * weight_scale))
@@ -1271,20 +1378,23 @@ class _IntLowerer:
             is_pos = b.icmp_signed(">", i, _ci(0))
             i_back = b.select(is_pos, b.sub(i, _ci(1)), _ci(0))
             val_back = _load1d(b, self.h, i_back)
-            prod_back = self._fixed_mul_to_accum(self._cs(cw_q), val_back,
-                                                  self.shift_res)
+            prod_back = self._fixed_mul_to_accum(
+                self._cs(cw_q), val_back, self.shift_res
+            )
             contrib_back = b.select(is_pos, prod_back, self._ca(0))
             # Forward chain: chain_feedback * h[i+1] for i < N-1
             is_lt_last = b.icmp_signed("<", i, _ci(N - 1))
             i_fwd = b.select(is_lt_last, b.add(i, _ci(1)), _ci(N - 1))
             val_fwd = _load1d(b, self.h, i_fwd)
-            prod_fwd = self._fixed_mul_to_accum(self._cs(cb_q), val_fwd,
-                                                  self.shift_res)
+            prod_fwd = self._fixed_mul_to_accum(
+                self._cs(cb_q), val_fwd, self.shift_res
+            )
             contrib_fwd = b.select(is_lt_last, prod_fwd, self._ca(0))
             acc_val = b.load(self.acc)
             b.store(
-                self._accum_add(self._accum_add(acc_val, contrib_back),
-                                 contrib_fwd),
+                self._accum_add(
+                    self._accum_add(acc_val, contrib_back), contrib_fwd
+                ),
                 self.acc,
             )
         else:
@@ -1370,8 +1480,9 @@ class _IntLowerer:
         if op.include_bias:
             # phi[0] = (1 << state_frac) so phi[0] * W_out_q[0] gives
             # state_scale^2 like all other contributions.
-            _store1d(self.b, self.phi_arr, _ci(off),
-                      self._cs(1 << self.state_frac))
+            _store1d(
+                self.b, self.phi_arr, _ci(off), self._cs(1 << self.state_frac)
+            )
             off += 1
         if op.include_input:
             with _loop(self.b, _ci(K), "kphi") as k:
@@ -1379,8 +1490,12 @@ class _IntLowerer:
                 _store1d(self.b, self.phi_arr, self.b.add(_ci(off), k), u_val)
             off += K
         with _loop(self.b, _ci(N), "iphi") as i:
-            _store1d(self.b, self.phi_arr, self.b.add(_ci(off), i),
-                      _load1d(self.b, self.h, i))
+            _store1d(
+                self.b,
+                self.phi_arr,
+                self.b.add(_ci(off), i),
+                _load1d(self.b, self.h, i),
+            )
 
     def _lower_readout_linear(self, op):
         """Readout in i64 accumulator regardless of storage width.
@@ -1392,8 +1507,11 @@ class _IntLowerer:
         g_Wout = self.globals["W_out"]
         F = op.F
         tM = self.b.mul(self.t, _ci(op.M))
-        sadd_i64 = (self.module.globals.get("llvm.sadd.sat.i64")
-                     if self.saturating else None)
+        sadd_i64 = (
+            self.module.globals.get("llvm.sadd.sat.i64")
+            if self.saturating
+            else None
+        )
         if self.saturating and sadd_i64 is None:
             sadd_i64 = ir.Function(
                 self.module,
@@ -1410,12 +1528,15 @@ class _IntLowerer:
                 pv64 = self.b.sext(pv, _I64)
                 prod = self.b.mul(w64, pv64)
                 cur = self.b.load(self.acc64)
-                summed = (self.b.call(sadd_i64, [cur, prod])
-                          if self.saturating
-                          else self.b.add(cur, prod))
+                summed = (
+                    self.b.call(sadd_i64, [cur, prod])
+                    if self.saturating
+                    else self.b.add(cur, prod)
+                )
                 self.b.store(summed, self.acc64)
-            shifted = self.b.ashr(self.b.load(self.acc64),
-                                    self._ci64(self.state_frac))
+            shifted = self.b.ashr(
+                self.b.load(self.acc64), self._ci64(self.state_frac)
+            )
             # Saturating truncation to storage_ty: clamp to storage range
             # before truncation to avoid wrap-around.
             if self.storage_bits == 32:
@@ -1440,7 +1561,9 @@ class _IntLowerer:
 # Affine (asymmetric per-tensor) lowering
 
 
-def emit_quantized_affine_module(qmodel, *, passes=None, head=None) -> ir.Module:
+def emit_quantized_affine_module(
+    qmodel, *, passes=None, head=None
+) -> ir.Module:
     """Build LLVM IR for the affine integer quantized path (i8 or i16).
 
     Function signature is identical to the symmetric path:
@@ -1494,7 +1617,8 @@ class _AffineLowerer:
 
     def __init__(self, ir_module):
         from rclite.ir.ops import (
-            ReservoirStep, BuildPhi, ReadoutLinear, TimeLoop, Argmax, Softmax,
+            Argmax,
+            Softmax,
             AccumulateState,
         )
 
@@ -1518,55 +1642,55 @@ class _AffineLowerer:
             )
 
         # Zero points (Python ints)
-        self.zp_input  = int(md["zp_input"])
-        self.zp_u_pre  = int(md["zp_u_pre"])
-        self.zp_state  = int(md["zp_state"])
-        self.zp_pre    = int(md["zp_pre"])
+        self.zp_input = int(md["zp_input"])
+        self.zp_u_pre = int(md["zp_u_pre"])
+        self.zp_state = int(md["zp_state"])
+        self.zp_pre = int(md["zp_pre"])
         self.zp_output = int(md["zp_output"])
 
         self.lut_offset = int(md["lut_offset"])
-        self.bias_pre   = int(md["bias_pre"])
+        self.bias_pre = int(md["bias_pre"])
 
         # LUT strategy and per-strategy precomputed.
         self.lut_kind = md.get("lut_kind", "direct")
         if self.lut_kind == "linear_interp":
-            self.lut_n_entries        = int(md["lut_n_entries"])
+            self.lut_n_entries = int(md["lut_n_entries"])
             self.lut_interp_frac_bits = int(md["lut_interp_frac_bits"])
-            self.lut_idx_M0           = int(md["lut_idx_M0"])
-            self.lut_idx_n            = int(md["lut_idx_n"])
+            self.lut_idx_M0 = int(md["lut_idx_M0"])
+            self.lut_idx_n = int(md["lut_idx_n"])
         elif self.lut_kind == "polynomial":
             self.poly_qf_bits = int(md["poly_qf_bits"])
-            self.poly_degree  = int(md.get("poly_degree", 5))
-            self.poly_x_M0    = int(md["poly_x_M0"])
-            self.poly_x_n     = int(md["poly_x_n"])
+            self.poly_degree = int(md.get("poly_degree", 5))
+            self.poly_x_M0 = int(md["poly_x_M0"])
+            self.poly_x_n = int(md["poly_x_n"])
             self.poly_back_M0 = int(md["poly_back_M0"])
-            self.poly_back_n  = int(md["poly_back_n"])
+            self.poly_back_n = int(md["poly_back_n"])
             self.poly_clip_qf = int(md["poly_clip_qf"])
-            self.poly_one_qf  = int(md["poly_one_qf"])
-            self.poly_a1_qf   = int(md["poly_a1_qf"])
-            self.poly_a3_qf   = int(md["poly_a3_qf"])
-            self.poly_a5_qf   = int(md["poly_a5_qf"])
+            self.poly_one_qf = int(md["poly_one_qf"])
+            self.poly_a1_qf = int(md["poly_a1_qf"])
+            self.poly_a3_qf = int(md["poly_a3_qf"])
+            self.poly_a5_qf = int(md["poly_a5_qf"])
 
         # Requantize multipliers (M0, n)
-        self.M_in_M0,  self.M_in_n  = int(md["M_in_M0"]),  int(md["M_in_n"])
+        self.M_in_M0, self.M_in_n = int(md["M_in_M0"]), int(md["M_in_n"])
         self.M_res_M0, self.M_res_n = int(md["M_res_M0"]), int(md["M_res_n"])
         self.per_channel_res = bool(md.get("per_channel_res", False))
         self.per_channel_out = bool(md.get("per_channel_out", False))
-        self.leak_M0,  self.leak_n  = int(md["leak_M0"]),  int(md["leak_n"])
-        self.M_out_bias_M0  = int(md["M_out_bias_M0"])
-        self.M_out_bias_n   = int(md["M_out_bias_n"])
+        self.leak_M0, self.leak_n = int(md["leak_M0"]), int(md["leak_n"])
+        self.M_out_bias_M0 = int(md["M_out_bias_M0"])
+        self.M_out_bias_n = int(md["M_out_bias_n"])
         self.M_out_input_M0 = int(md["M_out_input_M0"])
-        self.M_out_input_n  = int(md["M_out_input_n"])
+        self.M_out_input_n = int(md["M_out_input_n"])
         self.M_out_state_M0 = int(md["M_out_state_M0"])
-        self.M_out_state_n  = int(md["M_out_state_n"])
+        self.M_out_state_n = int(md["M_out_state_n"])
 
-        self.include_bias  = bool(md["include_bias"])
+        self.include_bias = bool(md["include_bias"])
         self.include_input = bool(md["include_input"])
 
         # Topology specialisation (SCR/DLR/DLRB skip the dense W_res matmul).
-        self.structured       = bool(md.get("structured", False))
-        self.topology_name    = md.get("topology", "ESN_STANDARD")
-        self.chain_weight_q   = int(md.get("chain_weight_q", 0))
+        self.structured = bool(md.get("structured", False))
+        self.topology_name = md.get("topology", "ESN_STANDARD")
+        self.chain_weight_q = int(md.get("chain_weight_q", 0))
         self.chain_feedback_q = int(md.get("chain_feedback_q", 0))
 
         # Integer input preprocess (active iff input_offset != 0 or
@@ -1574,8 +1698,8 @@ class _AffineLowerer:
         # a scratch buffer that the W_in matmul reads; otherwise the matmul
         # reads X directly.
         self.has_int_preprocess = bool(md.get("has_integer_preprocess", False))
-        self.pre_M0    = int(md.get("pre_M0", 0))
-        self.pre_n     = int(md.get("pre_n", 0))
+        self.pre_M0 = int(md.get("pre_M0", 0))
+        self.pre_n = int(md.get("pre_n", 0))
         self.pre_const = int(md.get("pre_const", 0))
 
         self.K, self.N, self.M = ir_module.K, ir_module.N, ir_module.M
@@ -1594,7 +1718,8 @@ class _AffineLowerer:
         self.has_head = self.out_int or self.has_softmax
         # MEAN time-pooling needs a running i64 state-sum buffer.
         self.needs_state_sum = any(
-            isinstance(op, AccumulateState) and op.mode == "mean" for op in flat
+            isinstance(op, AccumulateState) and op.mode == "mean"
+            for op in flat
         )
         out_ty = _I32 if self.out_int else self.storage_ty
         if self.has_softmax:
@@ -1624,24 +1749,34 @@ class _AffineLowerer:
 
         # Buffers
         self.h_buf = self.b.alloca(
-            self.storage_ty, size=_ci(self.N), name="h",
+            self.storage_ty,
+            size=_ci(self.N),
+            name="h",
         )
         self.pre_buf = self.b.alloca(
-            self.storage_ty, size=_ci(self.N), name="pre",
+            self.storage_ty,
+            size=_ci(self.N),
+            name="pre",
         )
         self.logits = (
-            self.b.alloca(self.storage_ty, size=_ci(max(self.M, 1)), name="logits")
-            if self.has_head else None
+            self.b.alloca(
+                self.storage_ty, size=_ci(max(self.M, 1)), name="logits"
+            )
+            if self.has_head
+            else None
         )
         self.exp_scratch = (
             self.b.alloca(_I32, size=_ci(max(self.M, 1)), name="exp_q")
-            if self.has_softmax else None
+            if self.has_softmax
+            else None
         )
         # u_pre scratch only allocated when integer preprocess is in play —
         # otherwise the matmul reads X directly.
         if self.has_int_preprocess:
             self.u_pre_buf = self.b.alloca(
-                self.storage_ty, size=_ci(max(self.K, 1)), name="u_pre",
+                self.storage_ty,
+                size=_ci(max(self.K, 1)),
+                name="u_pre",
             )
         else:
             self.u_pre_buf = None
@@ -1698,7 +1833,8 @@ class _AffineLowerer:
         g.linkage = "internal"
         g.global_constant = True
         g.initializer = ir.Constant(
-            arr_ty, [ir.Constant(elem_ty, int(v)) for v in flat],
+            arr_ty,
+            [ir.Constant(elem_ty, int(v)) for v in flat],
         )
         return g
 
@@ -1716,10 +1852,14 @@ class _AffineLowerer:
         lo = self._ci64(-(1 << 31))
         hi = self._ci64((1 << 31) - 1)
         clipped_lo = self.b.select(
-            self.b.icmp_signed("<", val_i64, lo), lo, val_i64,
+            self.b.icmp_signed("<", val_i64, lo),
+            lo,
+            val_i64,
         )
         clipped = self.b.select(
-            self.b.icmp_signed(">", clipped_lo, hi), hi, clipped_lo,
+            self.b.icmp_signed(">", clipped_lo, hi),
+            hi,
+            clipped_lo,
         )
         return self.b.trunc(clipped, _I32)
 
@@ -1761,10 +1901,14 @@ class _AffineLowerer:
         lo = self._ci32(-(1 << (self.storage_bits - 1)))
         hi = self._ci32((1 << (self.storage_bits - 1)) - 1)
         clipped_lo = self.b.select(
-            self.b.icmp_signed("<", val_i32, lo), lo, val_i32,
+            self.b.icmp_signed("<", val_i32, lo),
+            lo,
+            val_i32,
         )
         clipped = self.b.select(
-            self.b.icmp_signed(">", clipped_lo, hi), hi, clipped_lo,
+            self.b.icmp_signed(">", clipped_lo, hi),
+            hi,
+            clipped_lo,
         )
         return self.b.trunc(clipped, self.storage_ty)
 
@@ -1779,6 +1923,7 @@ class _AffineLowerer:
 
     def _flatten_ops(self):
         from rclite.ir.ops import TimeLoop
+
         for op in self.ir_module.ops:
             yield op
             if isinstance(op, TimeLoop):
@@ -1786,9 +1931,17 @@ class _AffineLowerer:
 
     def _lower(self, op):
         from rclite.ir.ops import (
-            TimeLoop, PreprocessInput, ReservoirStep, BuildPhi, ReadoutLinear,
-            Argmax, Softmax, AccumulateState, FinalizeAggregate,
+            TimeLoop,
+            PreprocessInput,
+            ReservoirStep,
+            BuildPhi,
+            ReadoutLinear,
+            Argmax,
+            Softmax,
+            AccumulateState,
+            FinalizeAggregate,
         )
+
         if isinstance(op, TimeLoop):
             return self._lower_time_loop(op)
         if isinstance(op, PreprocessInput):
@@ -1820,7 +1973,9 @@ class _AffineLowerer:
         b = self.b
         w_const = self._ci64(washout)
         t_minus1 = b.sub(self.T_arg, self._ci64(1))
-        w = b.select(b.icmp_signed("<", w_const, self.T_arg), w_const, t_minus1)
+        w = b.select(
+            b.icmp_signed("<", w_const, self.T_arg), w_const, t_minus1
+        )
         return b.select(b.icmp_signed("<", w, self._ci64(0)), self._ci64(0), w)
 
     def _lower_accumulate_state(self, op):
@@ -1831,7 +1986,7 @@ class _AffineLowerer:
         w = self._washout_clamped(op.washout)
         in_window = b.icmp_signed(">=", self.t, w)
         with _loop(b, _ci(op.N), "acc_h") as i:
-            s = _load1d(b, self.h_sum, i)               # i64
+            s = _load1d(b, self.h_sum, i)  # i64
             h_i = b.sext(_load1d(b, self.h_buf, i), _I64)
             add = b.select(in_window, h_i, self._ci64(0))
             _store1d(b, self.h_sum, i, b.add(s, add))
@@ -1846,21 +2001,25 @@ class _AffineLowerer:
         if op.mode == "mean":
             b = self.b
             w = self._washout_clamped(op.washout)
-            L = b.sub(self.T_arg, w)                     # i64, >= 1
+            L = b.sub(self.T_arg, w)  # i64, >= 1
             with _loop(b, _ci(op.N), "fin_h") as i:
-                s = _load1d(b, self.h_sum, i)            # i64
+                s = _load1d(b, self.h_sum, i)  # i64
                 q = self._emit_round_div_i64(s, L)
-                _store1d(b, self.h_buf, i,
-                         self._emit_saturate_to_storage(self._clamp_i64_to_i32(q)))
+                _store1d(
+                    b,
+                    self.h_buf,
+                    i,
+                    self._emit_saturate_to_storage(self._clamp_i64_to_i32(q)),
+                )
         # The pooled sequence produces a single output row.
         self.t = _ci(0)
 
     def _emit_round_div_i64(self, s, L):
         """Round-half-away-from-zero integer division s/L (L>0), in i64."""
         b = self.b
-        half = b.ashr(L, self._ci64(1))                 # floor(L/2), L>0
+        half = b.ashr(L, self._ci64(1))  # floor(L/2), L>0
         is_neg = b.icmp_signed("<", s, self._ci64(0))
-        pos = b.sdiv(b.add(s, half), L)                 # sdiv truncates toward 0
+        pos = b.sdiv(b.add(s, half), L)  # sdiv truncates toward 0
         neg_s = b.sub(self._ci64(0), s)
         neg = b.sub(self._ci64(0), b.sdiv(b.add(neg_s, half), L))
         return b.select(is_neg, neg, pos)
@@ -1898,27 +2057,36 @@ class _AffineLowerer:
         b.store(b.sext(_load1d(b, self.logits, _ci(0)), _I32), mx)
         with _loop(b, _ci(M), "smx") as m:
             v = b.sext(_load1d(b, self.logits, m), _I32)
-            b.store(b.select(b.icmp_signed(">", v, b.load(mx)), v, b.load(mx)), mx)
+            b.store(
+                b.select(b.icmp_signed(">", v, b.load(mx)), v, b.load(mx)), mx
+            )
 
         sum_acc = b.alloca(_I64, name="sm_sum")
         b.store(self._ci64(0), sum_acc)
         with _loop(b, _ci(M), "sme") as m:
             v = b.sext(_load1d(b, self.logits, m), _I32)
             d = b.sub(v, b.load(mx))
-            d = b.select(b.icmp_signed("<", d, self._ci32(dmin)),
-                         self._ci32(dmin), d)
+            d = b.select(
+                b.icmp_signed("<", d, self._ci32(dmin)), self._ci32(dmin), d
+            )
             num = b.sub(d, self._ci32(dmin))
             num64 = b.sext(num, _I64)
             posn = b.shl(b.mul(num64, self._ci64(n - 1)), self._ci64(idxf))
             pos = b.sdiv(posn, self._ci64(-dmin))
             i0 = b.ashr(pos, self._ci64(idxf))
-            i0 = b.select(b.icmp_signed("<", i0, self._ci64(0)),
-                          self._ci64(0), i0)
-            i0 = b.select(b.icmp_signed(">", i0, self._ci64(n - 2)),
-                          self._ci64(n - 2), i0)
+            i0 = b.select(
+                b.icmp_signed("<", i0, self._ci64(0)), self._ci64(0), i0
+            )
+            i0 = b.select(
+                b.icmp_signed(">", i0, self._ci64(n - 2)),
+                self._ci64(n - 2),
+                i0,
+            )
             frac = b.sub(pos, b.shl(i0, self._ci64(idxf)))
             y0 = b.sext(_load1d_global(b, g_lut, i0), _I64)
-            y1 = b.sext(_load1d_global(b, g_lut, b.add(i0, self._ci64(1))), _I64)
+            y1 = b.sext(
+                _load1d_global(b, g_lut, b.add(i0, self._ci64(1))), _I64
+            )
             e = b.add(y0, b.ashr(b.mul(b.sub(y1, y0), frac), self._ci64(idxf)))
             _store1d(b, self.exp_scratch, m, b.trunc(e, _I32))
             b.store(b.add(b.load(sum_acc), e), sum_acc)
@@ -1927,8 +2095,9 @@ class _AffineLowerer:
         with _loop(b, _ci(M), "smn") as m:
             e = b.sext(_load1d(b, self.exp_scratch, m), _I64)
             p = b.sdiv(b.shl(e, self._ci64(pf)), s)
-            p = b.select(b.icmp_signed(">", p, self._ci64(qmax)),
-                         self._ci64(qmax), p)
+            p = b.select(
+                b.icmp_signed(">", p, self._ci64(qmax)), self._ci64(qmax), p
+            )
             tM = b.mul(self.t, _ci(M))
             _store1d(b, self.Y_arg, b.add(tM, m), b.trunc(p, self.storage_ty))
 
@@ -1945,14 +2114,21 @@ class _AffineLowerer:
         with _loop(self.b, _ci(K), "kpre_aff") as k:
             x_q = _load1d(self.b, self.X_arg, self.b.add(tK, k))
             centered = self.b.sub(
-                self.b.sext(x_q, _I32), self._ci32(self.zp_input),
+                self.b.sext(x_q, _I32),
+                self._ci32(self.zp_input),
             )
             delta = self._emit_requantize_i32(
-                centered, self.pre_M0, self.pre_n,
+                centered,
+                self.pre_M0,
+                self.pre_n,
             )
             total = self.b.add(delta, self._ci32(self.pre_const))
-            _store1d(self.b, self.u_pre_buf, k,
-                      self._emit_saturate_to_storage(total))
+            _store1d(
+                self.b,
+                self.u_pre_buf,
+                k,
+                self._emit_saturate_to_storage(total),
+            )
 
     def _lower_time_loop(self, op):
         with _loop(self.b, self.T_arg, "t") as t:
@@ -1965,8 +2141,8 @@ class _AffineLowerer:
     # reservoir step
 
     def _lower_reservoir_step(self, op):
-        g_Win  = self.globals["W_in"]
-        g_rs_in  = self.globals["row_sum_W_in"]
+        g_Win = self.globals["W_in"]
+        g_rs_in = self.globals["row_sum_W_in"]
         # W_res / row_sum_W_res only exist for non-structured (dense) topologies.
         g_Wres = self.globals.get("W_res")
         g_rs_res = self.globals.get("row_sum_W_res")
@@ -1978,23 +2154,25 @@ class _AffineLowerer:
         if spec is not None and spec.kind == "unroll":
             # Per-row nonzero sets differ → unroll the outer i-loop.
             for i in range(N):
-                self._emit_affine_row(op, _ci(i), g_Win, g_rs_in, g_Wres,
-                                      g_rs_res, spec, i_py=i)
+                self._emit_affine_row(
+                    op, _ci(i), g_Win, g_rs_in, g_Wres, g_rs_res, spec, i_py=i
+                )
         else:
             with _loop(self.b, _ci(N), "ipre") as i:
-                self._emit_affine_row(op, i, g_Win, g_rs_in, g_Wres,
-                                      g_rs_res, spec, i_py=None)
+                self._emit_affine_row(
+                    op, i, g_Win, g_rs_in, g_Wres, g_rs_res, spec, i_py=None
+                )
 
         # ---- Activation + leaky integration ----
         with _loop(self.b, _ci(N), "iact") as i:
             p = _load1d(self.b, self.pre_buf, i)  # storage_ty
-            a = self._emit_activation(p)          # storage_ty
+            a = self._emit_activation(p)  # storage_ty
 
             h_old = _load1d(self.b, self.h_buf, i)
-            h_c = self.b.sub(self.b.sext(h_old, _I32),
-                              self._ci32(self.zp_state))
-            a_c = self.b.sub(self.b.sext(a, _I32),
-                              self._ci32(self.zp_state))
+            h_c = self.b.sub(
+                self.b.sext(h_old, _I32), self._ci32(self.zp_state)
+            )
+            a_c = self.b.sub(self.b.sext(a, _I32), self._ci32(self.zp_state))
             diff = self.b.sub(a_c, h_c)
             delta = self._emit_requantize_i32(diff, self.leak_M0, self.leak_n)
             new_h_c = self.b.add(h_c, delta)
@@ -2021,8 +2199,9 @@ class _AffineLowerer:
             h_p = b.sub(self._ca(0), h_p)
         return h_p
 
-    def _emit_affine_row(self, op, i, g_Win, g_rs_in, g_Wres, g_rs_res,
-                          spec, i_py):
+    def _emit_affine_row(
+        self, op, i, g_Win, g_rs_in, g_Wres, g_rs_res, spec, i_py
+    ):
         """Emit pre[row i] for the affine kernel (one body of the ipre loop).
 
         `i` is an SSA index (a constant when unrolling). For the unrolled
@@ -2044,12 +2223,17 @@ class _AffineLowerer:
             prod = b.mul(b.sext(w, self.accum_ty), b.sext(x, self.accum_ty))
             b.store(b.add(b.load(acc_in_var), prod), acc_in_var)
         rs_in_i32 = _load1d_global(b, g_rs_in, i)
-        rs_in = (rs_in_i32 if self.accum_ty == _I32
-                 else b.sext(rs_in_i32, self.accum_ty))
-        acc_in_final = b.sub(b.load(acc_in_var),
-                             b.mul(self._ca(self.zp_u_pre), rs_in))
+        rs_in = (
+            rs_in_i32
+            if self.accum_ty == _I32
+            else b.sext(rs_in_i32, self.accum_ty)
+        )
+        acc_in_final = b.sub(
+            b.load(acc_in_var), b.mul(self._ca(self.zp_u_pre), rs_in)
+        )
         rq_in = self._emit_requantize_i32(
-            self._clamp_to_i32(acc_in_final), self.M_in_M0, self.M_in_n)
+            self._clamp_to_i32(acc_in_final), self.M_in_M0, self.M_in_n
+        )
 
         # acc_res
         if self.structured:
@@ -2064,18 +2248,23 @@ class _AffineLowerer:
                     b.store(b.add(b.load(acc_res_var), prod), acc_res_var)
             elif spec is not None:  # CSR
                 self._emit_affine_res_csr(spec, acc_res_var, i)
-            else:                   # dense
+            else:  # dense
                 with _loop(b, _ci(N), "jres") as j:
                     w = _load2d_global(b, g_Wres, N, i, j)
                     h = _load1d(b, self.h_buf, j)
-                    prod = b.mul(b.sext(w, self.accum_ty),
-                                 b.sext(h, self.accum_ty))
+                    prod = b.mul(
+                        b.sext(w, self.accum_ty), b.sext(h, self.accum_ty)
+                    )
                     b.store(b.add(b.load(acc_res_var), prod), acc_res_var)
             rs_res_i32 = _load1d_global(b, g_rs_res, i)
-            rs_res = (rs_res_i32 if self.accum_ty == _I32
-                      else b.sext(rs_res_i32, self.accum_ty))
-            acc_res_final = b.sub(b.load(acc_res_var),
-                                  b.mul(self._ca(self.zp_state), rs_res))
+            rs_res = (
+                rs_res_i32
+                if self.accum_ty == _I32
+                else b.sext(rs_res_i32, self.accum_ty)
+            )
+            acc_res_final = b.sub(
+                b.load(acc_res_var), b.mul(self._ca(self.zp_state), rs_res)
+            )
             acc_res_i32 = self._clamp_to_i32(acc_res_final)
         if self.per_channel_res and not self.structured:
             # per-row (M0[i], n[i]) loaded from i32 globals → dynamic shift.
@@ -2084,10 +2273,12 @@ class _AffineLowerer:
             rq_res = self._emit_requantize_i32_dynamic(acc_res_i32, m0_i, n_i)
         else:
             rq_res = self._emit_requantize_i32(
-                acc_res_i32, self.M_res_M0, self.M_res_n)
+                acc_res_i32, self.M_res_M0, self.M_res_n
+            )
 
         pre_total = b.add(
-            b.add(self._ci32(self.zp_pre + self.bias_pre), rq_in), rq_res)
+            b.add(self._ci32(self.zp_pre + self.bias_pre), rq_in), rq_res
+        )
         pre_q = self._emit_saturate_to_storage(pre_total)
         _store1d(b, self.pre_buf, i, pre_q)
 
@@ -2174,8 +2365,9 @@ class _AffineLowerer:
 
     def _emit_act_direct(self, p_storage):
         g_lut = self.globals["lut_table"]
-        idx_i32 = self.b.add(self.b.sext(p_storage, _I32),
-                              self._ci32(self.lut_offset))
+        idx_i32 = self.b.add(
+            self.b.sext(p_storage, _I32), self._ci32(self.lut_offset)
+        )
         idx_i64 = self.b.sext(idx_i32, _I64)
         return _load1d_global(self.b, g_lut, idx_i64)
 
@@ -2185,19 +2377,25 @@ class _AffineLowerer:
         f = self.lut_interp_frac_bits
         n = self.lut_n_entries
         # normalized = sext(p, i32) + offset, then t_q = requantize(normalized, idx_M0, idx_n)
-        normalized = self.b.add(self.b.sext(p_storage, _I32),
-                                  self._ci32(self.lut_offset))
-        t_q = self._emit_requantize_i32(normalized, self.lut_idx_M0,
-                                          self.lut_idx_n)
+        normalized = self.b.add(
+            self.b.sext(p_storage, _I32), self._ci32(self.lut_offset)
+        )
+        t_q = self._emit_requantize_i32(
+            normalized, self.lut_idx_M0, self.lut_idx_n
+        )
         # idx = t_q >> f, clipped to [0, n-2]
         idx_raw = self.b.ashr(t_q, self._ci32(f))
         zero32 = self._ci32(0)
         n_minus2 = self._ci32(n - 2)
         idx_lo = self.b.select(
-            self.b.icmp_signed("<", idx_raw, zero32), zero32, idx_raw,
+            self.b.icmp_signed("<", idx_raw, zero32),
+            zero32,
+            idx_raw,
         )
         idx = self.b.select(
-            self.b.icmp_signed(">", idx_lo, n_minus2), n_minus2, idx_lo,
+            self.b.icmp_signed(">", idx_lo, n_minus2),
+            n_minus2,
+            idx_lo,
         )
         # frac = t_q - (idx << f)
         frac_q = self.b.sub(t_q, self.b.shl(idx, self._ci32(f)))
@@ -2221,26 +2419,30 @@ class _AffineLowerer:
     def _emit_act_polynomial(self, p_storage):
         """Odd-only minimax tanh, Horner in x², bit-exact with Python ref.
 
-            x² = (x·x) >> qf
-            inner = ((x²·a5) >> qf) + a3
-            outer = ((x²·inner) >> qf) + a1
-            y     = (x·outer) >> qf
-            y     = clamp(y, ±one_qf)
+        x² = (x·x) >> qf
+        inner = ((x²·a5) >> qf) + a3
+        outer = ((x²·inner) >> qf) + a1
+        y     = (x·outer) >> qf
+        y     = clamp(y, ±one_qf)
         """
         qf = self.poly_qf_bits
         # x_qf = requantize(sext(p) - zp_pre, x_M0, x_n), widen to i64.
-        centered = self.b.sub(self.b.sext(p_storage, _I32),
-                                self._ci32(self.zp_pre))
-        x_qf_i32 = self._emit_requantize_i32(centered,
-                                               self.poly_x_M0, self.poly_x_n)
+        centered = self.b.sub(
+            self.b.sext(p_storage, _I32), self._ci32(self.zp_pre)
+        )
+        x_qf_i32 = self._emit_requantize_i32(
+            centered, self.poly_x_M0, self.poly_x_n
+        )
         x_qf = self.b.sext(x_qf_i32, _I64)
         # Clamp |x| <= x_clip_qf
         clip_pos = self._ci64(self.poly_clip_qf)
         clip_neg = self._ci64(-self.poly_clip_qf)
-        x_qf = self.b.select(self.b.icmp_signed("<", x_qf, clip_neg),
-                               clip_neg, x_qf)
-        x_qf = self.b.select(self.b.icmp_signed(">", x_qf, clip_pos),
-                               clip_pos, x_qf)
+        x_qf = self.b.select(
+            self.b.icmp_signed("<", x_qf, clip_neg), clip_neg, x_qf
+        )
+        x_qf = self.b.select(
+            self.b.icmp_signed(">", x_qf, clip_pos), clip_pos, x_qf
+        )
         qf_const = self._ci64(qf)
         a1_const = self._ci64(self.poly_a1_qf)
         a3_const = self._ci64(self.poly_a3_qf)
@@ -2259,14 +2461,17 @@ class _AffineLowerer:
         # Clamp y to ±one_qf
         one_pos = self._ci64(self.poly_one_qf)
         one_neg = self._ci64(-self.poly_one_qf)
-        y_qf = self.b.select(self.b.icmp_signed("<", y_qf, one_neg),
-                               one_neg, y_qf)
-        y_qf = self.b.select(self.b.icmp_signed(">", y_qf, one_pos),
-                               one_pos, y_qf)
+        y_qf = self.b.select(
+            self.b.icmp_signed("<", y_qf, one_neg), one_neg, y_qf
+        )
+        y_qf = self.b.select(
+            self.b.icmp_signed(">", y_qf, one_pos), one_pos, y_qf
+        )
         # Δq_state = requantize(y_qf), then +zp_state
         y_qf_i32 = self.b.trunc(y_qf, _I32)
-        delta = self._emit_requantize_i32(y_qf_i32,
-                                            self.poly_back_M0, self.poly_back_n)
+        delta = self._emit_requantize_i32(
+            y_qf_i32, self.poly_back_M0, self.poly_back_n
+        )
         total = self.b.add(delta, self._ci32(self.zp_state))
         return self._emit_saturate_to_storage(total)
 
@@ -2291,7 +2496,7 @@ class _AffineLowerer:
         N = self.N
         Mout = op.M
 
-        off_bias  = 0
+        off_bias = 0
         off_input = 1 if self.include_bias else 0
         off_state = off_input + (K if self.include_input else 0)
 
@@ -2309,8 +2514,13 @@ class _AffineLowerer:
             if self.include_bias:
                 w0 = _load2d_global(self.b, g_Wout, F, m, _ci(off_bias))
                 clamped_b = self._clamp_i64_to_i32(self.b.sext(w0, _I64))
-                rq_b = self._rq_out(clamped_b, m, "M_out_bias",
-                                    self.M_out_bias_M0, self.M_out_bias_n)
+                rq_b = self._rq_out(
+                    clamped_b,
+                    m,
+                    "M_out_bias",
+                    self.M_out_bias_M0,
+                    self.M_out_bias_n,
+                )
                 self.b.store(self.b.add(self.b.load(y_var), rq_b), y_var)
 
             if self.include_input:
@@ -2319,21 +2529,30 @@ class _AffineLowerer:
                 with _loop(self.b, _ci(K), "kin_ro") as k:
                     col = self.b.add(_ci(off_input), k)
                     w = _load2d_global(self.b, g_Wout, F, m, col)
-                    x = _load1d(self.b, self.X_arg,
-                                  self.b.add(self.b.mul(t, _ci(K)), k))
-                    prod = self.b.mul(self.b.sext(w, _I64),
-                                       self.b.sext(x, _I64))
+                    x = _load1d(
+                        self.b,
+                        self.X_arg,
+                        self.b.add(self.b.mul(t, _ci(K)), k),
+                    )
+                    prod = self.b.mul(
+                        self.b.sext(w, _I64), self.b.sext(x, _I64)
+                    )
                     self.b.store(
-                        self.b.add(self.b.load(acc_var), prod), acc_var,
+                        self.b.add(self.b.load(acc_var), prod),
+                        acc_var,
                     )
                 rs = self.b.sext(_load1d_global(self.b, g_rs_input, m), _I64)
                 adj = self.b.sub(
                     self.b.load(acc_var),
                     self.b.mul(self._ci64(self.zp_input), rs),
                 )
-                rq_i = self._rq_out(self._clamp_i64_to_i32(adj), m,
-                                    "M_out_input",
-                                    self.M_out_input_M0, self.M_out_input_n)
+                rq_i = self._rq_out(
+                    self._clamp_i64_to_i32(adj),
+                    m,
+                    "M_out_input",
+                    self.M_out_input_M0,
+                    self.M_out_input_n,
+                )
                 self.b.store(self.b.add(self.b.load(y_var), rq_i), y_var)
 
             acc_var = self.b.alloca(_I64, name="acc_state_ro")
@@ -2342,18 +2561,23 @@ class _AffineLowerer:
                 col = self.b.add(_ci(off_state), j)
                 w = _load2d_global(self.b, g_Wout, F, m, col)
                 h = _load1d(self.b, self.h_buf, j)
-                prod = self.b.mul(self.b.sext(w, _I64),
-                                   self.b.sext(h, _I64))
+                prod = self.b.mul(self.b.sext(w, _I64), self.b.sext(h, _I64))
                 self.b.store(
-                    self.b.add(self.b.load(acc_var), prod), acc_var,
+                    self.b.add(self.b.load(acc_var), prod),
+                    acc_var,
                 )
             rs = self.b.sext(_load1d_global(self.b, g_rs_state, m), _I64)
             adj = self.b.sub(
                 self.b.load(acc_var),
                 self.b.mul(self._ci64(self.zp_state), rs),
             )
-            rq_s = self._rq_out(self._clamp_i64_to_i32(adj), m, "M_out_state",
-                                self.M_out_state_M0, self.M_out_state_n)
+            rq_s = self._rq_out(
+                self._clamp_i64_to_i32(adj),
+                m,
+                "M_out_state",
+                self.M_out_state_M0,
+                self.M_out_state_n,
+            )
             self.b.store(self.b.add(self.b.load(y_var), rq_s), y_var)
 
             y_q = self._emit_saturate_to_storage(self.b.load(y_var))
@@ -2381,9 +2605,13 @@ class CompiledAffineRC:
         self.rc = qmodel.rc
         self.head = head or "logits"
         self._out_int = self.head == "classify"
-        self._ir_text = str(emit_quantized_affine_module(
-            qmodel, passes=passes, head=head,
-        ))
+        self._ir_text = str(
+            emit_quantized_affine_module(
+                qmodel,
+                passes=passes,
+                head=head,
+            )
+        )
         self._mod = llvm.parse_assembly(self._ir_text)
         self._mod.verify()
 
@@ -2411,11 +2639,15 @@ class CompiledAffineRC:
             raise NotImplementedError(
                 f"CompiledAffineRC: storage_bits {sw} not supported"
             )
-        out_ptr = (ctypes.POINTER(ctypes.c_int32) if self._out_int
-                   else ctypes.POINTER(self._cstorage))
+        out_ptr = (
+            ctypes.POINTER(ctypes.c_int32)
+            if self._out_int
+            else ctypes.POINTER(self._cstorage)
+        )
         addr = self._engine.get_function_address("rc_predict")
         self._cfn = ctypes.CFUNCTYPE(
-            None, ctypes.c_int64,
+            None,
+            ctypes.c_int64,
             ctypes.POINTER(self._cstorage),
             out_ptr,
         )(addr)
@@ -2429,13 +2661,17 @@ class CompiledAffineRC:
         if X.ndim == 1:
             X = X[:, None]
         from rclite.core.profile import Aggregation
+
         T = X.shape[0]
         Mout = self.qmodel.M
         # Sequence pooling collapses the whole input to a single output row.
-        n_rows = (1 if self.qmodel.rc.readout.aggregation != Aggregation.NONE
-                  else T)
+        n_rows = (
+            1 if self.qmodel.rc.readout.aggregation != Aggregation.NONE else T
+        )
         # Quantize input via the model's input params (matches Python ref).
-        X_q = self.qmodel.config.input.quantize_array(X).astype(self._np_storage)
+        X_q = self.qmodel.config.input.quantize_array(X).astype(
+            self._np_storage
+        )
         X_q = np.ascontiguousarray(X_q.reshape(-1))
         if self._out_int:
             Y = np.zeros(n_rows, dtype=np.int32)
@@ -2478,9 +2714,15 @@ class CompiledRC:
 
     name = "llvm"
 
-    def __init__(self, rc: ReservoirComputer, exe: RCExecutor,
-                 opt_level: int = 3, vectorize: bool = True,
-                 passes=None, head=None):
+    def __init__(
+        self,
+        rc: ReservoirComputer,
+        exe: RCExecutor,
+        opt_level: int = 3,
+        vectorize: bool = True,
+        passes=None,
+        head=None,
+    ):
         _ensure_initialized()
         self.rc = rc
         self.exe = exe
@@ -2504,11 +2746,15 @@ class CompiledRC:
         self._engine.finalize_object()
         self._engine.run_static_constructors()
 
-        out_ptr = (ctypes.POINTER(ctypes.c_int32) if self._out_int
-                   else ctypes.POINTER(ctypes.c_double))
+        out_ptr = (
+            ctypes.POINTER(ctypes.c_int32)
+            if self._out_int
+            else ctypes.POINTER(ctypes.c_double)
+        )
         addr = self._engine.get_function_address("rc_predict")
         self._cfn = ctypes.CFUNCTYPE(
-            None, ctypes.c_int64,
+            None,
+            ctypes.c_int64,
             ctypes.POINTER(ctypes.c_double),
             out_ptr,
         )(addr)
@@ -2524,6 +2770,7 @@ class CompiledRC:
         if X.ndim == 1:
             X = X[:, None]
         from rclite.core.profile import Aggregation
+
         T = X.shape[0]
         M = self.rc.readout.units
         n_rows = 1 if self.rc.readout.aggregation != Aggregation.NONE else T
@@ -2581,8 +2828,7 @@ class CompiledRC:
             result = subprocess.run(cmd, capture_output=True, text=True)
             if result.returncode != 0:
                 raise RuntimeError(
-                    f"link failed: {' '.join(cmd)}\n"
-                    f"stderr:\n{result.stderr}"
+                    f"link failed: {' '.join(cmd)}\nstderr:\n{result.stderr}"
                 )
         finally:
             try:
@@ -2599,6 +2845,7 @@ class CompiledRC:
         models produce a single output row regardless of T.
         """
         from rclite.core.profile import Aggregation
+
         K = self.rc.input.units
         N = self.rc.reservoir.units
         M = self.rc.readout.units
@@ -2606,11 +2853,21 @@ class CompiledRC:
         trainer = self.rc.readout.trainer.name
         task = self.rc.readout.task.name
         agg = self.rc.readout.aggregation.name
-        n_rows = "1 (sequence-pooled)" if self.rc.readout.aggregation != Aggregation.NONE else "T"
-        out_decl = (f"int32_t *Y" if self._out_int else "double *Y")
-        out_desc = ("class id per row (argmax)" if self._out_int
-                    else ("softmax probabilities" if self.head == "proba"
-                          else "linear scores"))
+        n_rows = (
+            "1 (sequence-pooled)"
+            if self.rc.readout.aggregation != Aggregation.NONE
+            else "T"
+        )
+        out_decl = f"int32_t *Y" if self._out_int else "double *Y"
+        out_desc = (
+            "class id per row (argmax)"
+            if self._out_int
+            else (
+                "softmax probabilities"
+                if self.head == "proba"
+                else "linear scores"
+            )
+        )
         guard = "RC_PREDICT_H"
         header = (
             f"/* Auto-generated header for compiled ReservoirComputer.\n"
@@ -2639,7 +2896,7 @@ class CompiledRC:
             f"#define RC_NUM_CLASSES {M if task == 'CLASSIFICATION' else 0}\n"
             f"\n"
             f"#ifdef __cplusplus\n"
-            f"extern \"C\" {{\n"
+            f'extern "C" {{\n'
             f"#endif\n"
             f"\n"
             f"/* Run inference over a length-T sequence.\n"
@@ -2675,17 +2932,28 @@ class CompiledQuantizedRC:
 
     name = "llvm-quantized"
 
-    def __init__(self, qmodel, opt_level: int = 3, passes=None,
-                 saturating: bool = True, head=None):
+    def __init__(
+        self,
+        qmodel,
+        opt_level: int = 3,
+        passes=None,
+        saturating: bool = True,
+        head=None,
+    ):
         _ensure_initialized()
         self.qmodel = qmodel
         self.rc = qmodel.rc
         self.saturating = saturating
         self.head = head or "logits"
         self._out_int = self.head == "classify"
-        self._ir_text = str(emit_quantized_module(
-            qmodel, passes=passes, saturating=saturating, head=head,
-        ))
+        self._ir_text = str(
+            emit_quantized_module(
+                qmodel,
+                passes=passes,
+                saturating=saturating,
+                head=head,
+            )
+        )
         self._mod = llvm.parse_assembly(self._ir_text)
         self._mod.verify()
 
@@ -2716,13 +2984,19 @@ class CompiledQuantizedRC:
             self._cstorage = ctypes.c_int8
             self._np_storage = np.int8
         else:
-            raise NotImplementedError(f"storage width {sw} not supported in JIT")
+            raise NotImplementedError(
+                f"storage width {sw} not supported in JIT"
+            )
 
-        out_ptr = (ctypes.POINTER(ctypes.c_int32) if self._out_int
-                   else ctypes.POINTER(self._cstorage))
+        out_ptr = (
+            ctypes.POINTER(ctypes.c_int32)
+            if self._out_int
+            else ctypes.POINTER(self._cstorage)
+        )
         addr = self._engine.get_function_address("rc_predict")
         self._cfn = ctypes.CFUNCTYPE(
-            None, ctypes.c_int64,
+            None,
+            ctypes.c_int64,
             ctypes.POINTER(self._cstorage),
             out_ptr,
         )(addr)
@@ -2736,7 +3010,9 @@ class CompiledQuantizedRC:
         # The kernel preprocesses internally (PreprocessInput op); the caller
         # passes raw input quantized at input_scale.
         X_q = np.ascontiguousarray(
-            self.qmodel.target.quantize_input_array(X, cfg).astype(self._np_storage)
+            self.qmodel.target.quantize_input_array(X, cfg).astype(
+                self._np_storage
+            )
         )
         T = X_q.shape[0]
         if self._out_int:
@@ -2797,6 +3073,7 @@ def _add_fastmath_flags(ir_text: str) -> str:
     carry `fast` (or at least `reassoc contract`).
     """
     import re
+
     for op in _FASTMATH_OPS:
         pattern = re.compile(
             rf"\b{op}\s+(?=(?:float|double|half|<\s*\d+\s+x\s+"
@@ -2817,10 +3094,20 @@ class CrossCompiledRC:
 
     name = "llvm-cross"
 
-    def __init__(self, rc: ReservoirComputer, exe: RCExecutor, *,
-                 triple: str, cpu: str = "", features: str = "",
-                 dtype: str = "f32", opt_level: int = 2, passes=None,
-                 head=None, vectorize: bool = False):
+    def __init__(
+        self,
+        rc: ReservoirComputer,
+        exe: RCExecutor,
+        *,
+        triple: str,
+        cpu: str = "",
+        features: str = "",
+        dtype: str = "f32",
+        opt_level: int = 2,
+        passes=None,
+        head=None,
+        vectorize: bool = False,
+    ):
         _ensure_all_targets()
         self.rc = rc
         self.exe = exe
@@ -2841,7 +3128,10 @@ class CrossCompiledRC:
 
         target = llvm.Target.from_triple(triple)
         self._tm = target.create_target_machine(
-            cpu=cpu, features=features, opt=opt_level, reloc="static",
+            cpu=cpu,
+            features=features,
+            opt=opt_level,
+            reloc="static",
         )
 
         pto = llvm.create_pipeline_tuning_options()
@@ -2878,5 +3168,7 @@ class CrossCompiledRC:
         return str(self._mod)
 
 
-def cross_compile_rc(rc: ReservoirComputer, exe: RCExecutor, **kwargs) -> CrossCompiledRC:
+def cross_compile_rc(
+    rc: ReservoirComputer, exe: RCExecutor, **kwargs
+) -> CrossCompiledRC:
     return CrossCompiledRC(rc, exe, **kwargs)

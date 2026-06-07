@@ -4,6 +4,7 @@ A backend takes a trained `ReservoirComputer` (and its `RCExecutor` holding
 the materialized weight matrices) and produces a callable object exposing
 the `.predict(X)` shape-compatible with `RCExecutor.predict`.
 """
+
 from __future__ import annotations
 from typing import Protocol, runtime_checkable
 
@@ -20,4 +21,6 @@ class CompiledModel(Protocol):
 class Backend(Protocol):
     name: str
 
-    def compile(self, rc: ReservoirComputer, exe: RCExecutor) -> CompiledModel: ...
+    def compile(
+        self, rc: ReservoirComputer, exe: RCExecutor
+    ) -> CompiledModel: ...

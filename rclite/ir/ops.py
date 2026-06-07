@@ -6,6 +6,7 @@ The lowering visitor (`rclite.codegen.llvm`) emits target code per op
 class; passes (`rclite.ir.passes`) rewrite the op sequence to encode
 RC-specific structural optimizations.
 """
+
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional, Tuple
@@ -37,6 +38,7 @@ class SparseSpec:
         referenced by name: `val_name` (float values), `col_name` (i32
         column indices), `rowptr_name` (i32, length N+1).
     """
+
     kind: str  # "unroll" | "csr"
     nnz: int
     rows: Tuple[Tuple[Tuple[int, float], ...], ...] = ()
@@ -48,6 +50,7 @@ class SparseSpec:
 @dataclass(frozen=True)
 class PreprocessInput(Op):
     """u_pre := (u_raw - offset) * scale"""
+
     offset: float
     scale: float
     K: int
@@ -63,6 +66,7 @@ class ReservoirStep(Op):
       RANDOM / ESN_STANDARD: dense W_res matmul
       DLR / DLRB / SCR:      O(N) scalar chain (W_res unused)
     """
+
     leak: float
     bias: float
     N: int
@@ -83,6 +87,7 @@ class BuildPhi(Op):
     Materializes the readout feature vector in a buffer.
     Eliminated by `FuseStepReadout` when followed by `ReadoutLinear`.
     """
+
     include_bias: bool
     include_input: bool
     K: int
@@ -92,6 +97,7 @@ class BuildPhi(Op):
 @dataclass(frozen=True)
 class ReadoutLinear(Op):
     """y := W_out @ phi  (phi already materialized by BuildPhi)"""
+
     M: int
     F: int
     W_out_name: str = "W_out"
@@ -107,6 +113,7 @@ class FusedStepReadout(Op):
       - columns [1+K, F)   = reservoir state h
     No phi buffer is allocated.
     """
+
     leak: float
     bias: float
     N: int
@@ -133,6 +140,7 @@ class Argmax(Op):
     readout and emits the index of the largest. Monotone, so it is exact
     under any quantization of the readout.
     """
+
     M: int
 
 
@@ -143,6 +151,7 @@ class Softmax(Op):
     Classification head producing calibrated class probabilities. The
     max-subtraction keeps exp() in range; the float path calls libm exp.
     """
+
     M: int
 
 
@@ -154,6 +163,7 @@ class AccumulateState(Op):
     over post-washout steps (t >= min(washout, T-1)); mode="last" is a no-op
     (the final h is already in place). Paired with `FinalizeAggregate`.
     """
+
     N: int
     mode: str  # "mean" | "last"
     washout: int = 0
@@ -168,6 +178,7 @@ class FinalizeAggregate(Op):
     ReadoutLinear then run once on the pooled state, producing a single
     output row for the whole sequence.
     """
+
     N: int
     mode: str  # "mean" | "last"
     washout: int = 0
@@ -180,5 +191,6 @@ class TimeLoop(Op):
     `unroll` is a lowering hint: emit `unroll` body copies per iteration
     on the strided range, with a tail loop for the remainder.
     """
+
     body: Tuple[Op, ...]
     unroll: int = 1

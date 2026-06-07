@@ -12,6 +12,7 @@ and output tensors:
 For the symmetric path `in_zp = out_zp = 0` and the scales are powers of
 two (`2^-input_frac`, `2^-state_frac`).
 """
+
 from __future__ import annotations
 from dataclasses import dataclass
 
@@ -20,12 +21,12 @@ from dataclasses import dataclass
 class KernelInfo:
     """Target-agnostic description of an emitted `rc_predict` kernel."""
 
-    name: str               # short model name (used for the Rust crate)
-    quant: str              # "affine" | "symmetric"
-    storage_bits: int       # 8 / 16 (/ 32 for symmetric)
-    K: int                  # input dim
-    M: int                  # output dim
-    N: int                  # reservoir units
+    name: str  # short model name (used for the Rust crate)
+    quant: str  # "affine" | "symmetric"
+    storage_bits: int  # 8 / 16 (/ 32 for symmetric)
+    K: int  # input dim
+    M: int  # output dim
+    N: int  # reservoir units
     topology: str
     # Input quantization  (float x -> q):  q = round(x/in_scale) + in_zp
     in_scale: float
@@ -84,31 +85,49 @@ def _head_meta(qmodel):
     return task, n_classes
 
 
-def info_from_affine(qmodel, name: str = "rc_model", *, head=None) -> KernelInfo:
+def info_from_affine(
+    qmodel, name: str = "rc_model", *, head=None
+) -> KernelInfo:
     cfg = qmodel.config
     task, n_classes = _head_meta(qmodel)
     return KernelInfo(
-        name=name, quant="affine",
+        name=name,
+        quant="affine",
         storage_bits=qmodel.storage_bits,
-        K=qmodel.K, M=qmodel.M, N=qmodel.N,
+        K=qmodel.K,
+        M=qmodel.M,
+        N=qmodel.N,
         topology=qmodel.rc.reservoir.topology.name,
-        in_scale=float(cfg.input.scale), in_zp=int(cfg.input.zero_point),
-        out_scale=float(cfg.output.scale), out_zp=int(cfg.output.zero_point),
-        head=head or "logits", task=task, n_classes=n_classes,
+        in_scale=float(cfg.input.scale),
+        in_zp=int(cfg.input.zero_point),
+        out_scale=float(cfg.output.scale),
+        out_zp=int(cfg.output.zero_point),
+        head=head or "logits",
+        task=task,
+        n_classes=n_classes,
     )
 
 
-def info_from_symmetric(qmodel, name: str = "rc_model", *, head=None) -> KernelInfo:
+def info_from_symmetric(
+    qmodel, name: str = "rc_model", *, head=None
+) -> KernelInfo:
     cfg = qmodel.config
     task, n_classes = _head_meta(qmodel)
     return KernelInfo(
-        name=name, quant="symmetric",
+        name=name,
+        quant="symmetric",
         storage_bits=qmodel.target.storage_bits,
-        K=qmodel.K, M=qmodel.M, N=qmodel.N,
+        K=qmodel.K,
+        M=qmodel.M,
+        N=qmodel.N,
         topology=qmodel.rc.reservoir.topology.name,
         # symmetric input is quantized at 2^input_frac with zero_point 0
-        in_scale=1.0 / float(1 << cfg.input_frac), in_zp=0,
+        in_scale=1.0 / float(1 << cfg.input_frac),
+        in_zp=0,
         # output is reported at state scale = 2^state_frac
-        out_scale=1.0 / float(1 << cfg.state_frac), out_zp=0,
-        head=head or "logits", task=task, n_classes=n_classes,
+        out_scale=1.0 / float(1 << cfg.state_frac),
+        out_zp=0,
+        head=head or "logits",
+        task=task,
+        n_classes=n_classes,
     )

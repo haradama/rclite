@@ -10,6 +10,7 @@ The float trace gives us:
 
 Weights get symmetric absmax (TFLM convention, zero_point=0).
 """
+
 from __future__ import annotations
 from typing import Optional
 
@@ -21,8 +22,9 @@ from rclite.runtime.reference import RCExecutor
 from .types import AffineParams, AffineQuantConfig
 
 
-def _collect_float_traces(rc: ReservoirComputer, exe: RCExecutor,
-                            X: np.ndarray) -> dict:
+def _collect_float_traces(
+    rc: ReservoirComputer, exe: RCExecutor, X: np.ndarray
+) -> dict:
     """Replay the float reservoir; return per-step intermediates.
 
     Returns dict with arrays:
@@ -38,7 +40,9 @@ def _collect_float_traces(rc: ReservoirComputer, exe: RCExecutor,
     N = rc.reservoir.units
     M = rc.readout.units
 
-    U_pre = (X.astype(np.float64) - rc.input.input_offset) * rc.input.input_scaling
+    U_pre = (
+        X.astype(np.float64) - rc.input.input_offset
+    ) * rc.input.input_scaling
 
     H = np.zeros((T, N), dtype=np.float64)
     PRE = np.zeros((T, N), dtype=np.float64)
@@ -96,7 +100,9 @@ def calibrate_from_data(
     if w_out_storage_bits is None:
         w_out_storage_bits = storage_bits
     if exe.W_out is None:
-        raise ValueError("calibration needs a trained readout; call exe.fit() first")
+        raise ValueError(
+            "calibration needs a trained readout; call exe.fit() first"
+        )
     if washout is None:
         washout = int(rc.readout.washout)
 
@@ -119,21 +125,25 @@ def calibrate_from_data(
     W_out_input_p = None
     if rc.readout.include_bias:
         W_out_bias_p = AffineParams.symmetric_absmax(
-            exe.W_out[:, 0:1], w_out_storage_bits)
+            exe.W_out[:, 0:1], w_out_storage_bits
+        )
         off = 1
     if rc.readout.include_input:
         W_out_input_p = AffineParams.symmetric_absmax(
-            exe.W_out[:, off:off + K], w_out_storage_bits)
+            exe.W_out[:, off : off + K], w_out_storage_bits
+        )
         off += K
     W_out_state_p = AffineParams.symmetric_absmax(
-        exe.W_out[:, off:off + N], w_out_storage_bits)
+        exe.W_out[:, off : off + N], w_out_storage_bits
+    )
 
     # Per-channel W_res: one symmetric scale per reservoir row (output axis).
     # `W_res` param stays a valid per-tensor representative (unused on the
     # per-channel path); `W_res_scales` carries the per-row scales.
     W_res_scales = (
         AffineParams.symmetric_absmax_peraxis(exe.W_res, storage_bits)
-        if per_channel_W_res else None
+        if per_channel_W_res
+        else None
     )
 
     # Per-channel W_out: one symmetric scale per output row (output axis),
@@ -143,14 +153,17 @@ def calibrate_from_data(
         offc = 0
         if rc.readout.include_bias:
             W_out_bias_scales = AffineParams.symmetric_absmax_peraxis(
-                exe.W_out[:, 0:1], w_out_storage_bits)
+                exe.W_out[:, 0:1], w_out_storage_bits
+            )
             offc = 1
         if rc.readout.include_input:
             W_out_input_scales = AffineParams.symmetric_absmax_peraxis(
-                exe.W_out[:, offc:offc + K], w_out_storage_bits)
+                exe.W_out[:, offc : offc + K], w_out_storage_bits
+            )
             offc += K
         W_out_state_scales = AffineParams.symmetric_absmax_peraxis(
-            exe.W_out[:, offc:offc + N], w_out_storage_bits)
+            exe.W_out[:, offc : offc + N], w_out_storage_bits
+        )
 
     return AffineQuantConfig(
         input=AffineParams.asymmetric_minmax(X_eff, storage_bits),

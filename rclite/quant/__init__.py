@@ -16,9 +16,14 @@ Asymmetric per-tensor affine family (TFLM-style, `rclite.quant.affine`):
   - `quantize_model_affine()`             — float exe + config → model
   - `AffineQuantizedExecutor`             — integer Python reference
 """
+
 from .config import QuantConfig
 from .target import (
-    QuantTarget, I32FixedPoint, I16FixedPoint, I8Symmetric, I8Affine,
+    QuantTarget,
+    I32FixedPoint,
+    I16FixedPoint,
+    I8Symmetric,
+    I8Affine,
 )
 from .tanh_lut import TanhLUTSpec
 from .model import QuantizedModel
@@ -28,33 +33,53 @@ from .search import search_quantization, derive_frac_bits, SearchResult
 from .ir_builder import build_ir_from_quantized
 from .online import IntegerLMSLearner, collect_training_stream
 from .affine import (
-    AffineParams, AffineQuantConfig,
+    AffineParams,
+    AffineQuantConfig,
     calibrate_from_data,
-    LUTStrategy, LUTKind, LUTArtifacts, build_lut_artifacts,
-    AffineQuantizedModel, quantize_model_affine,
+    LUTStrategy,
+    LUTKind,
+    LUTArtifacts,
+    build_lut_artifacts,
+    AffineQuantizedModel,
+    quantize_model_affine,
     AffineQuantizedExecutor,
-    search_quantization_affine, AffineSearchResult,
+    search_quantization_affine,
+    AffineSearchResult,
     quantize_multiplier,
     build_ir_from_quantized_affine,
 )
 
 __all__ = [
     "QuantConfig",
-    "QuantTarget", "I32FixedPoint", "I16FixedPoint", "I8Symmetric", "I8Affine",
+    "QuantTarget",
+    "I32FixedPoint",
+    "I16FixedPoint",
+    "I8Symmetric",
+    "I8Affine",
     "TanhLUTSpec",
     "QuantizedModel",
-    "quantize_model", "quantize_W_out",
+    "quantize_model",
+    "quantize_W_out",
     "QuantizedExecutor",
-    "search_quantization", "derive_frac_bits", "SearchResult",
+    "search_quantization",
+    "derive_frac_bits",
+    "SearchResult",
     "build_ir_from_quantized",
     "IntegerLMSLearner",
     "collect_training_stream",
     # Affine
-    "AffineParams", "AffineQuantConfig",
+    "AffineParams",
+    "AffineQuantConfig",
     "calibrate_from_data",
-    "AffineQuantizedModel", "quantize_model_affine",
+    "AffineQuantizedModel",
+    "quantize_model_affine",
     "AffineQuantizedExecutor",
-    "search_quantization_affine", "AffineSearchResult",
-    "quantize_multiplier", "build_ir_from_quantized_affine",
-    "LUTStrategy", "LUTKind", "LUTArtifacts", "build_lut_artifacts",
+    "search_quantization_affine",
+    "AffineSearchResult",
+    "quantize_multiplier",
+    "build_ir_from_quantized_affine",
+    "LUTStrategy",
+    "LUTKind",
+    "LUTArtifacts",
+    "build_lut_artifacts",
 ]

@@ -17,6 +17,7 @@ Runner uses `wasmtime` to execute the resulting `.wasm` module; wasmtime
 enables the SIMD proposal by default, so the vectorized module runs
 unchanged.
 """
+
 from __future__ import annotations
 import pathlib
 import shutil
@@ -39,12 +40,16 @@ class WasmTarget(Target):
 
     triple = "wasm32-wasip1"
 
-    def __init__(self, dtype: str = "f32", *,
-                 simd: bool = True,
-                 rustc: str = "rustc",
-                 rust_target: str = "wasm32-wasip1",
-                 rust_edition: str = "2024",
-                 opt_level: str = "2"):
+    def __init__(
+        self,
+        dtype: str = "f32",
+        *,
+        simd: bool = True,
+        rustc: str = "rustc",
+        rust_target: str = "wasm32-wasip1",
+        rust_edition: str = "2024",
+        opt_level: str = "2",
+    ):
         if dtype != "f32":
             raise ValueError(
                 f"WasmTarget currently only supports dtype='f32', got {dtype!r}"
@@ -55,8 +60,11 @@ class WasmTarget(Target):
         self.rust_target = rust_target
         self.rust_edition = rust_edition
         self.opt_level = opt_level
-        self.name = (f"wasm32/{rust_target}+simd128" if simd
-                     else f"wasm32/{rust_target}")
+        self.name = (
+            f"wasm32/{rust_target}+simd128"
+            if simd
+            else f"wasm32/{rust_target}"
+        )
 
     def _features(self) -> str:
         # `+simd128` enables the WebAssembly SIMD proposal in the wasm32
@@ -73,18 +81,24 @@ class WasmTarget(Target):
                 f"`rustup target add {self.rust_target}`"
             )
 
-    def _link_rustc(self, main_path: pathlib.Path, rc_o: pathlib.Path,
-                    wasm: pathlib.Path) -> None:
+    def _link_rustc(
+        self, main_path: pathlib.Path, rc_o: pathlib.Path, wasm: pathlib.Path
+    ) -> None:
         """rustc compiles the harness against rust-std (bundling wasi-libc
         for `tanhf`/`memcpy`/...), then wasm-ld pulls `rc_predict.o` in via
         `-C link-arg`."""
         cmd = [
             self.rustc,
-            "--edition", self.rust_edition,
-            "--target", self.rust_target,
-            "-C", f"opt-level={self.opt_level}",
-            "-C", f"link-arg={rc_o}",
-            "-o", str(wasm),
+            "--edition",
+            self.rust_edition,
+            "--target",
+            self.rust_target,
+            "-C",
+            f"opt-level={self.opt_level}",
+            "-C",
+            f"link-arg={rc_o}",
+            "-o",
+            str(wasm),
             str(main_path),
         ]
         cp = subprocess.run(cmd, capture_output=True, text=True)
@@ -94,12 +108,17 @@ class WasmTarget(Target):
                 f"  stderr:\n{cp.stderr}"
             )
 
-    def compile(self, rc, exe, *,
-                output_dir,
-                test_inputs: Optional[np.ndarray] = None,
-                expected_outputs: Optional[np.ndarray] = None,
-                sparse=False,
-                **_) -> CompiledArtifact:
+    def compile(
+        self,
+        rc,
+        exe,
+        *,
+        output_dir,
+        test_inputs: Optional[np.ndarray] = None,
+        expected_outputs: Optional[np.ndarray] = None,
+        sparse=False,
+        **_,
+    ) -> CompiledArtifact:
         if test_inputs is None:
             raise ValueError(
                 "Wasm deployment needs `test_inputs` to embed in main.rs"
@@ -115,8 +134,12 @@ class WasmTarget(Target):
 
         # 1. Cross-compile rc_predict.o for wasm32.
         cc_obj = cross_compile_rc(
-            rc, exe, triple=self.triple, dtype=self.dtype,
-            features=self._features(), vectorize=self.simd,
+            rc,
+            exe,
+            triple=self.triple,
+            dtype=self.dtype,
+            features=self._features(),
+            vectorize=self.simd,
             passes=sparse_passes(sparse, include_structural=True),
         )
         rc_o = out / "rc_predict.o"
@@ -158,14 +181,16 @@ class WasmTarget(Target):
 
         # 4. Render main.rs from template.
         main_path = out / "main.rs"
-        main_path.write_text(render_template(
-            _SUPPORT_DIR / "main_template.rs",
-            T=str(T),
-            K=str(K),
-            M=str(M),
-            X_VALUES=", ".join(f"{v:.9g}_f32" for v in x_flat),
-            Y_VALUES=", ".join(f"{v:.9g}_f32" for v in y_flat),
-        ))
+        main_path.write_text(
+            render_template(
+                _SUPPORT_DIR / "main_template.rs",
+                T=str(T),
+                K=str(K),
+                M=str(M),
+                X_VALUES=", ".join(f"{v:.9g}_f32" for v in x_flat),
+                Y_VALUES=", ".join(f"{v:.9g}_f32" for v in y_flat),
+            )
+        )
 
         # 5. Link via rustc: rustc compiles main.rs against rust-std
         #    (which bundles wasi-libc for `tanhf`/`memcpy`/...), then wasm-ld
@@ -173,11 +198,16 @@ class WasmTarget(Target):
         wasm = out / "rc.wasm"
         cmd = [
             self.rustc,
-            "--edition", self.rust_edition,
-            "--target", self.rust_target,
-            "-C", f"opt-level={self.opt_level}",
-            "-C", f"link-arg={rc_o}",
-            "-o", str(wasm),
+            "--edition",
+            self.rust_edition,
+            "--target",
+            self.rust_target,
+            "-C",
+            f"opt-level={self.opt_level}",
+            "-C",
+            f"link-arg={rc_o}",
+            "-o",
+            str(wasm),
             str(main_path),
         ]
         cp = subprocess.run(cmd, capture_output=True, text=True)
@@ -192,7 +222,9 @@ class WasmTarget(Target):
             "rust_target": self.rust_target,
             "dtype": self.dtype,
             "simd": self.simd,
-            "T": T, "K": K, "M": M,
+            "T": T,
+            "K": K,
+            "M": M,
             "wasm_size": wasm.stat().st_size,
         }
 
@@ -205,8 +237,9 @@ class WasmTarget(Target):
             metadata=metadata,
         )
 
-    def _compile_quantized_object(self, qmodel, out: pathlib.Path,
-                                  sparse=False) -> pathlib.Path:
+    def _compile_quantized_object(
+        self, qmodel, out: pathlib.Path, sparse=False
+    ) -> pathlib.Path:
         """Cross-compile the integer (symmetric fixed-point) kernel to a
         wasm32 object.
 
@@ -217,17 +250,21 @@ class WasmTarget(Target):
         """
         import llvmlite.binding as llvm
         from rclite.codegen.llvm import (
-            emit_quantized_module, _ensure_all_targets,
+            emit_quantized_module,
+            _ensure_all_targets,
         )
+
         ll_mod = emit_quantized_module(
-            qmodel, passes=sparse_passes(sparse, include_structural=False))
+            qmodel, passes=sparse_passes(sparse, include_structural=False)
+        )
         ll_mod.triple = self.triple
         _ensure_all_targets()
         mod = llvm.parse_assembly(str(ll_mod))
         mod.verify()
         target = llvm.Target.from_triple(self.triple)
         tm = target.create_target_machine(
-            opt=int(self.opt_level), reloc="static",
+            opt=int(self.opt_level),
+            reloc="static",
         )
         pto = llvm.create_pipeline_tuning_options()
         pto.speed_level = int(self.opt_level)
@@ -242,11 +279,9 @@ class WasmTarget(Target):
             f.write(tm.emit_assembly(mod))
         return rc_o
 
-    def compile_quantized(self, qmodel, *,
-                          output_dir,
-                          test_inputs: np.ndarray,
-                          sparse=False,
-                          **_) -> CompiledArtifact:
+    def compile_quantized(
+        self, qmodel, *, output_dir, test_inputs: np.ndarray, sparse=False, **_
+    ) -> CompiledArtifact:
         """Cross-compile a *symmetric-quantized* (i8 / i16 / i32) model to a
         wasm32 module. The integer kernel takes storage_t inputs (at
         input_scale) and returns storage_t outputs (at state_scale) using
@@ -312,6 +347,7 @@ class WasmTarget(Target):
             X_q = X_q[:, None]
 
         from rclite.codegen.llvm import CompiledQuantizedRC
+
         host_kernel = CompiledQuantizedRC(qmodel)
         # predict() decodes to float = Y_q / state_scale; recover the exact
         # integer (values are < 2**31, representable in f64).
@@ -321,16 +357,18 @@ class WasmTarget(Target):
         Y_ref_q = np.rint(y_float * cfg.state_scale).astype(np_storage)
 
         main_path = out / "main_q.rs"
-        main_path.write_text(render_template(
-            _SUPPORT_DIR / "main_template_q.rs",
-            T=str(T),
-            K=str(K),
-            M=str(M),
-            STORAGE_T=storage_rs,
-            STATE_FRAC=str(cfg.state_frac),
-            X_VALUES_Q=", ".join(str(int(v)) for v in X_q.ravel()),
-            Y_VALUES_Q=", ".join(str(int(v)) for v in Y_ref_q.ravel()),
-        ))
+        main_path.write_text(
+            render_template(
+                _SUPPORT_DIR / "main_template_q.rs",
+                T=str(T),
+                K=str(K),
+                M=str(M),
+                STORAGE_T=storage_rs,
+                STATE_FRAC=str(cfg.state_frac),
+                X_VALUES_Q=", ".join(str(int(v)) for v in X_q.ravel()),
+                Y_VALUES_Q=", ".join(str(int(v)) for v in Y_ref_q.ravel()),
+            )
+        )
 
         wasm = out / "rc_q.wasm"
         self._link_rustc(main_path, rc_o, wasm)
@@ -347,18 +385,25 @@ class WasmTarget(Target):
                 "dtype": f"i{sw}",
                 "quantized": True,
                 "state_frac": cfg.state_frac,
-                "T": T, "K": K, "M": M,
+                "T": T,
+                "K": K,
+                "M": M,
                 "wasm_size": wasm.stat().st_size,
             },
         )
 
-    def compile_bench(self, rc, exe, *,
-                      output_dir,
-                      test_inputs: np.ndarray,
-                      expected_outputs: Optional[np.ndarray] = None,
-                      repeats: int = 25,
-                      warmup: int = 3,
-                      **_) -> CompiledArtifact:
+    def compile_bench(
+        self,
+        rc,
+        exe,
+        *,
+        output_dir,
+        test_inputs: np.ndarray,
+        expected_outputs: Optional[np.ndarray] = None,
+        repeats: int = 25,
+        warmup: int = 3,
+        **_,
+    ) -> CompiledArtifact:
         """Compile a benchmark harness that times rc_predict internally.
 
         The resulting `.wasm` runs `repeats` measured inferences (after
@@ -381,8 +426,12 @@ class WasmTarget(Target):
         out.mkdir(parents=True, exist_ok=True)
 
         cc_obj = cross_compile_rc(
-            rc, exe, triple=self.triple, dtype=self.dtype,
-            features=self._features(), vectorize=self.simd,
+            rc,
+            exe,
+            triple=self.triple,
+            dtype=self.dtype,
+            features=self._features(),
+            vectorize=self.simd,
         )
         rc_o = out / "rc_predict.o"
         cc_obj.emit_object(str(rc_o))
@@ -420,25 +469,32 @@ class WasmTarget(Target):
         y_flat = y_ref.ravel()
 
         main_path = out / "bench.rs"
-        main_path.write_text(render_template(
-            _SUPPORT_DIR / "bench_template.rs",
-            T=str(T),
-            K=str(K),
-            M=str(M),
-            REPEATS=str(repeats),
-            WARMUP=str(warmup),
-            X_VALUES=", ".join(f"{v:.9g}_f32" for v in x_flat),
-            Y_VALUES=", ".join(f"{v:.9g}_f32" for v in y_flat),
-        ))
+        main_path.write_text(
+            render_template(
+                _SUPPORT_DIR / "bench_template.rs",
+                T=str(T),
+                K=str(K),
+                M=str(M),
+                REPEATS=str(repeats),
+                WARMUP=str(warmup),
+                X_VALUES=", ".join(f"{v:.9g}_f32" for v in x_flat),
+                Y_VALUES=", ".join(f"{v:.9g}_f32" for v in y_flat),
+            )
+        )
 
         wasm = out / "rc_bench.wasm"
         cmd = [
             self.rustc,
-            "--edition", self.rust_edition,
-            "--target", self.rust_target,
-            "-C", f"opt-level={self.opt_level}",
-            "-C", f"link-arg={rc_o}",
-            "-o", str(wasm),
+            "--edition",
+            self.rust_edition,
+            "--target",
+            self.rust_target,
+            "-C",
+            f"opt-level={self.opt_level}",
+            "-C",
+            f"link-arg={rc_o}",
+            "-o",
+            str(wasm),
             str(main_path),
         ]
         cp = subprocess.run(cmd, capture_output=True, text=True)
@@ -459,23 +515,34 @@ class WasmTarget(Target):
                 "rust_target": self.rust_target,
                 "dtype": self.dtype,
                 "simd": self.simd,
-                "T": T, "K": K, "M": M,
-                "repeats": repeats, "warmup": warmup,
+                "T": T,
+                "K": K,
+                "M": M,
+                "repeats": repeats,
+                "warmup": warmup,
                 "wasm_size": wasm.stat().st_size,
                 "bench": True,
             },
         )
 
-    def run(self, artifact: CompiledArtifact, *,
-            wasmtime: str = "wasmtime",
-            timeout: float = 60.0,
-            **_) -> RunResult:
+    def run(
+        self,
+        artifact: CompiledArtifact,
+        *,
+        wasmtime: str = "wasmtime",
+        timeout: float = 60.0,
+        **_,
+    ) -> RunResult:
         if shutil.which(wasmtime) is None:
             raise RuntimeError(f"{wasmtime} not found on PATH")
         cp = subprocess.run(
             [wasmtime, str(artifact.binary)],
-            capture_output=True, text=True, timeout=timeout,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
         )
         output = (cp.stdout or "") + (cp.stderr or "")
         success = (cp.returncode == 0) and ("EMULATOR_EXIT" in output)
-        return RunResult(success=success, output=output, returncode=cp.returncode)
+        return RunResult(
+            success=success, output=output, returncode=cp.returncode
+        )

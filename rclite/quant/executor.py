@@ -6,12 +6,11 @@ arithmetic here is identical (modulo floating-point preprocessing) to
 what the LLVM integer lowering emits, so a config that scores well here
 will score the same on the deployed binary.
 """
+
 from __future__ import annotations
-from typing import Optional
 
 import numpy as np
 
-from rclite.core.profile import Topology
 from .model import QuantizedModel
 from ._intops import fixed_mul_i32, trunc_i32, tanh_lut_lookup, wrap_to_storage
 
@@ -35,7 +34,9 @@ class QuantizedExecutor:
         self.storage_bits = self.target.storage_bits
         self.shift_input = cfg.weight_frac + cfg.input_frac - cfg.state_frac
         self.shift_recurrent = cfg.weight_frac
-        self.leak_q = self.target.quantize_state(qmodel.rc.reservoir.leak_rate, cfg)
+        self.leak_q = self.target.quantize_state(
+            qmodel.rc.reservoir.leak_rate, cfg
+        )
         self.one_minus_leak_q = (1 << cfg.state_frac) - self.leak_q
         self.bias_q = self.target.quantize_state(qmodel.rc.reservoir.bias, cfg)
 
@@ -87,15 +88,21 @@ class QuantizedExecutor:
             # term[i, k] = (W_in[i, k] * u[k]) >> shift_in, trunc to i32
             terms = trunc_i32((W_in * u[np.newaxis, :]) >> self.shift_input)
             for k in range(q.K):
-                pre_q = trunc_i32(pre_q.astype(np.int64) + terms[:, k].astype(np.int64))
+                pre_q = trunc_i32(
+                    pre_q.astype(np.int64) + terms[:, k].astype(np.int64)
+                )
 
         for i in range(N):
             nz_idx, w_row = self._W_res_csr[i]
             if nz_idx.size == 0:
                 continue
-            terms = trunc_i32((w_row.astype(np.int64)
-                                * self.state_q[nz_idx].astype(np.int64))
-                               >> self.shift_recurrent)
+            terms = trunc_i32(
+                (
+                    w_row.astype(np.int64)
+                    * self.state_q[nz_idx].astype(np.int64)
+                )
+                >> self.shift_recurrent
+            )
             acc = int(pre_q[i])
             for t in terms:
                 acc = int(trunc_i32(np.int64(acc + int(t))))
@@ -146,7 +153,9 @@ class QuantizedExecutor:
     # ------------------------------------------------------------------
     # Readout
 
-    def predict_one_q(self, u_raw_q: np.ndarray, state_q: np.ndarray) -> np.ndarray:
+    def predict_one_q(
+        self, u_raw_q: np.ndarray, state_q: np.ndarray
+    ) -> np.ndarray:
         """mirage-style readout with mixed-scale W_out_q. Returns y_q (state scale, i32)."""
         cfg = self.config
         q = self.qmodel
@@ -163,11 +172,13 @@ class QuantizedExecutor:
             out += bias_scaled * q.W_out_q[:, 0].astype(np.int64)
             off = 1
         if q.rc.readout.include_input:
-            out += (q.W_out_q[:, off:off + q.K].astype(np.int64)
-                     @ u_raw_q.astype(np.int64))
+            out += q.W_out_q[:, off : off + q.K].astype(
+                np.int64
+            ) @ u_raw_q.astype(np.int64)
             off += q.K
-        out += (q.W_out_q[:, off:off + q.N].astype(np.int64)
-                 @ state_q.astype(np.int64))
+        out += q.W_out_q[:, off : off + q.N].astype(np.int64) @ state_q.astype(
+            np.int64
+        )
         # Shift back to state scale, then saturate-truncate to storage range
         # to mirror JIT's `clamp → trunc` at the end of _lower_readout_linear.
         shifted = out >> cfg.state_frac

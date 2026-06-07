@@ -25,6 +25,7 @@ Public API:
   - `search_quantization_affine()` — QAT refit search (iterative)
   - `AffineSearchResult`         — return type of the QAT search
 """
+
 from .types import AffineParams, AffineQuantConfig
 from .calibrate import calibrate_from_data
 from .lut import LUTStrategy, LUTKind, LUTArtifacts, build_lut_artifacts
@@ -38,7 +39,10 @@ __all__ = [
     "AffineParams",
     "AffineQuantConfig",
     "calibrate_from_data",
-    "LUTStrategy", "LUTKind", "LUTArtifacts", "build_lut_artifacts",
+    "LUTStrategy",
+    "LUTKind",
+    "LUTArtifacts",
+    "build_lut_artifacts",
     "AffineQuantizedModel",
     "quantize_model_affine",
     "AffineQuantizedExecutor",

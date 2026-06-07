@@ -1,15 +1,24 @@
 """SysML v2: package RC::Blocks"""
+
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
-from .profile import Activation, Aggregation, Distribution, Task, Topology, Trainer
+from .profile import (
+    Activation,
+    Aggregation,
+    Distribution,
+    Task,
+    Topology,
+    Trainer,
+)
 from .ports import SignalIn, SignalOut
 
 
 @dataclass
 class Layer:
     """SysML2: part def Layer { units, activation; port in_; port out_ }"""
+
     units: int
     activation: Activation = Activation.TANH
     name: str = ""
@@ -36,6 +45,7 @@ class InputNode(Layer):
     in the runtime. Setting it to BERNOULLI yields the deterministic ±v signs
     used by the Rodan-Tino minimum-complexity reservoirs.
     """
+
     input_scaling: float = 1.0
     input_offset: float = 0.0
     input_distribution: Distribution = Distribution.NORMAL
@@ -54,6 +64,7 @@ class ReservoirNode(Layer):
       - `chain_feedback` is the backward weight (DLRB only)
       - `spectral_radius` is ignored at construction (informational)
     """
+
     spectral_radius: float = 0.9
     leak_rate: float = 1.0
     density: float = 0.1
@@ -80,7 +91,9 @@ class ReservoirNode(Layer):
             raise ValueError(
                 f"ReservoirNode.density must be in [0,1], got {self.density}"
             )
-        if self.is_structured() and not (0.0 <= abs(self.chain_weight) <= 10.0):
+        if self.is_structured() and not (
+            0.0 <= abs(self.chain_weight) <= 10.0
+        ):
             raise ValueError(
                 f"ReservoirNode.chain_weight unreasonable: {self.chain_weight}"
             )
@@ -110,6 +123,7 @@ class ReadoutNode(Layer):
     readout; MEAN / LAST collapse a whole sequence to one feature vector so a
     sequence maps to a single label (or scalar).
     """
+
     trainer: Trainer = Trainer.RIDGE
     regularization: float = 1e-6
     washout: int = 100

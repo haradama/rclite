@@ -15,6 +15,7 @@ This is the same shape as rc-bench's `Unroll2ElideCopyConstT` but with a
 parameterizable K and no need for buffer ping-pong (we already update h
 in place).
 """
+
 from __future__ import annotations
 from dataclasses import dataclass, replace
 

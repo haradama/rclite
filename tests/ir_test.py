@@ -1,5 +1,6 @@
 """Tests for the rclite IR layer (ops, passes, printer) and parity with
 direct lowering."""
+
 from __future__ import annotations
 import pathlib
 import sys
@@ -10,14 +11,24 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import numpy as np
 
 from rclite import (
-    InputNode, ReservoirNode, ReadoutNode, ReservoirComputer,
-    Activation, Distribution, Topology, Trainer,
+    InputNode,
+    ReservoirNode,
+    ReadoutNode,
+    ReservoirComputer,
+    Activation,
+    Distribution,
+    Topology,
+    Trainer,
 )
 from rclite.runtime import RCExecutor
 from rclite.ir import (
-    build_ir, to_mlir_text,
-    StructuralSpecialize, FuseStepReadout, TimeUnroll,
-    TimeLoop, PreprocessInput, ReservoirStep, BuildPhi, ReadoutLinear,
+    build_ir,
+    to_mlir_text,
+    StructuralSpecialize,
+    FuseStepReadout,
+    TimeUnroll,
+    TimeLoop,
+    ReservoirStep,
     FusedStepReadout,
 )
 from rclite.codegen import compile_rc
@@ -35,19 +46,40 @@ def expect_raises(exc_type, fn, *args, **kwargs):
     raise AssertionError(f"Expected {exc_type.__name__}, none raised")
 
 
-def _build(topology=Topology.ESN_STANDARD, units=60, include_input=True,
-            include_bias=True):
+def _build(
+    topology=Topology.ESN_STANDARD,
+    units=60,
+    include_input=True,
+    include_bias=True,
+):
     rc = ReservoirComputer(
-        input=InputNode(units=1, input_offset=0.5, input_scaling=1.0,
-                        input_distribution=Distribution.BERNOULLI, name="in"),
-        reservoir=ReservoirNode(units=units, activation=Activation.TANH,
-                                topology=topology, chain_weight=0.85,
-                                spectral_radius=0.9, leak_rate=0.3,
-                                density=0.2, seed=11, name="res"),
-        readout=ReadoutNode(units=1, trainer=Trainer.RIDGE,
-                            regularization=1e-6, washout=80,
-                            include_bias=include_bias,
-                            include_input=include_input, name="out"),
+        input=InputNode(
+            units=1,
+            input_offset=0.5,
+            input_scaling=1.0,
+            input_distribution=Distribution.BERNOULLI,
+            name="in",
+        ),
+        reservoir=ReservoirNode(
+            units=units,
+            activation=Activation.TANH,
+            topology=topology,
+            chain_weight=0.85,
+            spectral_radius=0.9,
+            leak_rate=0.3,
+            density=0.2,
+            seed=11,
+            name="res",
+        ),
+        readout=ReadoutNode(
+            units=1,
+            trainer=Trainer.RIDGE,
+            regularization=1e-6,
+            washout=80,
+            include_bias=include_bias,
+            include_input=include_input,
+            name="out",
+        ),
     )
     exe = RCExecutor(rc)
     rng = np.random.default_rng(0)
@@ -66,8 +98,12 @@ def test_build_ir_default_shape():
     assert isinstance(loop, TimeLoop)
     assert loop.unroll == 1
     types = [type(o).__name__ for o in loop.body]
-    assert types == ["PreprocessInput", "ReservoirStep", "BuildPhi",
-                     "ReadoutLinear"]
+    assert types == [
+        "PreprocessInput",
+        "ReservoirStep",
+        "BuildPhi",
+        "ReadoutLinear",
+    ]
     assert set(m.weights.keys()) == {"W_in", "W_res", "W_out"}
 
 
@@ -86,14 +122,24 @@ def test_structural_specialize_drops_W_res_when_unused():
     # Manually convert the op's topology to SCR but keep W_res referenced;
     # StructuralSpecialize should clean it up.
     from dataclasses import replace
+
     step = m.ops[0].body[1]
-    forced = TimeLoop(body=tuple(
-        replace(step, topology=Topology.SCR, chain_weight=0.85)
-        if isinstance(o, ReservoirStep) else o
-        for o in m.ops[0].body
-    ))
-    m2 = type(m)(K=m.K, N=m.N, M=m.M, weights=dict(m.weights),
-                  ops=[forced], metadata=dict(m.metadata))
+    forced = TimeLoop(
+        body=tuple(
+            replace(step, topology=Topology.SCR, chain_weight=0.85)
+            if isinstance(o, ReservoirStep)
+            else o
+            for o in m.ops[0].body
+        )
+    )
+    m2 = type(m)(
+        K=m.K,
+        N=m.N,
+        M=m.M,
+        weights=dict(m.weights),
+        ops=[forced],
+        metadata=dict(m.metadata),
+    )
     m3 = StructuralSpecialize()(m2)
     assert "W_res" not in m3.weights
     new_step = m3.ops[0].body[1]
@@ -104,14 +150,24 @@ def test_structural_specialize_rejects_unstable_scr():
     rc, exe, _ = _build(topology=Topology.SCR)
     m = build_ir(rc, exe)
     from dataclasses import replace
+
     step = m.ops[0].body[1]
-    bad = TimeLoop(body=tuple(
-        replace(step, chain_weight=1.5)
-        if isinstance(o, ReservoirStep) else o
-        for o in m.ops[0].body
-    ))
-    m_bad = type(m)(K=m.K, N=m.N, M=m.M, weights=dict(m.weights),
-                     ops=[bad], metadata=dict(m.metadata))
+    bad = TimeLoop(
+        body=tuple(
+            replace(step, chain_weight=1.5)
+            if isinstance(o, ReservoirStep)
+            else o
+            for o in m.ops[0].body
+        )
+    )
+    m_bad = type(m)(
+        K=m.K,
+        N=m.N,
+        M=m.M,
+        weights=dict(m.weights),
+        ops=[bad],
+        metadata=dict(m.metadata),
+    )
     expect_raises(ValueError, StructuralSpecialize(), m_bad)
 
 
@@ -205,20 +261,29 @@ def test_parity_fuse_only():
 
 
 def test_parity_structural_and_fuse():
-    _parity(passes=[StructuralSpecialize(), FuseStepReadout()],
-             topology=Topology.SCR)
+    _parity(
+        passes=[StructuralSpecialize(), FuseStepReadout()],
+        topology=Topology.SCR,
+    )
 
 
 def test_parity_with_time_unroll():
     for K in (2, 4, 8):
-        _parity(passes=[StructuralSpecialize(), FuseStepReadout(),
-                         TimeUnroll(K=K)])
+        _parity(
+            passes=[StructuralSpecialize(), FuseStepReadout(), TimeUnroll(K=K)]
+        )
 
 
 def test_parity_unroll_with_dlr_dlrb():
     for topo in (Topology.DLR, Topology.DLRB):
-        _parity(passes=[StructuralSpecialize(), FuseStepReadout(),
-                         TimeUnroll(K=3)], topology=topo)
+        _parity(
+            passes=[
+                StructuralSpecialize(),
+                FuseStepReadout(),
+                TimeUnroll(K=3),
+            ],
+            topology=topo,
+        )
 
 
 def test_parity_unroll_non_divisible():
@@ -227,15 +292,21 @@ def test_parity_unroll_non_divisible():
     rng = np.random.default_rng(1)
     X = rng.standard_normal((37, 1)) * 0.3 + 0.5
     Y_ref = exe.predict(X)
-    jit = compile_rc(rc, exe, passes=[StructuralSpecialize(),
-                                        FuseStepReadout(), TimeUnroll(K=4)])
+    jit = compile_rc(
+        rc,
+        exe,
+        passes=[StructuralSpecialize(), FuseStepReadout(), TimeUnroll(K=4)],
+    )
     Y_jit = jit.predict(X)
     diff = float(np.max(np.abs(Y_ref - Y_jit)))
     assert diff < 1e-10, f"non-divisible unroll parity diff = {diff}"
 
 
-TESTS = [v for k, v in list(globals().items())
-         if k.startswith("test_") and callable(v)]
+TESTS = [
+    v
+    for k, v in list(globals().items())
+    if k.startswith("test_") and callable(v)
+]
 
 
 def main() -> int:

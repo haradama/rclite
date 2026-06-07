@@ -15,6 +15,7 @@ Runner uses mGBA under xvfb. The GBA has no clean program-exit, so the driver
 loops forever after printing TEST_PASS / TEST_FAIL and the runner stops the
 emulator with a timeout (a timeout is treated as "ran without crashing").
 """
+
 from __future__ import annotations
 import os
 import pathlib
@@ -26,7 +27,10 @@ from typing import Optional
 import numpy as np
 
 from rclite.codegen import compile_rc, cross_compile_rc
-from rclite.codegen.llvm import emit_quantized_module, emit_quantized_affine_module
+from rclite.codegen.llvm import (
+    emit_quantized_module,
+    emit_quantized_affine_module,
+)
 from rclite.codegen.templating import render_template
 from rclite.ir import sparse_passes
 from ..target import Target, CompiledArtifact, RunResult
@@ -83,7 +87,7 @@ class GbaTarget(Target):
         tm = target.create_target_machine(cpu=self.cpu, opt=2, reloc="static")
         pto = llvm.create_pipeline_tuning_options()
         pto.speed_level = 2
-        pto.loop_vectorization = False   # ARMv4T has no SIMD
+        pto.loop_vectorization = False  # ARMv4T has no SIMD
         pto.slp_vectorization = False
         pb = llvm.create_pass_builder(tm, pto)
         pb.getModulePassManager().run(mod, pb)
@@ -94,8 +98,14 @@ class GbaTarget(Target):
             f.write(tm.emit_assembly(mod))
         return rc_o
 
-    def _build_rom(self, out: pathlib.Path, rc_o: pathlib.Path,
-                   main_path: pathlib.Path, *, with_float: bool) -> pathlib.Path:
+    def _build_rom(
+        self,
+        out: pathlib.Path,
+        rc_o: pathlib.Path,
+        main_path: pathlib.Path,
+        *,
+        with_float: bool,
+    ) -> pathlib.Path:
         """Assemble crt0, compile main, link the ELF, then objcopy to .gba.
 
         Returns the path to the runnable cartridge image (rc.gba).
@@ -105,29 +115,61 @@ class GbaTarget(Target):
         shutil.copy(_SUPPORT_DIR / "crt0.s", crt0_path)
         shutil.copy(_SUPPORT_DIR / _LINKER_SCRIPT, linker_path)
 
-        common = [f"-mcpu={self.cpu}", "-mthumb-interwork", "-O2", "-g",
-                  "-ffunction-sections", "-fdata-sections", "-Wall", f"-I{out}"]
+        common = [
+            f"-mcpu={self.cpu}",
+            "-mthumb-interwork",
+            "-O2",
+            "-g",
+            "-ffunction-sections",
+            "-fdata-sections",
+            "-Wall",
+            f"-I{out}",
+        ]
 
         # crt0 is ARM; main is Thumb.
         crt0_o = out / "crt0.o"
         cp = subprocess.run(
-            [self.cc, "-c", f"-mcpu={self.cpu}", "-marm", "-mthumb-interwork",
-             str(crt0_path), "-o", str(crt0_o)],
-            capture_output=True, text=True)
+            [
+                self.cc,
+                "-c",
+                f"-mcpu={self.cpu}",
+                "-marm",
+                "-mthumb-interwork",
+                str(crt0_path),
+                "-o",
+                str(crt0_o),
+            ],
+            capture_output=True,
+            text=True,
+        )
         if cp.returncode != 0:
             raise RuntimeError(f"assemble failed for crt0.s: {cp.stderr}")
 
         main_o = out / "main.o"
-        cp = subprocess.run([self.cc, "-c", *common, "-mthumb",
-                             str(main_path), "-o", str(main_o)],
-                            capture_output=True, text=True)
+        cp = subprocess.run(
+            [
+                self.cc,
+                "-c",
+                *common,
+                "-mthumb",
+                str(main_path),
+                "-o",
+                str(main_o),
+            ],
+            capture_output=True,
+            text=True,
+        )
         if cp.returncode != 0:
             raise RuntimeError(f"compile failed for main.c: {cp.stderr}")
 
         elf = out / "rc.elf"
         link_cmd = [
-            self.cc, f"-mcpu={self.cpu}", "-mthumb", "-mthumb-interwork",
-            "-T", str(linker_path),
+            self.cc,
+            f"-mcpu={self.cpu}",
+            "-mthumb",
+            "-mthumb-interwork",
+            "-T",
+            str(linker_path),
             "-nostartfiles",
             "-Wl,--gc-sections",
             f"-Wl,-Map={out / 'rc.map'}",
@@ -136,8 +178,11 @@ class GbaTarget(Target):
         if with_float:
             link_cmd += _AEABI_ALIASES
         link_cmd += [str(crt0_o), str(main_o), str(rc_o), "-o", str(elf)]
-        link_cmd += ["-lm", "-lgcc", "-lc", "-lnosys"] if with_float \
+        link_cmd += (
+            ["-lm", "-lgcc", "-lc", "-lnosys"]
+            if with_float
             else ["-lgcc", "-lc", "-lnosys"]
+        )
         cp = subprocess.run(link_cmd, capture_output=True, text=True)
         if cp.returncode != 0:
             raise RuntimeError(f"link failed: {cp.stderr}")
@@ -149,7 +194,9 @@ class GbaTarget(Target):
             )
         cp = subprocess.run(
             [self.objcopy, "-O", "binary", str(elf), str(rom)],
-            capture_output=True, text=True)
+            capture_output=True,
+            text=True,
+        )
         if cp.returncode != 0:
             raise RuntimeError(f"objcopy failed: {cp.stderr}")
         return rom
@@ -158,20 +205,28 @@ class GbaTarget(Target):
         try:
             sz = subprocess.run(
                 [self.cc.replace("gcc", "size"), str(elf)],
-                capture_output=True, text=True, check=True)
+                capture_output=True,
+                text=True,
+                check=True,
+            )
             return sz.stdout.strip()
         except Exception:
             return None
 
     # -- compile entry points ----------------------------------------------
 
-    def compile(self, rc, exe, *,
-                output_dir,
-                test_inputs: Optional[np.ndarray] = None,
-                expected_outputs: Optional[np.ndarray] = None,
-                tol: float = 1e-2,
-                sparse=False,
-                **_) -> CompiledArtifact:
+    def compile(
+        self,
+        rc,
+        exe,
+        *,
+        output_dir,
+        test_inputs: Optional[np.ndarray] = None,
+        expected_outputs: Optional[np.ndarray] = None,
+        tol: float = 1e-2,
+        sparse=False,
+        **_,
+    ) -> CompiledArtifact:
         """Cross-compile the f32 (soft-float) kernel to a GBA cartridge."""
         if test_inputs is None:
             raise ValueError(
@@ -182,7 +237,11 @@ class GbaTarget(Target):
         out.mkdir(parents=True, exist_ok=True)
 
         cc_obj = cross_compile_rc(
-            rc, exe, triple=self.triple, cpu=self.cpu, dtype=self.dtype,
+            rc,
+            exe,
+            triple=self.triple,
+            cpu=self.cpu,
+            dtype=self.dtype,
             passes=sparse_passes(sparse, include_structural=True),
         )
         rc_o = out / "rc_predict.o"
@@ -197,25 +256,32 @@ class GbaTarget(Target):
             expected_outputs = host_jit.predict(test_inputs).astype(np.float32)
 
         x_flat = np.ascontiguousarray(test_inputs, dtype=np.float32).ravel()
-        y_flat = np.ascontiguousarray(expected_outputs, dtype=np.float32).ravel()
+        y_flat = np.ascontiguousarray(
+            expected_outputs, dtype=np.float32
+        ).ravel()
         main_path = out / "main.c"
         # @@T_LEN@@ is the step count T; X/Y are embedded row-major (T, K)/(T, M)
         # with the dims coming from rc_predict.h's RC_INPUT_DIM / RC_OUTPUT_DIM.
-        main_path.write_text(render_template(
-            _SUPPORT_DIR / "main_template.c",
-            T_LEN=str(test_inputs.shape[0]),
-            TOLF=f"{tol:.9g}",
-            X_VALUES=", ".join(f"{v:.9g}f" for v in x_flat),
-            Y_VALUES=", ".join(f"{v:.9g}f" for v in y_flat),
-        ))
+        main_path.write_text(
+            render_template(
+                _SUPPORT_DIR / "main_template.c",
+                T_LEN=str(test_inputs.shape[0]),
+                TOLF=f"{tol:.9g}",
+                X_VALUES=", ".join(f"{v:.9g}f" for v in x_flat),
+                Y_VALUES=", ".join(f"{v:.9g}f" for v in y_flat),
+            )
+        )
 
         shutil.copy(_SUPPORT_DIR / "mgba_log.h", out / "mgba_log.h")
         rom = self._build_rom(out, rc_o, main_path, with_float=True)
 
         elf = out / "rc.elf"
         metadata = {
-            "triple": self.triple, "cpu": self.cpu, "dtype": self.dtype,
-            "elf": elf, "tol": tol,
+            "triple": self.triple,
+            "cpu": self.cpu,
+            "dtype": self.dtype,
+            "elf": elf,
+            "tol": tol,
         }
         sz = self._size(elf)
         if sz is not None:
@@ -230,12 +296,16 @@ class GbaTarget(Target):
             metadata=metadata,
         )
 
-    def compile_quantized(self, qmodel, *,
-                          output_dir,
-                          test_inputs: np.ndarray,
-                          tol: int = 1,
-                          sparse=False,
-                          **_) -> CompiledArtifact:
+    def compile_quantized(
+        self,
+        qmodel,
+        *,
+        output_dir,
+        test_inputs: np.ndarray,
+        tol: int = 1,
+        sparse=False,
+        **_,
+    ) -> CompiledArtifact:
         """Cross-compile a symmetric (Q-format) quantized model to a .gba."""
         sw = qmodel.target.storage_bits
         # Known limitation: on multi-input (K>1) models the LLVM thumbv4t
@@ -268,45 +338,60 @@ class GbaTarget(Target):
                 f"compile_quantized: storage_bits={sw} not supported"
             )
 
-        rc_o = self._cross_object(emit_quantized_module(
-            qmodel, passes=sparse_passes(sparse, include_structural=False)), out)
+        rc_o = self._cross_object(
+            emit_quantized_module(
+                qmodel, passes=sparse_passes(sparse, include_structural=False)
+            ),
+            out,
+        )
 
         rc = qmodel.rc
         u_pre = (test_inputs - rc.input.input_offset) * rc.input.input_scaling
         X_q = qmodel.target.quantize_input_array(u_pre, cfg).astype(np_storage)
 
         from rclite.quant.executor import QuantizedExecutor
+
         qexe = QuantizedExecutor(qmodel)
         Y_ref_q = np.zeros((test_inputs.shape[0], qmodel.M), dtype=np_storage)
         for t in range(test_inputs.shape[0]):
-            x_row = (X_q[t] if X_q.ndim > 1
-                     else np.array([X_q[t]], dtype=np_storage))
+            x_row = (
+                X_q[t]
+                if X_q.ndim > 1
+                else np.array([X_q[t]], dtype=np_storage)
+            )
             qexe.step_q(x_row.astype(np.int32))
-            Y_ref_q[t] = qexe.predict_one_q(x_row.astype(np.int32),
-                                            qexe.state_q).astype(np_storage)
+            Y_ref_q[t] = qexe.predict_one_q(
+                x_row.astype(np.int32), qexe.state_q
+            ).astype(np_storage)
 
         T = len(X_q)
         main_path = out / "main.c"
-        main_path.write_text(render_template(
-            _SUPPORT_DIR / "main_template_q.c",
-            T_LEN=str(T),
-            RC_K=str(qmodel.K),
-            RC_M=str(qmodel.M),
-            STATE_FRAC=str(cfg.state_frac),
-            STORAGE_T=storage_t,
-            TOL=str(int(tol)),
-            X_VALUES_Q=", ".join(str(int(v)) for v in X_q.ravel()),
-            Y_VALUES_Q=", ".join(str(int(v)) for v in Y_ref_q.ravel()),
-        ))
+        main_path.write_text(
+            render_template(
+                _SUPPORT_DIR / "main_template_q.c",
+                T_LEN=str(T),
+                RC_K=str(qmodel.K),
+                RC_M=str(qmodel.M),
+                STATE_FRAC=str(cfg.state_frac),
+                STORAGE_T=storage_t,
+                TOL=str(int(tol)),
+                X_VALUES_Q=", ".join(str(int(v)) for v in X_q.ravel()),
+                Y_VALUES_Q=", ".join(str(int(v)) for v in Y_ref_q.ravel()),
+            )
+        )
 
         shutil.copy(_SUPPORT_DIR / "mgba_log.h", out / "mgba_log.h")
         rom = self._build_rom(out, rc_o, main_path, with_float=False)
 
         elf = out / "rc.elf"
         metadata = {
-            "triple": self.triple, "cpu": self.cpu, "dtype": f"i{sw}",
-            "state_frac": cfg.state_frac, "quantized": True,
-            "elf": elf, "tol": int(tol),
+            "triple": self.triple,
+            "cpu": self.cpu,
+            "dtype": f"i{sw}",
+            "state_frac": cfg.state_frac,
+            "quantized": True,
+            "elf": elf,
+            "tol": int(tol),
         }
         sz = self._size(elf)
         if sz is not None:
@@ -321,12 +406,16 @@ class GbaTarget(Target):
             metadata=metadata,
         )
 
-    def compile_affine_quantized(self, qmodel, *,
-                                 output_dir,
-                                 test_inputs: np.ndarray,
-                                 tol: int = 1,
-                                 sparse=False,
-                                 **_) -> CompiledArtifact:
+    def compile_affine_quantized(
+        self,
+        qmodel,
+        *,
+        output_dir,
+        test_inputs: np.ndarray,
+        tol: int = 1,
+        sparse=False,
+        **_,
+    ) -> CompiledArtifact:
         """Cross-compile an `AffineQuantizedModel` to a GBA cartridge.
 
         The recommended path for the GBA: pure-integer, no FPU/soft-float.
@@ -345,15 +434,22 @@ class GbaTarget(Target):
                 f"compile_affine_quantized: storage_bits={sw} not supported"
             )
 
-        rc_o = self._cross_object(emit_quantized_affine_module(
-            qmodel, passes=sparse_passes(sparse, include_structural=False)), out)
+        rc_o = self._cross_object(
+            emit_quantized_affine_module(
+                qmodel, passes=sparse_passes(sparse, include_structural=False)
+            ),
+            out,
+        )
 
         cfg = qmodel.config
         X_q = cfg.input.quantize_array(test_inputs).astype(np_storage)
 
         from rclite.quant.affine.executor import AffineQuantizedExecutor
+
         qexe = AffineQuantizedExecutor(qmodel)
-        test_inputs_2d = test_inputs[:, None] if test_inputs.ndim == 1 else test_inputs
+        test_inputs_2d = (
+            test_inputs[:, None] if test_inputs.ndim == 1 else test_inputs
+        )
         T = test_inputs_2d.shape[0]
         Y_ref_q = np.zeros((T, qmodel.M), dtype=np_storage)
         for t in range(T):
@@ -361,30 +457,38 @@ class GbaTarget(Target):
             x_raw_q = qexe._quantize_raw_input(x_raw)
             u_pre_q = qexe._quantize_u_pre(x_raw)
             qexe.step_q(u_pre_q)
-            Y_ref_q[t] = qexe.predict_one_q(x_raw_q, qexe.state_q).astype(np_storage)
+            Y_ref_q[t] = qexe.predict_one_q(x_raw_q, qexe.state_q).astype(
+                np_storage
+            )
 
         main_path = out / "main.c"
-        main_path.write_text(render_template(
-            _SUPPORT_DIR / "main_template_q_affine.c",
-            T_LEN=str(T),
-            RC_K=str(qmodel.K),
-            RC_M=str(qmodel.M),
-            STORAGE_T=storage_t,
-            LUT_KIND=qmodel.lut_strategy.kind.value,
-            TOL=str(int(tol)),
-            X_VALUES_Q=", ".join(str(int(v)) for v in X_q.ravel()),
-            Y_VALUES_Q=", ".join(str(int(v)) for v in Y_ref_q.ravel()),
-        ))
+        main_path.write_text(
+            render_template(
+                _SUPPORT_DIR / "main_template_q_affine.c",
+                T_LEN=str(T),
+                RC_K=str(qmodel.K),
+                RC_M=str(qmodel.M),
+                STORAGE_T=storage_t,
+                LUT_KIND=qmodel.lut_strategy.kind.value,
+                TOL=str(int(tol)),
+                X_VALUES_Q=", ".join(str(int(v)) for v in X_q.ravel()),
+                Y_VALUES_Q=", ".join(str(int(v)) for v in Y_ref_q.ravel()),
+            )
+        )
 
         shutil.copy(_SUPPORT_DIR / "mgba_log.h", out / "mgba_log.h")
         rom = self._build_rom(out, rc_o, main_path, with_float=False)
 
         elf = out / "rc.elf"
         metadata = {
-            "triple": self.triple, "cpu": self.cpu, "dtype": f"i{sw}",
-            "quantized": True, "affine": True,
+            "triple": self.triple,
+            "cpu": self.cpu,
+            "dtype": f"i{sw}",
+            "quantized": True,
+            "affine": True,
             "lut_kind": qmodel.lut_strategy.kind.value,
-            "elf": elf, "tol": int(tol),
+            "elf": elf,
+            "tol": int(tol),
         }
         sz = self._size(elf)
         if sz is not None:
@@ -401,11 +505,15 @@ class GbaTarget(Target):
 
     # -- runner ------------------------------------------------------------
 
-    def run(self, artifact: CompiledArtifact, *,
-            mgba: str = "mgba",
-            timeout: float = 5.0,
-            log_level: int = 15,
-            **_) -> RunResult:
+    def run(
+        self,
+        artifact: CompiledArtifact,
+        *,
+        mgba: str = "mgba",
+        timeout: float = 5.0,
+        log_level: int = 15,
+        **_,
+    ) -> RunResult:
         """Run the cartridge in mGBA and grep its debug log for TEST_PASS.
 
         The GBA has no clean program exit, so the driver loops forever after
@@ -437,8 +545,12 @@ class GbaTarget(Target):
         env.setdefault("SDL_AUDIODRIVER", "dummy")
 
         proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, start_new_session=True, env=env,
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+            env=env,
         )
         timed_out = False
         try:
@@ -455,9 +567,11 @@ class GbaTarget(Target):
 
         output = output or ""
         returncode = 124 if timed_out else proc.returncode
-        success = (returncode in (0, 124)
-                   and "TEST_PASS" in output
-                   and "TEST_FAIL" not in output)
+        success = (
+            returncode in (0, 124)
+            and "TEST_PASS" in output
+            and "TEST_FAIL" not in output
+        )
         return RunResult(success=success, output=output, returncode=returncode)
 
     @staticmethod

@@ -5,6 +5,7 @@ of a precomputed tanh table. The table itself is built lazily — both
 float and quantized variants are available so the IR and the runtime can
 share the same spec.
 """
+
 from __future__ import annotations
 from dataclasses import dataclass
 
@@ -30,10 +31,12 @@ class TanhLUTSpec:
         xs = np.linspace(self.xmin, self.xmax, self.n, dtype=np.float64)
         return np.tanh(xs).astype(np.float32)
 
-    def build_table_int(self, state_scale: int, dtype: np.dtype = np.int32
-                         ) -> np.ndarray:
+    def build_table_int(
+        self, state_scale: int, dtype: np.dtype = np.int32
+    ) -> np.ndarray:
         """Quantized table: tanh values multiplied by `state_scale`."""
         return np.clip(
             np.rint(self.build_table_f32().astype(np.float64) * state_scale),
-            np.iinfo(dtype).min, np.iinfo(dtype).max,
+            np.iinfo(dtype).min,
+            np.iinfo(dtype).max,
         ).astype(dtype)

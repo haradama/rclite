@@ -17,6 +17,7 @@ Available targets:
     NesTarget         — Nintendo Entertainment System (6502 / NROM) via llvm-mos
     Nes               — convenience preset: NesTarget runnable via Mesen
 """
+
 from .target import Target, CompiledArtifact, RunResult
 from .host import HostTarget
 from .cortex_m0 import CortexM0Target, CortexM0Board, MicrobitV1, Microbit
@@ -26,11 +27,20 @@ from .gba import GbaTarget, Gba
 from .nes import NesTarget, Nes
 
 __all__ = [
-    "Target", "CompiledArtifact", "RunResult",
+    "Target",
+    "CompiledArtifact",
+    "RunResult",
     "HostTarget",
-    "CortexM0Target", "CortexM0Board", "MicrobitV1", "Microbit",
-    "WasmTarget", "Wasmtime", "BrowserWasm",
+    "CortexM0Target",
+    "CortexM0Board",
+    "MicrobitV1",
+    "Microbit",
+    "WasmTarget",
+    "Wasmtime",
+    "BrowserWasm",
     "ArduinoUnoTarget",
-    "GbaTarget", "Gba",
-    "NesTarget", "Nes",
+    "GbaTarget",
+    "Gba",
+    "NesTarget",
+    "Nes",
 ]

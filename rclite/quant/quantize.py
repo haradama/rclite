@@ -1,4 +1,5 @@
 """Convert a trained float reservoir computer into a QuantizedModel."""
+
 from __future__ import annotations
 from typing import Optional
 
@@ -43,23 +44,33 @@ def quantize_model(
     W_res_q = target.quantize_weight_array(exe.W_res, config)
     W_out_q = quantize_W_out(exe.W_out, rc, config, target)
 
-    lut_table_q = lut.build_table_int(config.state_scale,
-                                        dtype=target.storage_dtype)
+    lut_table_q = lut.build_table_int(
+        config.state_scale, dtype=target.storage_dtype
+    )
 
     return QuantizedModel(
-        rc=rc, target=target, config=config, lut=lut,
-        W_in_q=W_in_q, W_res_q=W_res_q, W_out_q=W_out_q,
+        rc=rc,
+        target=target,
+        config=config,
+        lut=lut,
+        W_in_q=W_in_q,
+        W_res_q=W_res_q,
+        W_out_q=W_out_q,
         lut_table_q=lut_table_q,
     )
 
 
-def quantize_W_out(W_out: np.ndarray, rc: ReservoirComputer,
-                    cfg: QuantConfig, target: QuantTarget) -> np.ndarray:
+def quantize_W_out(
+    W_out: np.ndarray,
+    rc: ReservoirComputer,
+    cfg: QuantConfig,
+    target: QuantTarget,
+) -> np.ndarray:
     """mirage-style mixed-scale W_out quantization.
 
-      col 0           — bias  (if include_bias)        at state_scale
-      cols [1, 1+K)   — input pass-through (if any)    at state_scale^2 / input_scale
-      cols [1+K, F)   — reservoir state                at state_scale
+    col 0           — bias  (if include_bias)        at state_scale
+    cols [1, 1+K)   — input pass-through (if any)    at state_scale^2 / input_scale
+    cols [1+K, F)   — reservoir state                at state_scale
     """
     M, F = W_out.shape
     out = np.zeros((M, F), dtype=target.storage_dtype)
@@ -75,11 +86,13 @@ def quantize_W_out(W_out: np.ndarray, rc: ReservoirComputer,
         shift = 2 * cfg.state_frac - cfg.input_frac
         scale = float(1 << abs(shift))
         if shift >= 0:
-            scaled = W_out[:, off:off + K].astype(np.float64) * scale
+            scaled = W_out[:, off : off + K].astype(np.float64) * scale
         else:
-            scaled = W_out[:, off:off + K].astype(np.float64) / scale
-        out[:, off:off + K] = target._saturate_array(scaled)
+            scaled = W_out[:, off : off + K].astype(np.float64) / scale
+        out[:, off : off + K] = target._saturate_array(scaled)
         off += K
     # State weights (the trailing N columns)
-    out[:, off:off + N] = target.quantize_state_array(W_out[:, off:off + N], cfg)
+    out[:, off : off + N] = target.quantize_state_array(
+        W_out[:, off : off + N], cfg
+    )
     return out

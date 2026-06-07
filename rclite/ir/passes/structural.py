@@ -12,6 +12,7 @@ at the IR level:
 Verifies the chain_weight magnitude bound for structured topologies and
 errors out if it is unstable.
 """
+
 from __future__ import annotations
 from dataclasses import replace
 from typing import Iterable
@@ -20,7 +21,10 @@ from rclite.core.profile import Topology
 
 from ..module import Module
 from ..ops import (
-    Op, ReservoirStep, FusedStepReadout, TimeLoop,
+    Op,
+    ReservoirStep,
+    FusedStepReadout,
+    TimeLoop,
 )
 
 
@@ -36,8 +40,11 @@ class StructuralSpecialize:
         if "W_res" in weights and not _module_uses_W_res(new_ops):
             del weights["W_res"]
         return Module(
-            K=module.K, N=module.N, M=module.M,
-            weights=weights, ops=new_ops,
+            K=module.K,
+            N=module.N,
+            M=module.M,
+            weights=weights,
+            ops=new_ops,
             metadata=dict(module.metadata),
         )
 
@@ -46,14 +53,16 @@ class StructuralSpecialize:
             return replace(op, body=tuple(self._fix(o) for o in op.body))
         if isinstance(op, ReservoirStep):
             if op.topology in _STRUCTURED:
-                _validate_chain_bounds(op.topology, op.chain_weight,
-                                       op.chain_feedback)
+                _validate_chain_bounds(
+                    op.topology, op.chain_weight, op.chain_feedback
+                )
                 if op.W_res_name is not None:
                     return replace(op, W_res_name=None)
         if isinstance(op, FusedStepReadout):
             if op.topology in _STRUCTURED:
-                _validate_chain_bounds(op.topology, op.chain_weight,
-                                       op.chain_feedback)
+                _validate_chain_bounds(
+                    op.topology, op.chain_weight, op.chain_feedback
+                )
                 if op.W_res_name is not None:
                     return replace(op, W_res_name=None)
         return op
@@ -63,9 +72,7 @@ def _validate_chain_bounds(topology: Topology, cw: float, cb: float) -> None:
     if topology == Topology.DLR:
         return  # nilpotent — any chain_weight is fine
     if topology == Topology.SCR and abs(cw) >= 1.0:
-        raise ValueError(
-            f"SCR chain_weight={cw} violates |chain_weight| < 1"
-        )
+        raise ValueError(f"SCR chain_weight={cw} violates |chain_weight| < 1")
     if topology == Topology.DLRB and abs(cw) + abs(cb) >= 1.0:
         raise ValueError(
             f"DLRB |chain_weight|+|chain_feedback|={abs(cw) + abs(cb)} "

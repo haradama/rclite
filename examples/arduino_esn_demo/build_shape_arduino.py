@@ -30,9 +30,9 @@ Usage::
 
     python examples/arduino_esn_demo/build_shape_arduino.py
 """
+
 from __future__ import annotations
 import pathlib
-import shutil
 import subprocess
 import sys
 
@@ -40,11 +40,24 @@ import numpy as np
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 
-from rclite import (InputNode, ReservoirNode, ReadoutNode, ReservoirComputer,
-                    Activation, Distribution, Topology, Trainer, Task)
+from rclite import (
+    InputNode,
+    ReservoirNode,
+    ReadoutNode,
+    ReservoirComputer,
+    Activation,
+    Distribution,
+    Topology,
+    Trainer,
+    Task,
+)
 from rclite.runtime import RCExecutor
-from rclite.quant import (calibrate_from_data, quantize_model_affine,
-                          AffineQuantizedExecutor, LUTStrategy)
+from rclite.quant import (
+    calibrate_from_data,
+    quantize_model_affine,
+    AffineQuantizedExecutor,
+    LUTStrategy,
+)
 from rclite.targets import ArduinoUnoTarget
 
 BUILD = pathlib.Path(__file__).resolve().parents[2] / "build" / "arduino_shape"
@@ -55,24 +68,24 @@ SHAPE_CLASSES = ["rising", "falling", "peak", "valley", "sine"]
 N_CLASSES = len(SHAPE_CLASSES)
 
 # Per-step reformulation knobs.
-N_UNITS = 100          # SCR reservoir size (fits the Uno with room to spare)
-WASHOUT = 16           # transient steps to ignore for ranges + training
-LATE = 24              # train/read the label off the last LATE steps
-RIDGE = 1e-2           # readout L2 (a touch heavier helps the i8 path)
+N_UNITS = 100  # SCR reservoir size (fits the Uno with room to spare)
+WASHOUT = 16  # transient steps to ignore for ranges + training
+LATE = 24  # train/read the label off the last LATE steps
+RIDGE = 1e-2  # readout L2 (a touch heavier helps the i8 path)
 
 
 def _shape_window(kind: int, rng, jitter: float = 0.06) -> np.ndarray:
     """One labelled curve == one (SHAPE_W, 1) sequence (matches wasm demo)."""
     t = np.linspace(0.0, 1.0, SHAPE_W)
-    if kind == 0:                         # rising ramp
+    if kind == 0:  # rising ramp
         s = -1.0 + 2.0 * t
-    elif kind == 1:                       # falling ramp
+    elif kind == 1:  # falling ramp
         s = 1.0 - 2.0 * t
-    elif kind == 2:                       # peak (triangle: rise then fall)
+    elif kind == 2:  # peak (triangle: rise then fall)
         s = 1.0 - 4.0 * np.abs(t - 0.5)
-    elif kind == 3:                       # valley (V: fall then rise)
+    elif kind == 3:  # valley (V: fall then rise)
         s = -1.0 + 4.0 * np.abs(t - 0.5)
-    else:                                 # one sine cycle
+    else:  # one sine cycle
         s = np.sin(2.0 * np.pi * t)
     return (s + jitter * rng.standard_normal(SHAPE_W))[:, None]
 
@@ -96,16 +109,33 @@ def _one_hot(y, c):
 def _build_float_model():
     """Per-step (aggregation=NONE) 5-class classifier on the shape curves."""
     rc = ReservoirComputer(
-        input=InputNode(units=1, activation=Activation.IDENTITY,
-                        input_offset=0.0, input_scaling=1.0,
-                        input_distribution=Distribution.BERNOULLI, name="in"),
-        reservoir=ReservoirNode(units=N_UNITS, activation=Activation.TANH,
-                                 topology=Topology.SCR, chain_weight=0.9,
-                                 leak_rate=0.30, seed=9, name="res"),
-        readout=ReadoutNode(units=N_CLASSES, activation=Activation.IDENTITY,
-                            trainer=Trainer.RIDGE, regularization=RIDGE,
-                            washout=WASHOUT, include_bias=True,
-                            task=Task.CLASSIFICATION, name="out"),  # NONE agg
+        input=InputNode(
+            units=1,
+            activation=Activation.IDENTITY,
+            input_offset=0.0,
+            input_scaling=1.0,
+            input_distribution=Distribution.BERNOULLI,
+            name="in",
+        ),
+        reservoir=ReservoirNode(
+            units=N_UNITS,
+            activation=Activation.TANH,
+            topology=Topology.SCR,
+            chain_weight=0.9,
+            leak_rate=0.30,
+            seed=9,
+            name="res",
+        ),
+        readout=ReadoutNode(
+            units=N_CLASSES,
+            activation=Activation.IDENTITY,
+            trainer=Trainer.RIDGE,
+            regularization=RIDGE,
+            washout=WASHOUT,
+            include_bias=True,
+            task=Task.CLASSIFICATION,
+            name="out",
+        ),  # NONE agg
     )
     return rc, RCExecutor(rc)
 
@@ -120,27 +150,27 @@ def _train_per_step(exe, seqs, labels):
     """
     phis, ys = [], []
     for X, lab in zip(seqs, labels):
-        H = exe.collect_states(X)                 # (T, N), fresh reset
-        phi = exe._augment(X, H)                  # [bias, state] -> (T, 1+N)
-        phis.append(phi[SHAPE_W - LATE:])
+        H = exe.collect_states(X)  # (T, N), fresh reset
+        phi = exe._augment(X, H)  # [bias, state] -> (T, 1+N)
+        phis.append(phi[SHAPE_W - LATE :])
         ys.append(np.full(LATE, lab, dtype=int))
     Phi = np.concatenate(phis, axis=0)
     Y = _one_hot(np.concatenate(ys), N_CLASSES)
     A = Phi.T @ Phi + RIDGE * np.eye(Phi.shape[1])
-    exe.W_out = np.linalg.solve(A, Phi.T @ Y).T   # (M, 1+N)
+    exe.W_out = np.linalg.solve(A, Phi.T @ Y).T  # (M, 1+N)
     exe.classes_ = np.arange(N_CLASSES)
 
 
 def _window_label(logits):
     """Recover one label per window: majority vote over the last LATE steps."""
-    votes = np.argmax(logits[SHAPE_W - LATE:], axis=1)
+    votes = np.argmax(logits[SHAPE_W - LATE :], axis=1)
     return int(np.bincount(votes, minlength=N_CLASSES).argmax())
 
 
 def _accuracy_float(exe, seqs, labels):
     ok = 0
     for X, lab in zip(seqs, labels):
-        if _window_label(exe.predict(X)) == lab:   # predict() resets per call
+        if _window_label(exe.predict(X)) == lab:  # predict() resets per call
             ok += 1
     return ok / len(seqs)
 
@@ -148,7 +178,7 @@ def _accuracy_float(exe, seqs, labels):
 def _accuracy_quant(qm, seqs, labels):
     ok = 0
     for X, lab in zip(seqs, labels):
-        qexe = AffineQuantizedExecutor(qm)          # fresh == device reset
+        qexe = AffineQuantizedExecutor(qm)  # fresh == device reset
         if _window_label(qexe.predict(X)) == lab:
             ok += 1
     return ok / len(seqs)
@@ -243,10 +273,15 @@ def _write_classify_sketch(qm, cfg, sketch_dir, window):
         x_raw_q = qexe._quantize_raw_input(X[t])
         u_pre_q = qexe._quantize_u_pre(X[t])
         qexe.step_q(u_pre_q)
-        Y_ref_q[t] = qexe.predict_one_q(x_raw_q, qexe.state_q).astype(np_storage)
+        Y_ref_q[t] = qexe.predict_one_q(x_raw_q, qexe.state_q).astype(
+            np_storage
+        )
 
     subst = {
-        "T": T, "K": qm.K, "M": qm.M, "STORAGE_T": storage_t,
+        "T": T,
+        "K": qm.K,
+        "M": qm.M,
+        "STORAGE_T": storage_t,
         "X_VALUES": ", ".join(str(int(v)) for v in X_q.ravel()),
         "Y_VALUES": ", ".join(str(int(v)) for v in Y_ref_q.ravel()),
     }
@@ -258,8 +293,15 @@ def _write_classify_sketch(qm, cfg, sketch_dir, window):
 
 def _arduino_compile(sketch_dir, out):
     build_dir = out / "build"
-    cmd = ["arduino-cli", "compile", "--fqbn", "arduino:avr:uno",
-           "--output-dir", str(build_dir), str(sketch_dir)]
+    cmd = [
+        "arduino-cli",
+        "compile",
+        "--fqbn",
+        "arduino:avr:uno",
+        "--output-dir",
+        str(build_dir),
+        str(sketch_dir),
+    ]
     cp = subprocess.run(cmd, capture_output=True, text=True)
     return cp
 
@@ -271,21 +313,25 @@ def main() -> None:
     tr_s, tr_y = seqs[:n_tr], labels[:n_tr]
     te_s, te_y = seqs[n_tr:], labels[n_tr:]
 
-    print(f"[1/4] train per-step SCR classifier (N={N_UNITS}, {N_CLASSES} classes)")
+    print(
+        f"[1/4] train per-step SCR classifier (N={N_UNITS}, {N_CLASSES} classes)"
+    )
     rc, exe = _build_float_model()
     _train_per_step(exe, tr_s, tr_y)
     acc_f = _accuracy_float(exe, te_s, te_y)
     print(f"      float window acc = {acc_f:.3f}")
 
     print("[2/4] affine quantize (i8 reservoir + i16 W_out, direct tanh LUT)")
-    calib_X = np.concatenate(tr_s[:60], axis=0)   # one stream is fine for ranges
-    cfg = calibrate_from_data(rc, exe, calib_X,
-                              storage_bits=8, w_out_storage_bits=16)
+    calib_X = np.concatenate(
+        tr_s[:60], axis=0
+    )  # one stream is fine for ranges
+    cfg = calibrate_from_data(
+        rc, exe, calib_X, storage_bits=8, w_out_storage_bits=16
+    )
     # A direct 256-entry tanh LUT (256 B in Flash) is needed here: the
     # interp-64 approximation smears the 5-way late-step decision boundary
     # (drops this task to ~0.58); the full table recovers float accuracy.
-    qm = quantize_model_affine(rc, exe, cfg,
-                               lut_strategy=LUTStrategy.direct())
+    qm = quantize_model_affine(rc, exe, cfg, lut_strategy=LUTStrategy.direct())
     acc_q = _accuracy_quant(qm, te_s, te_y)
     print(f"      quantized window acc = {acc_q:.3f}")
 
@@ -294,15 +340,18 @@ def main() -> None:
     demo_kind = 2  # "peak"
     window = _shape_window(demo_kind, np.random.default_rng(0), jitter=0.0)
     target = ArduinoUnoTarget()
-    art = target.compile_affine_quantized(qm, output_dir=BUILD,
-                                          test_inputs=window, build=False)
+    art = target.compile_affine_quantized(
+        qm, output_dir=BUILD, test_inputs=window, build=False
+    )
     sketch_dir = BUILD / "sketch"
     _write_classify_sketch(qm, cfg, sketch_dir, window)
 
     cp = _arduino_compile(sketch_dir, BUILD)
     md = art.metadata
-    print(f"      storage={md['dtype']}  W_out={md['w_out_dtype']}  "
-          f"topology={md['topology']}  lut={md['lut_kind']}")
+    print(
+        f"      storage={md['dtype']}  W_out={md['w_out_dtype']}  "
+        f"topology={md['topology']}  lut={md['lut_kind']}"
+    )
     if cp.returncode != 0:
         print("      arduino-cli compile FAILED:")
         print(cp.stderr)
@@ -316,10 +365,14 @@ def main() -> None:
 
     print("[4/4] device demo")
     pred = _window_label(AffineQuantizedExecutor(qm).predict(window))
-    print(f"      embedded window is '{SHAPE_CLASSES[demo_kind]}'; "
-          f"kernel predicts '{SHAPE_CLASSES[pred]}'")
-    print(f"\n[ok] flash with:  arduino-cli upload -p <PORT> "
-          f"--fqbn arduino:avr:uno {sketch_dir}")
+    print(
+        f"      embedded window is '{SHAPE_CLASSES[demo_kind]}'; "
+        f"kernel predicts '{SHAPE_CLASSES[pred]}'"
+    )
+    print(
+        f"\n[ok] flash with:  arduino-cli upload -p <PORT> "
+        f"--fqbn arduino:avr:uno {sketch_dir}"
+    )
 
 
 if __name__ == "__main__":

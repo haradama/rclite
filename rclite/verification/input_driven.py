@@ -11,6 +11,7 @@ Reference:
     Re-visiting the echo state property. Neural Networks, 35, 1-9.
     https://doi.org/10.1016/j.neunet.2012.07.005
 """
+
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -104,6 +105,7 @@ class InputDrivenESPCheck:
     Computes the maximum local Lyapunov exponent along `sample_input` and
     declares ESP satisfied when it is below `threshold` (typically 0).
     """
+
     executor: RCExecutor
     sample_input: "np.ndarray"
     threshold: float = 0.0
@@ -114,8 +116,10 @@ class InputDrivenESPCheck:
 
     def violations(self) -> List[str]:
         mle = maximum_lyapunov_exponent(
-            self.executor, self.sample_input,
-            warmup=self.warmup, seed=self.seed,
+            self.executor,
+            self.sample_input,
+            warmup=self.warmup,
+            seed=self.seed,
         )
         self.last_mle = mle
         if mle >= self.threshold:

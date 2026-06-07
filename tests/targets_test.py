@@ -1,4 +1,5 @@
 """Tests for the Target abstraction (host + cortex-m0)."""
+
 from __future__ import annotations
 import pathlib
 import shutil
@@ -12,16 +13,29 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import numpy as np
 
 from rclite import (
-    InputNode, ReservoirNode, ReadoutNode, ReservoirComputer,
-    Activation, Distribution, Topology, Trainer,
+    InputNode,
+    ReservoirNode,
+    ReadoutNode,
+    ReservoirComputer,
+    Distribution,
+    Topology,
+    Trainer,
 )
 from rclite.runtime import RCExecutor
 from rclite.targets import (
-    Target, CompiledArtifact, RunResult,
-    HostTarget, CortexM0Target, MicrobitV1, Microbit,
-    WasmTarget, Wasmtime, BrowserWasm,
-    GbaTarget, Gba,
-    NesTarget, Nes,
+    Target,
+    CompiledArtifact,
+    HostTarget,
+    CortexM0Target,
+    MicrobitV1,
+    Microbit,
+    WasmTarget,
+    Wasmtime,
+    BrowserWasm,
+    GbaTarget,
+    Gba,
+    NesTarget,
+    Nes,
 )
 
 
@@ -51,7 +65,8 @@ def _rust_target_available(target="wasm32-wasip1", rustc="rustc"):
     try:
         cp = subprocess.run(
             [rustc, "--print", "target-libdir", "--target", target],
-            capture_output=True, text=True,
+            capture_output=True,
+            text=True,
         )
     except OSError:
         return False
@@ -63,14 +78,29 @@ def _rust_target_available(target="wasm32-wasip1", rustc="rustc"):
 
 def _build():
     rc = ReservoirComputer(
-        input=InputNode(units=1, input_offset=0.5,
-                        input_distribution=Distribution.BERNOULLI, name="in"),
-        reservoir=ReservoirNode(units=40, topology=Topology.SCR,
-                                chain_weight=0.85, leak_rate=0.3,
-                                seed=42, name="res"),
-        readout=ReadoutNode(units=1, trainer=Trainer.RIDGE,
-                            regularization=1e-6, washout=80,
-                            include_bias=True, include_input=True, name="out"),
+        input=InputNode(
+            units=1,
+            input_offset=0.5,
+            input_distribution=Distribution.BERNOULLI,
+            name="in",
+        ),
+        reservoir=ReservoirNode(
+            units=40,
+            topology=Topology.SCR,
+            chain_weight=0.85,
+            leak_rate=0.3,
+            seed=42,
+            name="res",
+        ),
+        readout=ReadoutNode(
+            units=1,
+            trainer=Trainer.RIDGE,
+            regularization=1e-6,
+            washout=80,
+            include_bias=True,
+            include_input=True,
+            name="out",
+        ),
     )
     exe = RCExecutor(rc)
     rng = np.random.default_rng(0)
@@ -91,14 +121,20 @@ def test_microbit_class_inherits_cortex_m0():
 
 def test_target_run_default_raises():
     """Subclasses must override run() to provide an emulator path."""
+
     class Stub(Target):
         name = "stub"
+
         def compile(self, rc, exe, *, output_dir, **_):
-            return CompiledArtifact(target_name=self.name,
-                                     output_dir=pathlib.Path(output_dir))
-    expect_raises(NotImplementedError, Stub().run,
-                  CompiledArtifact(target_name="stub",
-                                    output_dir=pathlib.Path("/tmp")))
+            return CompiledArtifact(
+                target_name=self.name, output_dir=pathlib.Path(output_dir)
+            )
+
+    expect_raises(
+        NotImplementedError,
+        Stub().run,
+        CompiledArtifact(target_name="stub", output_dir=pathlib.Path("/tmp")),
+    )
 
 
 def test_host_target_emits_artifact():
@@ -118,8 +154,7 @@ def test_host_target_emits_artifact():
 def test_cortex_m0_target_requires_test_inputs():
     rc, exe, _ = _build()
     with tempfile.TemporaryDirectory() as td:
-        expect_raises(ValueError, Microbit().compile, rc, exe,
-                      output_dir=td)
+        expect_raises(ValueError, Microbit().compile, rc, exe, output_dir=td)
 
 
 def test_microbit_full_pipeline():
@@ -173,12 +208,14 @@ def test_wasm_simd_emits_v128_instructions():
     if not _rust_target_available():
         return  # skip — rustc / wasm32 rust-std not available
     import re
+
     rc, exe, sample = _build()
     counts = {}
     for simd in (True, False):
         with tempfile.TemporaryDirectory() as td:
-            Wasmtime(simd=simd).compile(rc, exe, output_dir=td,
-                                        test_inputs=sample)
+            Wasmtime(simd=simd).compile(
+                rc, exe, output_dir=td, test_inputs=sample
+            )
             asm = pathlib.Path(td, "rc_predict.s").read_text()
             counts[simd] = len(re.findall(r"\bf32x4\.|\bv128\.", asm))
     assert counts[True] > 0, "expected v128 ops in the SIMD build"
@@ -187,24 +224,49 @@ def test_wasm_simd_emits_v128_instructions():
 
 def _build_quantized_wasm(storage_bits, state_frac):
     """A small symmetric-quantized model for the WASM integer path."""
-    from rclite.quant import (QuantConfig, TanhLUTSpec, quantize_model,
-                              I8Symmetric, I16FixedPoint, I32FixedPoint)
+    from rclite.quant import (
+        QuantConfig,
+        TanhLUTSpec,
+        quantize_model,
+        I8Symmetric,
+        I16FixedPoint,
+        I32FixedPoint,
+    )
+
     rc = ReservoirComputer(
-        input=InputNode(units=1, input_offset=0.0, input_scaling=1.0,
-                        input_distribution=Distribution.BERNOULLI, name="in"),
-        reservoir=ReservoirNode(units=24, topology=Topology.SCR,
-                                 chain_weight=0.9, leak_rate=0.3, seed=42,
-                                 name="res"),
-        readout=ReadoutNode(units=1, trainer=Trainer.RIDGE,
-                            regularization=1e-6, washout=40,
-                            include_bias=True, include_input=True, name="out"),
+        input=InputNode(
+            units=1,
+            input_offset=0.0,
+            input_scaling=1.0,
+            input_distribution=Distribution.BERNOULLI,
+            name="in",
+        ),
+        reservoir=ReservoirNode(
+            units=24,
+            topology=Topology.SCR,
+            chain_weight=0.9,
+            leak_rate=0.3,
+            seed=42,
+            name="res",
+        ),
+        readout=ReadoutNode(
+            units=1,
+            trainer=Trainer.RIDGE,
+            regularization=1e-6,
+            washout=40,
+            include_bias=True,
+            include_input=True,
+            name="out",
+        ),
     )
     exe = RCExecutor(rc)
     rng = np.random.default_rng(0)
     X = rng.standard_normal((300, 1)) * 0.2
     Y = np.sin(np.arange(300) * 0.1)[:, None]
     exe.fit(X, Y)
-    target = {8: I8Symmetric, 16: I16FixedPoint, 32: I32FixedPoint}[storage_bits]()
+    target = {8: I8Symmetric, 16: I16FixedPoint, 32: I32FixedPoint}[
+        storage_bits
+    ]()
     cfg = QuantConfig(state_frac=state_frac, input_frac=4, weight_frac=4)
     qm = quantize_model(rc, exe, cfg, target=target, lut=TanhLUTSpec(n=64))
     return qm, X[250:258]
@@ -221,9 +283,15 @@ def test_wasm_compile_quantized_rejects_bad_storage():
         config = None
         target = _FakeTarget()
         M = 1
+
     with tempfile.TemporaryDirectory() as td:
-        expect_raises(NotImplementedError, Wasmtime().compile_quantized,
-                      _FakeQModel(), output_dir=td, test_inputs=sample)
+        expect_raises(
+            NotImplementedError,
+            Wasmtime().compile_quantized,
+            _FakeQModel(),
+            output_dir=td,
+            test_inputs=sample,
+        )
 
 
 def test_wasm_quantized_bit_exact():
@@ -237,15 +305,17 @@ def test_wasm_quantized_bit_exact():
         qm, sample = _build_quantized_wasm(storage_bits, state_frac)
         with tempfile.TemporaryDirectory() as td:
             target = Wasmtime()
-            art = target.compile_quantized(qm, output_dir=td,
-                                            test_inputs=sample)
+            art = target.compile_quantized(
+                qm, output_dir=td, test_inputs=sample
+            )
             assert art.binary.exists()
             assert art.metadata["quantized"] is True
             assert art.metadata["dtype"] == f"i{storage_bits}"
             result = target.run(art)
             assert result.success, f"wasmtime output:\n{result.output}"
             assert "BIT_EXACT: yes" in result.output, (
-                f"i{storage_bits} not bit-exact:\n{result.output}")
+                f"i{storage_bits} not bit-exact:\n{result.output}"
+            )
 
 
 def test_browser_class_and_inheritance():
@@ -292,7 +362,8 @@ def test_browser_quantized_zero_imports():
         art = target.compile_quantized(qm, output_dir=td, test_inputs=sample)
         assert art.metadata["imports"] == [], (
             f"quantized reactor should have no imports, got "
-            f"{art.metadata['imports']}")
+            f"{art.metadata['imports']}"
+        )
         assert "rc_predict" in art.metadata["exports"]
         assert art.metadata["dtype"] == "i16"
         if shutil.which("wasmtime") is not None:
@@ -304,6 +375,7 @@ def test_wasm_inspect_parses_imports_exports():
     if not _rust_target_available():
         return  # skip — rustc / wasm32 rust-std not available
     from rclite.targets.wasm._wasm_inspect import inspect_wasm
+
     rc, exe, sample = _build()
     with tempfile.TemporaryDirectory() as td:
         art = BrowserWasm().compile(rc, exe, output_dir=td, test_inputs=sample)
@@ -320,8 +392,7 @@ def test_wasm_target_rejects_non_f32():
 def test_wasm_target_requires_test_inputs():
     rc, exe, _ = _build()
     with tempfile.TemporaryDirectory() as td:
-        expect_raises(ValueError, Wasmtime().compile, rc, exe,
-                      output_dir=td)
+        expect_raises(ValueError, Wasmtime().compile, rc, exe, output_dir=td)
 
 
 def test_wasmtime_full_pipeline():
@@ -362,27 +433,49 @@ def test_target_run_result_failure_path():
 
 def _build_affine_gba(units=24, T=200, seed=0):
     """A small affine-quantized model for the GBA target tests."""
-    from rclite.quant import (calibrate_from_data, quantize_model_affine,
-                              LUTStrategy)
+    from rclite.quant import (
+        calibrate_from_data,
+        quantize_model_affine,
+        LUTStrategy,
+    )
+
     rc = ReservoirComputer(
-        input=InputNode(units=1, input_offset=0.0, input_scaling=1.0,
-                        input_distribution=Distribution.BERNOULLI, name="in"),
-        reservoir=ReservoirNode(units=units, topology=Topology.SCR,
-                                 chain_weight=0.9, chain_feedback=0.1,
-                                 leak_rate=0.3, seed=42, name="res"),
-        readout=ReadoutNode(units=1, trainer=Trainer.RIDGE,
-                            regularization=1e-6, washout=30,
-                            include_bias=True, include_input=True, name="out"),
+        input=InputNode(
+            units=1,
+            input_offset=0.0,
+            input_scaling=1.0,
+            input_distribution=Distribution.BERNOULLI,
+            name="in",
+        ),
+        reservoir=ReservoirNode(
+            units=units,
+            topology=Topology.SCR,
+            chain_weight=0.9,
+            chain_feedback=0.1,
+            leak_rate=0.3,
+            seed=42,
+            name="res",
+        ),
+        readout=ReadoutNode(
+            units=1,
+            trainer=Trainer.RIDGE,
+            regularization=1e-6,
+            washout=30,
+            include_bias=True,
+            include_input=True,
+            name="out",
+        ),
     )
     exe = RCExecutor(rc)
     rng = np.random.default_rng(seed)
     X = rng.standard_normal((T, 1)) * 0.2
     Y = np.sin(np.arange(T) * 0.1)[:, None]
-    exe.fit(X[:T - 50], Y[:T - 50])
-    cfg = calibrate_from_data(rc, exe, X[:T - 50], storage_bits=8)
-    qm = quantize_model_affine(rc, exe, cfg,
-                                lut_strategy=LUTStrategy.linear_interp(64))
-    return qm, X[T - 50:T - 40]
+    exe.fit(X[: T - 50], Y[: T - 50])
+    cfg = calibrate_from_data(rc, exe, X[: T - 50], storage_bits=8)
+    qm = quantize_model_affine(
+        rc, exe, cfg, lut_strategy=LUTStrategy.linear_interp(64)
+    )
+    return qm, X[T - 50 : T - 40]
 
 
 def test_gba_class_attributes():
@@ -399,7 +492,8 @@ def test_gba_compile_affine_emits_rom():
     qm, sample = _build_affine_gba()
     with tempfile.TemporaryDirectory() as td:
         art = Gba().compile_affine_quantized(
-            qm, output_dir=pathlib.Path(td), test_inputs=sample)
+            qm, output_dir=pathlib.Path(td), test_inputs=sample
+        )
         assert art.binary is not None and art.binary.exists()
         assert art.binary.suffix == ".gba"
         assert art.metadata["triple"] == "thumbv4t-none-eabi"
@@ -409,13 +503,17 @@ def test_gba_compile_affine_emits_rom():
 def test_gba_full_pipeline_mgba():
     if shutil.which("arm-none-eabi-gcc") is None:
         return  # skip
-    if shutil.which("mgba") is None and shutil.which("/usr/games/mgba") is None:
+    if (
+        shutil.which("mgba") is None
+        and shutil.which("/usr/games/mgba") is None
+    ):
         return  # skip — no emulator
     qm, sample = _build_affine_gba()
     with tempfile.TemporaryDirectory() as td:
         target = Gba()
         art = target.compile_affine_quantized(
-            qm, output_dir=pathlib.Path(td), test_inputs=sample)
+            qm, output_dir=pathlib.Path(td), test_inputs=sample
+        )
         result = target.run(art, timeout=6)
         assert result.success, f"mGBA output:\n{result.output}"
         assert "TEST_PASS" in result.output
@@ -436,7 +534,8 @@ def test_nes_compile_emits_sources_without_toolchain():
     qm, sample = _build_affine_gba()
     with tempfile.TemporaryDirectory() as td:
         art = Nes().compile_affine_quantized(
-            qm, output_dir=pathlib.Path(td), test_inputs=sample, build=False)
+            qm, output_dir=pathlib.Path(td), test_inputs=sample, build=False
+        )
         assert art.binary is None
         assert art.metadata["cpu"] == "6502"
         assert art.metadata["affine"] is True
@@ -453,7 +552,8 @@ def test_nes_compile_emits_rom():
     qm, sample = _build_affine_gba()
     with tempfile.TemporaryDirectory() as td:
         art = Nes().compile_affine_quantized(
-            qm, output_dir=pathlib.Path(td), test_inputs=sample)
+            qm, output_dir=pathlib.Path(td), test_inputs=sample
+        )
         assert art.binary is not None and art.binary.exists()
         assert art.binary.suffix == ".nes"
 
@@ -469,7 +569,8 @@ def test_nes_full_pipeline_emulator():
     with tempfile.TemporaryDirectory() as td:
         target = Nes()
         art = target.compile_affine_quantized(
-            qm, output_dir=pathlib.Path(td), test_inputs=sample)
+            qm, output_dir=pathlib.Path(td), test_inputs=sample
+        )
         result = target.run(art)  # auto: Mesen if present, else FCEUX
         assert result.success, f"emulator output:\n{result.output}"
         assert "TEST_PASS" in result.output
@@ -478,12 +579,20 @@ def test_nes_full_pipeline_emulator():
 
 def test_nes_compile_rejects_non_affine():
     rc, exe, sample = _build()
-    expect_raises(NotImplementedError, Nes().compile, rc, exe,
-                  output_dir="/tmp/unused_nes")
+    expect_raises(
+        NotImplementedError,
+        Nes().compile,
+        rc,
+        exe,
+        output_dir="/tmp/unused_nes",
+    )
 
 
-TESTS = [v for k, v in list(globals().items())
-         if k.startswith("test_") and callable(v)]
+TESTS = [
+    v
+    for k, v in list(globals().items())
+    if k.startswith("test_") and callable(v)
+]
 
 
 def main() -> int:

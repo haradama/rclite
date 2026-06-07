@@ -9,6 +9,7 @@ Lowers the IDL to a Cortex-M0 ELF using:
 
 Runner uses qemu-system-arm with the board's QEMU machine name.
 """
+
 from __future__ import annotations
 import pathlib
 import shutil
@@ -18,11 +19,14 @@ from typing import Optional
 import numpy as np
 
 from rclite.codegen import compile_rc, cross_compile_rc
-from rclite.codegen.llvm import emit_quantized_module, emit_quantized_affine_module
+from rclite.codegen.llvm import (
+    emit_quantized_module,
+    emit_quantized_affine_module,
+)
 from rclite.codegen.templating import render_template
 from rclite.ir import sparse_passes
 from ..target import Target, CompiledArtifact, RunResult
-from .boards import CortexM0Board, MicrobitV1
+from .boards import CortexM0Board
 
 
 _SUPPORT_DIR = pathlib.Path(__file__).parent / "support"
@@ -47,19 +51,28 @@ class CortexM0Target(Target):
     triple = "thumbv6m-none-eabi"
     cpu = "cortex-m0"
 
-    def __init__(self, board: CortexM0Board, dtype: str = "f32",
-                 cc: str = "arm-none-eabi-gcc"):
+    def __init__(
+        self,
+        board: CortexM0Board,
+        dtype: str = "f32",
+        cc: str = "arm-none-eabi-gcc",
+    ):
         self.board = board
         self.dtype = dtype
         self.cc = cc
         self.name = f"cortex-m0/{board.name}"
 
-    def compile(self, rc, exe, *,
-                output_dir,
-                test_inputs: Optional[np.ndarray] = None,
-                expected_outputs: Optional[np.ndarray] = None,
-                sparse=False,
-                **_) -> CompiledArtifact:
+    def compile(
+        self,
+        rc,
+        exe,
+        *,
+        output_dir,
+        test_inputs: Optional[np.ndarray] = None,
+        expected_outputs: Optional[np.ndarray] = None,
+        sparse=False,
+        **_,
+    ) -> CompiledArtifact:
         if test_inputs is None:
             raise ValueError(
                 "Cortex-M0 deployment needs `test_inputs` to embed in main.c"
@@ -74,7 +87,11 @@ class CortexM0Target(Target):
 
         # 1. Cross-compile rc_predict.o for Cortex-M0.
         cc_obj = cross_compile_rc(
-            rc, exe, triple=self.triple, cpu=self.cpu, dtype=self.dtype,
+            rc,
+            exe,
+            triple=self.triple,
+            cpu=self.cpu,
+            dtype=self.dtype,
             passes=sparse_passes(sparse, include_structural=True),
         )
         rc_o = out / "rc_predict.o"
@@ -95,14 +112,18 @@ class CortexM0Target(Target):
         # the dims coming from rc_predict.h's RC_INPUT_DIM / RC_OUTPUT_DIM.
         T = test_inputs.shape[0]
         x_flat = np.ascontiguousarray(test_inputs, dtype=np.float32).ravel()
-        y_flat = np.ascontiguousarray(expected_outputs, dtype=np.float32).ravel()
+        y_flat = np.ascontiguousarray(
+            expected_outputs, dtype=np.float32
+        ).ravel()
         main_path = out / "main.c"
-        main_path.write_text(render_template(
-            _SUPPORT_DIR / "main_template.c",
-            T_LEN=str(T),
-            X_VALUES=", ".join(f"{v:.9g}f" for v in x_flat),
-            Y_VALUES=", ".join(f"{v:.9g}f" for v in y_flat),
-        ))
+        main_path.write_text(
+            render_template(
+                _SUPPORT_DIR / "main_template.c",
+                T_LEN=str(T),
+                X_VALUES=", ".join(f"{v:.9g}f" for v in x_flat),
+                Y_VALUES=", ".join(f"{v:.9g}f" for v in y_flat),
+            )
+        )
 
         # 5. Stage startup + linker script next to the sources.
         startup_path = out / "startup.c"
@@ -112,21 +133,34 @@ class CortexM0Target(Target):
 
         # 6. Assemble + link.
         cflags = [
-            f"-mcpu={self.cpu}", "-mthumb", "-O2", "-g",
-            "-ffunction-sections", "-fdata-sections", "-Wall",
+            f"-mcpu={self.cpu}",
+            "-mthumb",
+            "-O2",
+            "-g",
+            "-ffunction-sections",
+            "-fdata-sections",
+            "-Wall",
             f"-I{out}",
         ]
         for src in (startup_path, main_path):
             obj = src.with_suffix(".o")
-            cp = subprocess.run([self.cc, "-c", *cflags, str(src), "-o", str(obj)],
-                                capture_output=True, text=True)
+            cp = subprocess.run(
+                [self.cc, "-c", *cflags, str(src), "-o", str(obj)],
+                capture_output=True,
+                text=True,
+            )
             if cp.returncode != 0:
-                raise RuntimeError(f"compile failed for {src.name}: {cp.stderr}")
+                raise RuntimeError(
+                    f"compile failed for {src.name}: {cp.stderr}"
+                )
 
         elf = out / "rc.elf"
         link_cmd = [
-            self.cc, f"-mcpu={self.cpu}", "-mthumb",
-            "-T", str(linker_path),
+            self.cc,
+            f"-mcpu={self.cpu}",
+            "-mthumb",
+            "-T",
+            str(linker_path),
             "-nostartfiles",
             "-Wl,--gc-sections",
             f"-Wl,-Map={out / 'rc.map'}",
@@ -135,21 +169,29 @@ class CortexM0Target(Target):
             str(out / "startup.o"),
             str(out / "main.o"),
             str(rc_o),
-            "-o", str(elf),
-            "-lm", "-lgcc", "-lc", "-lnosys",
+            "-o",
+            str(elf),
+            "-lm",
+            "-lgcc",
+            "-lc",
+            "-lnosys",
         ]
         cp = subprocess.run(link_cmd, capture_output=True, text=True)
         if cp.returncode != 0:
             raise RuntimeError(f"link failed: {cp.stderr}")
 
         metadata = {
-            "board": self.board, "triple": self.triple,
-            "cpu": self.cpu, "dtype": self.dtype,
+            "board": self.board,
+            "triple": self.triple,
+            "cpu": self.cpu,
+            "dtype": self.dtype,
         }
         try:
             sz = subprocess.run(
                 [self.cc.replace("gcc", "size"), str(elf)],
-                capture_output=True, text=True, check=True,
+                capture_output=True,
+                text=True,
+                check=True,
             )
             metadata["size"] = sz.stdout.strip()
         except Exception:
@@ -164,17 +206,16 @@ class CortexM0Target(Target):
             metadata=metadata,
         )
 
-    def compile_quantized(self, qmodel, *,
-                            output_dir,
-                            test_inputs: np.ndarray,
-                            sparse=False,
-                            **_) -> CompiledArtifact:
+    def compile_quantized(
+        self, qmodel, *, output_dir, test_inputs: np.ndarray, sparse=False, **_
+    ) -> CompiledArtifact:
         """Cross-compile a quantized model. The kernel takes storage_t inputs
         already at input_scale (preprocessed). main.c embeds the
         storage_t-encoded input/reference arrays and uses pure integer
         arithmetic — no libm tanhf, no soft-float. The storage width is
         picked from `qmodel.target.storage_bits` (32 / 16 / 8)."""
         import llvmlite.binding as llvm
+
         if shutil.which(self.cc) is None:
             raise RuntimeError(
                 f"{self.cc} not found on PATH — install gcc-arm-none-eabi"
@@ -197,9 +238,11 @@ class CortexM0Target(Target):
 
         # Cross-compile the i32 kernel
         ll_mod = emit_quantized_module(
-            qmodel, passes=sparse_passes(sparse, include_structural=False))
+            qmodel, passes=sparse_passes(sparse, include_structural=False)
+        )
         ll_mod.triple = self.triple
         from rclite.codegen.llvm import _ensure_all_targets
+
         _ensure_all_targets()
         mod = llvm.parse_assembly(str(ll_mod))
         mod.verify()
@@ -224,16 +267,21 @@ class CortexM0Target(Target):
 
         # Reference outputs (bit-exact via Python QuantizedExecutor)
         from rclite.quant.executor import QuantizedExecutor
+
         qexe = QuantizedExecutor(qmodel)
         Y_ref_q = np.zeros((test_inputs.shape[0], qmodel.M), dtype=np_storage)
         for t in range(test_inputs.shape[0]):
-            x_row = (X_q[t] if X_q.ndim > 1
-                     else np.array([X_q[t]], dtype=np_storage))
+            x_row = (
+                X_q[t]
+                if X_q.ndim > 1
+                else np.array([X_q[t]], dtype=np_storage)
+            )
             qexe.step_q(x_row.astype(np.int32))
             # phi-style readout uses raw input passthrough scaling — match the
             # kernel's BuildPhi by feeding the (preprocessed-quantized) X_q here.
-            Y_ref_q[t] = qexe.predict_one_q(x_row.astype(np.int32),
-                                              qexe.state_q).astype(np_storage)
+            Y_ref_q[t] = qexe.predict_one_q(
+                x_row.astype(np.int32), qexe.state_q
+            ).astype(np_storage)
 
         # Render main.c from template
         T = len(X_q)
@@ -259,21 +307,34 @@ class CortexM0Target(Target):
         shutil.copy(_SUPPORT_DIR / self.board.linker_script, linker_path)
 
         cflags = [
-            f"-mcpu={self.cpu}", "-mthumb", "-O2", "-g",
-            "-ffunction-sections", "-fdata-sections", "-Wall",
+            f"-mcpu={self.cpu}",
+            "-mthumb",
+            "-O2",
+            "-g",
+            "-ffunction-sections",
+            "-fdata-sections",
+            "-Wall",
             f"-I{out}",
         ]
         for src in (startup_path, main_path):
             obj = src.with_suffix(".o")
-            cp = subprocess.run([self.cc, "-c", *cflags, str(src), "-o", str(obj)],
-                                capture_output=True, text=True)
+            cp = subprocess.run(
+                [self.cc, "-c", *cflags, str(src), "-o", str(obj)],
+                capture_output=True,
+                text=True,
+            )
             if cp.returncode != 0:
-                raise RuntimeError(f"compile failed for {src.name}: {cp.stderr}")
+                raise RuntimeError(
+                    f"compile failed for {src.name}: {cp.stderr}"
+                )
 
         elf = out / "rc.elf"
         link_cmd = [
-            self.cc, f"-mcpu={self.cpu}", "-mthumb",
-            "-T", str(linker_path),
+            self.cc,
+            f"-mcpu={self.cpu}",
+            "-mthumb",
+            "-T",
+            str(linker_path),
             "-nostartfiles",
             "-Wl,--gc-sections",
             f"-Wl,-Map={out / 'rc.map'}",
@@ -282,23 +343,30 @@ class CortexM0Target(Target):
             str(out / "startup.o"),
             str(out / "main.o"),
             str(rc_o),
-            "-o", str(elf),
-            "-lgcc", "-lc", "-lnosys",  # no -lm: integer path has no FP
+            "-o",
+            str(elf),
+            "-lgcc",
+            "-lc",
+            "-lnosys",  # no -lm: integer path has no FP
         ]
         cp = subprocess.run(link_cmd, capture_output=True, text=True)
         if cp.returncode != 0:
             raise RuntimeError(f"link failed: {cp.stderr}")
 
         metadata = {
-            "board": self.board, "triple": self.triple,
-            "cpu": self.cpu, "dtype": f"i{sw}",
+            "board": self.board,
+            "triple": self.triple,
+            "cpu": self.cpu,
+            "dtype": f"i{sw}",
             "state_frac": cfg.state_frac,
             "quantized": True,
         }
         try:
             sz = subprocess.run(
                 [self.cc.replace("gcc", "size"), str(elf)],
-                capture_output=True, text=True, check=True,
+                capture_output=True,
+                text=True,
+                check=True,
             )
             metadata["size"] = sz.stdout.strip()
         except Exception:
@@ -313,11 +381,9 @@ class CortexM0Target(Target):
             metadata=metadata,
         )
 
-    def compile_affine_quantized(self, qmodel, *,
-                                   output_dir,
-                                   test_inputs: np.ndarray,
-                                   sparse=False,
-                                   **_) -> CompiledArtifact:
+    def compile_affine_quantized(
+        self, qmodel, *, output_dir, test_inputs: np.ndarray, sparse=False, **_
+    ) -> CompiledArtifact:
         """Cross-compile an `AffineQuantizedModel` to a Cortex-M0 ELF.
 
         Storage width (i8 / i16) and the LUT strategy (DIRECT /
@@ -328,6 +394,7 @@ class CortexM0Target(Target):
         pure integer arithmetic.
         """
         import llvmlite.binding as llvm
+
         if shutil.which(self.cc) is None:
             raise RuntimeError(
                 f"{self.cc} not found on PATH — install gcc-arm-none-eabi"
@@ -348,9 +415,11 @@ class CortexM0Target(Target):
 
         # Cross-compile the affine kernel
         ll_mod = emit_quantized_affine_module(
-            qmodel, passes=sparse_passes(sparse, include_structural=False))
+            qmodel, passes=sparse_passes(sparse, include_structural=False)
+        )
         ll_mod.triple = self.triple
         from rclite.codegen.llvm import _ensure_all_targets
+
         _ensure_all_targets()
         mod = llvm.parse_assembly(str(ll_mod))
         mod.verify()
@@ -377,6 +446,7 @@ class CortexM0Target(Target):
         # is bit-exact with the JIT) and emit q_y at the model's output
         # scale.
         from rclite.quant.affine.executor import AffineQuantizedExecutor
+
         qexe = AffineQuantizedExecutor(qmodel)
         if test_inputs.ndim == 1:
             test_inputs_2d = test_inputs[:, None]
@@ -389,7 +459,9 @@ class CortexM0Target(Target):
             x_raw_q = qexe._quantize_raw_input(x_raw)
             u_pre_q = qexe._quantize_u_pre(x_raw)
             qexe.step_q(u_pre_q)
-            Y_ref_q[t] = qexe.predict_one_q(x_raw_q, qexe.state_q).astype(np_storage)
+            Y_ref_q[t] = qexe.predict_one_q(x_raw_q, qexe.state_q).astype(
+                np_storage
+            )
 
         # Render the affine main.c
         x_lit = ", ".join(str(int(v)) for v in X_q.ravel())
@@ -414,21 +486,34 @@ class CortexM0Target(Target):
         shutil.copy(_SUPPORT_DIR / self.board.linker_script, linker_path)
 
         cflags = [
-            f"-mcpu={self.cpu}", "-mthumb", "-O2", "-g",
-            "-ffunction-sections", "-fdata-sections", "-Wall",
+            f"-mcpu={self.cpu}",
+            "-mthumb",
+            "-O2",
+            "-g",
+            "-ffunction-sections",
+            "-fdata-sections",
+            "-Wall",
             f"-I{out}",
         ]
         for src in (startup_path, main_path):
             obj = src.with_suffix(".o")
-            cp = subprocess.run([self.cc, "-c", *cflags, str(src), "-o", str(obj)],
-                                capture_output=True, text=True)
+            cp = subprocess.run(
+                [self.cc, "-c", *cflags, str(src), "-o", str(obj)],
+                capture_output=True,
+                text=True,
+            )
             if cp.returncode != 0:
-                raise RuntimeError(f"compile failed for {src.name}: {cp.stderr}")
+                raise RuntimeError(
+                    f"compile failed for {src.name}: {cp.stderr}"
+                )
 
         elf = out / "rc.elf"
         link_cmd = [
-            self.cc, f"-mcpu={self.cpu}", "-mthumb",
-            "-T", str(linker_path),
+            self.cc,
+            f"-mcpu={self.cpu}",
+            "-mthumb",
+            "-T",
+            str(linker_path),
             "-nostartfiles",
             "-Wl,--gc-sections",
             f"-Wl,-Map={out / 'rc.map'}",
@@ -437,23 +522,31 @@ class CortexM0Target(Target):
             str(out / "startup.o"),
             str(out / "main.o"),
             str(rc_o),
-            "-o", str(elf),
-            "-lgcc", "-lc", "-lnosys",  # no -lm: integer affine kernel
+            "-o",
+            str(elf),
+            "-lgcc",
+            "-lc",
+            "-lnosys",  # no -lm: integer affine kernel
         ]
         cp = subprocess.run(link_cmd, capture_output=True, text=True)
         if cp.returncode != 0:
             raise RuntimeError(f"link failed: {cp.stderr}")
 
         metadata = {
-            "board": self.board, "triple": self.triple,
-            "cpu": self.cpu, "dtype": f"i{sw}",
-            "quantized": True, "affine": True,
+            "board": self.board,
+            "triple": self.triple,
+            "cpu": self.cpu,
+            "dtype": f"i{sw}",
+            "quantized": True,
+            "affine": True,
             "lut_kind": qmodel.lut_strategy.kind.value,
         }
         try:
             sz = subprocess.run(
                 [self.cc.replace("gcc", "size"), str(elf)],
-                capture_output=True, text=True, check=True,
+                capture_output=True,
+                text=True,
+                check=True,
             )
             metadata["size"] = sz.stdout.strip()
         except Exception:
@@ -468,21 +561,38 @@ class CortexM0Target(Target):
             metadata=metadata,
         )
 
-    def run(self, artifact: CompiledArtifact, *,
-            qemu: str = "qemu-system-arm",
-            timeout: float = 60.0,
-            **_) -> RunResult:
+    def run(
+        self,
+        artifact: CompiledArtifact,
+        *,
+        qemu: str = "qemu-system-arm",
+        timeout: float = 60.0,
+        **_,
+    ) -> RunResult:
         if shutil.which(qemu) is None:
             raise RuntimeError(f"{qemu} not found on PATH")
         board = artifact.metadata.get("board")
         if board is None:
-            raise RuntimeError("artifact missing board metadata; nothing to run")
+            raise RuntimeError(
+                "artifact missing board metadata; nothing to run"
+            )
         cp = subprocess.run(
-            [qemu, "-M", board.qemu_machine, "-nographic", "-semihosting",
-             "-kernel", str(artifact.binary)],
-            capture_output=True, text=True, timeout=timeout,
+            [
+                qemu,
+                "-M",
+                board.qemu_machine,
+                "-nographic",
+                "-semihosting",
+                "-kernel",
+                str(artifact.binary),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
         )
         # ARM semihosting writes the program's stdout to QEMU's stderr.
         output = (cp.stdout or "") + (cp.stderr or "")
         success = (cp.returncode == 0) and ("EMULATOR_EXIT" in output)
-        return RunResult(success=success, output=output, returncode=cp.returncode)
+        return RunResult(
+            success=success, output=output, returncode=cp.returncode
+        )

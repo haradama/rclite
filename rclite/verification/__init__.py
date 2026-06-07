@@ -1,7 +1,11 @@
 """Model verification: structural constraints + input-driven ESP checks."""
+
 from .constraints import (
-    ConstraintViolation, ESPChecker,
-    echo_state_property, leak_range, density_range,
+    ConstraintViolation,
+    ESPChecker,
+    echo_state_property,
+    leak_range,
+    density_range,
     WellPosedReservoir,
 )
 
@@ -17,9 +21,13 @@ except ImportError:
     pass
 
 __all__ = [
-    "ConstraintViolation", "ESPChecker",
-    "echo_state_property", "leak_range", "density_range",
+    "ConstraintViolation",
+    "ESPChecker",
+    "echo_state_property",
+    "leak_range",
+    "density_range",
     "WellPosedReservoir",
     "InputDrivenESPCheck",
-    "maximum_lyapunov_exponent", "reservoir_singular_value",
+    "maximum_lyapunov_exponent",
+    "reservoir_singular_value",
 ]

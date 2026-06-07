@@ -24,6 +24,7 @@ A positive `threshold` prunes near-zero weights and is therefore lossy.
 Structured topologies (DLR/DLRB/SCR) are left untouched — they are
 already O(N) and carry no W_res.
 """
+
 from __future__ import annotations
 from dataclasses import replace
 from typing import Iterable
@@ -34,7 +35,11 @@ from rclite.core.profile import Topology
 
 from ..module import Module
 from ..ops import (
-    Op, ReservoirStep, FusedStepReadout, SparseSpec, TimeLoop,
+    Op,
+    ReservoirStep,
+    FusedStepReadout,
+    SparseSpec,
+    TimeLoop,
 )
 from .structural import StructuralSpecialize
 
@@ -100,16 +105,22 @@ def build_csr(W, threshold: float = 0.0):
             col.append(int(j))
             val.append(W[i, j])
         rowptr.append(len(col))
-    return (np.asarray(val, dtype=W.dtype),
-            np.asarray(col, dtype=np.int32),
-            np.asarray(rowptr, dtype=np.int32))
+    return (
+        np.asarray(val, dtype=W.dtype),
+        np.asarray(col, dtype=np.int32),
+        np.asarray(rowptr, dtype=np.int32),
+    )
 
 
 class SparsifyReservoir:
     name = "rc-sparsify-reservoir"
 
-    def __init__(self, strategy: str = "auto", max_unroll_nnz: int = 4096,
-                 threshold: float = 0.0):
+    def __init__(
+        self,
+        strategy: str = "auto",
+        max_unroll_nnz: int = 4096,
+        threshold: float = 0.0,
+    ):
         if strategy not in ("auto", "unroll", "csr"):
             raise ValueError(
                 f"strategy must be 'auto'|'unroll'|'csr', got {strategy!r}"
@@ -124,13 +135,20 @@ class SparsifyReservoir:
         self._weights = dict(module.weights)
         new_ops = [self._fix(op) for op in module.ops]
         # Drop the dense W_res tensors that no op references anymore.
-        for name in [n for n in self._weights if n.startswith("W_res")
-                     and not n.endswith(("_val", "_col", "_rowptr"))]:
+        for name in [
+            n
+            for n in self._weights
+            if n.startswith("W_res")
+            and not n.endswith(("_val", "_col", "_rowptr"))
+        ]:
             if not _module_uses(new_ops, name):
                 del self._weights[name]
         return Module(
-            K=module.K, N=module.N, M=module.M,
-            weights=self._weights, ops=new_ops,
+            K=module.K,
+            N=module.N,
+            M=module.M,
+            weights=self._weights,
+            ops=new_ops,
             metadata=dict(module.metadata),
         )
 
@@ -138,8 +156,11 @@ class SparsifyReservoir:
         if isinstance(op, TimeLoop):
             return replace(op, body=tuple(self._fix(o) for o in op.body))
         if isinstance(op, (ReservoirStep, FusedStepReadout)):
-            if (op.topology in _DENSE and op.W_res_name is not None
-                    and op.res_sparse is None):
+            if (
+                op.topology in _DENSE
+                and op.W_res_name is not None
+                and op.res_sparse is None
+            ):
                 spec = self._build_spec(op)
                 return replace(op, res_sparse=spec, W_res_name=None)
         return op
@@ -160,8 +181,10 @@ class SparsifyReservoir:
         self._weights[f"{base}_col"] = col
         self._weights[f"{base}_rowptr"] = rowptr
         return SparseSpec(
-            kind="csr", nnz=nnz,
-            val_name=f"{base}_val", col_name=f"{base}_col",
+            kind="csr",
+            nnz=nnz,
+            val_name=f"{base}_val",
+            col_name=f"{base}_col",
             rowptr_name=f"{base}_rowptr",
         )
 

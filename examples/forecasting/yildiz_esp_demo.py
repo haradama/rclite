@@ -9,18 +9,24 @@ Shows two reservoirs:
 This is the situation that motivated Yildiz et al. 2012 — the conservative
 bound is sufficient but unnecessarily strict for input-driven reservoirs.
 """
+
 from __future__ import annotations
 import sys
 import pathlib
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 
-import numpy as np
 
 from rclite import (
-    InputNode, ReservoirNode, ReadoutNode, ReservoirComputer,
-    WellPosedReservoir, ConstraintViolation,
-    Activation, Topology, Trainer,
+    InputNode,
+    ReservoirNode,
+    ReadoutNode,
+    ReservoirComputer,
+    WellPosedReservoir,
+    ConstraintViolation,
+    Activation,
+    Topology,
+    Trainer,
 )
 from rclite.runtime import RCExecutor
 from rclite.verification import (
@@ -32,24 +38,39 @@ from rclite.verification import (
 from examples.forecasting.mackey_glass_esn import mackey_glass
 
 
-def build(spectral_radius: float, leak_rate: float, input_offset: float,
-          seed: int = 42) -> ReservoirComputer:
+def build(
+    spectral_radius: float,
+    leak_rate: float,
+    input_offset: float,
+    seed: int = 42,
+) -> ReservoirComputer:
     return ReservoirComputer(
         input=InputNode(
-            units=1, activation=Activation.IDENTITY,
-            input_scaling=1.0, input_offset=input_offset,
+            units=1,
+            activation=Activation.IDENTITY,
+            input_scaling=1.0,
+            input_offset=input_offset,
             name="input",
         ),
         reservoir=ReservoirNode(
-            units=500, activation=Activation.TANH,
-            spectral_radius=spectral_radius, leak_rate=leak_rate,
-            density=0.05, topology=Topology.ESN_STANDARD, seed=seed,
+            units=500,
+            activation=Activation.TANH,
+            spectral_radius=spectral_radius,
+            leak_rate=leak_rate,
+            density=0.05,
+            topology=Topology.ESN_STANDARD,
+            seed=seed,
             name="reservoir",
         ),
         readout=ReadoutNode(
-            units=1, activation=Activation.IDENTITY,
-            trainer=Trainer.RIDGE, regularization=1e-6, washout=200,
-            include_bias=True, include_input=True, name="readout",
+            units=1,
+            activation=Activation.IDENTITY,
+            trainer=Trainer.RIDGE,
+            regularization=1e-6,
+            washout=200,
+            include_bias=True,
+            include_input=True,
+            name="readout",
         ),
     )
 
@@ -60,7 +81,9 @@ def main() -> None:
     input_offset = float(X_sample.mean())
 
     print("=== (A) spectral_radius = 0.95 — conservative configuration ===")
-    rc_a = build(spectral_radius=0.95, leak_rate=0.3, input_offset=input_offset)
+    rc_a = build(
+        spectral_radius=0.95, leak_rate=0.3, input_offset=input_offset
+    )
     exe_a = RCExecutor(rc_a)
     print(f"  ρ(W) = {rc_a.reservoir.spectral_radius:.3f}")
     print(f"  σ_max(W) = {reservoir_singular_value(exe_a):.3f}")
@@ -70,7 +93,9 @@ def main() -> None:
     print(f"  [ok] WellPosedReservoir (structural) satisfied\n")
 
     print("=== (B) spectral_radius = 1.10 — beyond the conservative bound ===")
-    rc_b = build(spectral_radius=1.10, leak_rate=0.50, input_offset=input_offset)
+    rc_b = build(
+        spectral_radius=1.10, leak_rate=0.50, input_offset=input_offset
+    )
     exe_b = RCExecutor(rc_b)
     print(f"  ρ(W) = {rc_b.reservoir.spectral_radius:.3f}")
     print(f"  σ_max(W) = {reservoir_singular_value(exe_b):.3f}")
@@ -88,7 +113,9 @@ def main() -> None:
     req = WellPosedReservoir(
         rc_b.reservoir,
         empirical_check=InputDrivenESPCheck(
-            executor=exe_b, sample_input=X_sample, threshold=0.0,
+            executor=exe_b,
+            sample_input=X_sample,
+            threshold=0.0,
         ),
     )
     req.check()
@@ -105,7 +132,9 @@ def main() -> None:
     print(f"  MLE      = {mle_c:+.4f}")
     req_c = WellPosedReservoir(
         rc_c.reservoir,
-        empirical_check=InputDrivenESPCheck(executor=exe_c, sample_input=X_sample),
+        empirical_check=InputDrivenESPCheck(
+            executor=exe_c, sample_input=X_sample
+        ),
     )
     try:
         req_c.check()

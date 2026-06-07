@@ -3,6 +3,7 @@
 Phase 2a scope: Python reference only. The LLVM-emit + on-device kernel
 is Phase 2b.
 """
+
 from __future__ import annotations
 import pathlib
 import sys
@@ -13,16 +14,25 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import numpy as np
 
 from rclite import (
-    InputNode, ReservoirNode, ReadoutNode, ReservoirComputer,
-    Activation, Distribution, Topology, Trainer,
+    InputNode,
+    ReservoirNode,
+    ReadoutNode,
+    ReservoirComputer,
+    Activation,
+    Distribution,
+    Topology,
+    Trainer,
 )
 from rclite.runtime import RCExecutor
 from rclite.quant import (
-    AffineParams, AffineQuantConfig,
+    AffineParams,
+    AffineQuantConfig,
     calibrate_from_data,
-    AffineQuantizedModel, quantize_model_affine,
+    AffineQuantizedModel,
+    quantize_model_affine,
     AffineQuantizedExecutor,
-    search_quantization_affine, AffineSearchResult,
+    search_quantization_affine,
+    AffineSearchResult,
 )
 
 
@@ -38,18 +48,39 @@ def expect_raises(exc_type, fn, *args, **kwargs):
     raise AssertionError(f"Expected {exc_type.__name__}, none raised")
 
 
-def _build_esn(units=30, topology=Topology.SCR, include_input=True,
-                include_bias=True, T=300, seed=0):
+def _build_esn(
+    units=30,
+    topology=Topology.SCR,
+    include_input=True,
+    include_bias=True,
+    T=300,
+    seed=0,
+):
     rc = ReservoirComputer(
-        input=InputNode(units=1, input_offset=0.0, input_scaling=1.0,
-                        input_distribution=Distribution.BERNOULLI, name="in"),
-        reservoir=ReservoirNode(units=units, topology=topology,
-                                 chain_weight=0.9, leak_rate=0.3, seed=42,
-                                 name="res"),
-        readout=ReadoutNode(units=1, trainer=Trainer.RIDGE,
-                             regularization=1e-6, washout=50,
-                             include_bias=include_bias,
-                             include_input=include_input, name="out"),
+        input=InputNode(
+            units=1,
+            input_offset=0.0,
+            input_scaling=1.0,
+            input_distribution=Distribution.BERNOULLI,
+            name="in",
+        ),
+        reservoir=ReservoirNode(
+            units=units,
+            topology=topology,
+            chain_weight=0.9,
+            leak_rate=0.3,
+            seed=42,
+            name="res",
+        ),
+        readout=ReadoutNode(
+            units=1,
+            trainer=Trainer.RIDGE,
+            regularization=1e-6,
+            washout=50,
+            include_bias=include_bias,
+            include_input=include_input,
+            name="out",
+        ),
     )
     exe = RCExecutor(rc)
     rng = np.random.default_rng(seed)
@@ -122,20 +153,38 @@ def test_affine_params_quantize_array_dtype():
 
 def test_config_rejects_nonzero_zp_for_weights():
     p_act = AffineParams(scale=0.01, zero_point=5)
-    p_w   = AffineParams(scale=0.01, zero_point=0)
+    p_w = AffineParams(scale=0.01, zero_point=0)
     p_bad = AffineParams(scale=0.01, zero_point=5)
     # W_in with zp != 0 should be rejected
-    expect_raises(ValueError, AffineQuantConfig,
-                   input=p_act, u_pre=p_act, state=p_w, pre=p_act,
-                   W_in=p_bad, W_res=p_w, W_out_state=p_w, output=p_act)
+    expect_raises(
+        ValueError,
+        AffineQuantConfig,
+        input=p_act,
+        u_pre=p_act,
+        state=p_w,
+        pre=p_act,
+        W_in=p_bad,
+        W_res=p_w,
+        W_out_state=p_w,
+        output=p_act,
+    )
 
 
 def test_config_rejects_mixed_storage_bits():
-    p8  = AffineParams(scale=0.01, zero_point=0, storage_bits=8)
+    p8 = AffineParams(scale=0.01, zero_point=0, storage_bits=8)
     p16 = AffineParams(scale=0.01, zero_point=0, storage_bits=16)
-    expect_raises(ValueError, AffineQuantConfig,
-                   input=p8, u_pre=p16, state=p8, pre=p8,
-                   W_in=p8, W_res=p8, W_out_state=p8, output=p8)
+    expect_raises(
+        ValueError,
+        AffineQuantConfig,
+        input=p8,
+        u_pre=p16,
+        state=p8,
+        pre=p8,
+        W_in=p8,
+        W_res=p8,
+        W_out_state=p8,
+        output=p8,
+    )
 
 
 # ---------------------------------------------------------------- calibration
@@ -251,7 +300,9 @@ def test_executor_state_trajectory_close_to_float():
     # recurrent matmul; over 200 steps we tolerate accumulated drift up to
     # ~25× the per-element state quantum.
     err = float(np.abs(H_q - H_f).max())
-    assert err < 25 * cfg.state.scale, f"state err {err} >> 25*{cfg.state.scale}"
+    assert err < 25 * cfg.state.scale, (
+        f"state err {err} >> 25*{cfg.state.scale}"
+    )
 
 
 def test_executor_output_in_same_ballpark_as_float():
@@ -266,8 +317,9 @@ def test_executor_output_in_same_ballpark_as_float():
     mse_f = float(np.mean((Y_f - Y_ref) ** 2))
     mse_q = float(np.mean((Y_q - Y_ref) ** 2))
     # For i8 with auto-calibration, allow within 10x of float MSE
-    assert mse_q < 10 * mse_f + 1e-3, \
+    assert mse_q < 10 * mse_f + 1e-3, (
         f"affine MSE {mse_q:.4e} too far from float {mse_f:.4e}"
+    )
 
 
 def test_executor_dequantize_matches_int_state_q():
@@ -312,7 +364,9 @@ def test_per_block_W_out_keeps_tiny_bias_coefficient():
     # Bias column is W_out_q[:, 0]; should not be all zeros (assuming bias coef
     # is non-negligible after fitting on the synthetic target).
     bias_col = qm.W_out_q[:, 0]
-    assert not np.all(bias_col == 0), "bias column collapsed to zero — per-block scales not working"
+    assert not np.all(bias_col == 0), (
+        "bias column collapsed to zero — per-block scales not working"
+    )
 
 
 # ---------------------------------------------------------------- i16 storage path
@@ -326,8 +380,9 @@ def test_affine_params_i16_range():
     AffineParams(scale=1.0, zero_point=32767, storage_bits=16)
     AffineParams(scale=1.0, zero_point=-32768, storage_bits=16)
     # one past the boundary should fail
-    expect_raises(ValueError, AffineParams, scale=1.0, zero_point=32768,
-                   storage_bits=16)
+    expect_raises(
+        ValueError, AffineParams, scale=1.0, zero_point=32768, storage_bits=16
+    )
 
 
 def test_calibrate_storage_bits_propagates():
@@ -335,8 +390,16 @@ def test_calibrate_storage_bits_propagates():
     rc, exe, X, _ = _build_esn(units=20)
     cfg16 = calibrate_from_data(rc, exe, X, storage_bits=16)
     assert cfg16.storage_bits == 16
-    for name in ("input", "u_pre", "state", "pre", "W_in", "W_res",
-                  "W_out_state", "output"):
+    for name in (
+        "input",
+        "u_pre",
+        "state",
+        "pre",
+        "W_in",
+        "W_res",
+        "W_out_state",
+        "output",
+    ):
         assert getattr(cfg16, name).storage_bits == 16, name
 
 
@@ -386,8 +449,9 @@ def test_i16_affine_accuracy_close_to_float():
     mse_f_target = float(np.mean((Y_f - Y[400:500]) ** 2))
     mse_q_target = float(np.mean((Y_q - Y[400:500]) ** 2))
     # i16 affine should be within 5x of float MSE on this synthetic task
-    assert mse_q_target < 5 * mse_f_target + 1e-4, \
+    assert mse_q_target < 5 * mse_f_target + 1e-4, (
         f"i16 affine MSE {mse_q_target:.4e} too far from float {mse_f_target:.4e}"
+    )
 
 
 def test_i16_affine_state_trajectory_bounded():
@@ -414,8 +478,14 @@ def test_i16_affine_state_trajectory_bounded():
 def test_qat_returns_affine_search_result():
     rc, exe, X, Y = _build_esn(units=20, T=400)
     result = search_quantization_affine(
-        rc, exe, X[:300], Y[:300], X[300:400], Y[300:400],
-        storage_bits=8, n_iterations=1,
+        rc,
+        exe,
+        X[:300],
+        Y[:300],
+        X[300:400],
+        Y[300:400],
+        storage_bits=8,
+        n_iterations=1,
     )
     assert isinstance(result, AffineSearchResult)
     assert isinstance(result.best_qmodel, AffineQuantizedModel)
@@ -428,8 +498,14 @@ def test_qat_zero_iterations_matches_calibrate():
     """n_iterations=0 should produce the same model as plain calibration."""
     rc, exe, X, Y = _build_esn(units=20, T=400)
     result = search_quantization_affine(
-        rc, exe, X[:300], Y[:300], X[300:400], Y[300:400],
-        storage_bits=8, n_iterations=0,
+        rc,
+        exe,
+        X[:300],
+        Y[:300],
+        X[300:400],
+        Y[300:400],
+        storage_bits=8,
+        n_iterations=0,
     )
     # Compare W_out_q to a single-pass calibration
     cfg = calibrate_from_data(rc, exe, X[:300], storage_bits=8)
@@ -446,12 +522,19 @@ def test_qat_improves_or_matches_baseline():
     """
     rc, exe, X, Y = _build_esn(units=30, T=500)
     result = search_quantization_affine(
-        rc, exe, X[:400], Y[:400], X[400:500], Y[400:500],
-        storage_bits=8, n_iterations=2,
+        rc,
+        exe,
+        X[:400],
+        Y[:400],
+        X[400:500],
+        Y[400:500],
+        storage_bits=8,
+        n_iterations=2,
     )
     baseline_mse = result.history[0][1]
-    assert result.best_mse <= baseline_mse + 1e-12, \
+    assert result.best_mse <= baseline_mse + 1e-12, (
         f"QAT best {result.best_mse:.4e} worse than baseline {baseline_mse:.4e}"
+    )
 
 
 def test_qat_strictly_improves_on_mackey_glass_i8():
@@ -461,42 +544,78 @@ def test_qat_strictly_improves_on_mackey_glass_i8():
     has clear room to compensate for state-quantization noise. We require
     a strict win to validate that the QAT loop is actually doing work.
     """
-    from rclite import (InputNode, ReservoirNode, ReadoutNode,
-                         ReservoirComputer, Activation,
-                         Distribution, Topology, Trainer)
+    from rclite import (
+        InputNode,
+        ReservoirNode,
+        ReadoutNode,
+        ReservoirComputer,
+        Distribution,
+        Topology,
+        Trainer,
+    )
     from examples.forecasting.mackey_glass_esn import mackey_glass
+
     series = mackey_glass(n=1500)
-    X = series[:-1, None]; Y = series[1:, None]
+    X = series[:-1, None]
+    Y = series[1:, None]
     rc = ReservoirComputer(
-        input=InputNode(units=1, input_offset=0.0, input_scaling=1.0,
-                        input_distribution=Distribution.BERNOULLI),
-        reservoir=ReservoirNode(units=60, activation=Activation.TANH,
-                                 topology=Topology.SCR, chain_weight=0.9,
-                                 leak_rate=0.3, seed=42),
-        readout=ReadoutNode(units=1, trainer=Trainer.RIDGE,
-                             regularization=1e-6, washout=200,
-                             include_bias=True, include_input=True),
+        input=InputNode(
+            units=1,
+            input_offset=0.0,
+            input_scaling=1.0,
+            input_distribution=Distribution.BERNOULLI,
+        ),
+        reservoir=ReservoirNode(
+            units=60,
+            activation=Activation.TANH,
+            topology=Topology.SCR,
+            chain_weight=0.9,
+            leak_rate=0.3,
+            seed=42,
+        ),
+        readout=ReadoutNode(
+            units=1,
+            trainer=Trainer.RIDGE,
+            regularization=1e-6,
+            washout=200,
+            include_bias=True,
+            include_input=True,
+        ),
     )
     exe = RCExecutor(rc)
     exe.fit(X[:1000], Y[:1000])
     result = search_quantization_affine(
-        rc, exe, X[:1000], Y[:1000], X[1000:1100], Y[1000:1100],
-        storage_bits=8, n_iterations=2,
+        rc,
+        exe,
+        X[:1000],
+        Y[:1000],
+        X[1000:1100],
+        Y[1000:1100],
+        storage_bits=8,
+        n_iterations=2,
     )
     baseline_mse = result.history[0][1]
-    assert result.best_mse < baseline_mse, \
+    assert result.best_mse < baseline_mse, (
         f"QAT best {result.best_mse:.4e} did not beat baseline {baseline_mse:.4e}"
+    )
     # And the improvement should be meaningful, not just numerical
     improvement = baseline_mse / result.best_mse
-    assert improvement >= 1.5, \
+    assert improvement >= 1.5, (
         f"QAT improvement only {improvement:.2f}x — expected >= 1.5x for MG i8"
+    )
 
 
 def test_qat_best_iteration_matches_history_argmin():
     rc, exe, X, Y = _build_esn(units=20, T=400)
     result = search_quantization_affine(
-        rc, exe, X[:300], Y[:300], X[300:400], Y[300:400],
-        storage_bits=8, n_iterations=2,
+        rc,
+        exe,
+        X[:300],
+        Y[:300],
+        X[300:400],
+        Y[300:400],
+        storage_bits=8,
+        n_iterations=2,
     )
     argmin_it, argmin_mse = min(result.history, key=lambda t: t[1])
     assert result.best_iteration == argmin_it
@@ -506,8 +625,14 @@ def test_qat_best_iteration_matches_history_argmin():
 def test_qat_best_qmodel_is_callable():
     rc, exe, X, Y = _build_esn(units=20, T=400)
     result = search_quantization_affine(
-        rc, exe, X[:300], Y[:300], X[300:400], Y[300:400],
-        storage_bits=8, n_iterations=1,
+        rc,
+        exe,
+        X[:300],
+        Y[:300],
+        X[300:400],
+        Y[300:400],
+        storage_bits=8,
+        n_iterations=1,
     )
     qexe = AffineQuantizedExecutor(result.best_qmodel)
     Y_q = qexe.predict(X[300:330])
@@ -519,8 +644,14 @@ def test_qat_supports_i16_storage():
     """QAT search should work end-to-end with storage_bits=16 too."""
     rc, exe, X, Y = _build_esn(units=20, T=400)
     result = search_quantization_affine(
-        rc, exe, X[:300], Y[:300], X[300:400], Y[300:400],
-        storage_bits=16, n_iterations=1,
+        rc,
+        exe,
+        X[:300],
+        Y[:300],
+        X[300:400],
+        Y[300:400],
+        storage_bits=16,
+        n_iterations=1,
     )
     assert result.best_qmodel.storage_bits == 16
     assert result.best_qmodel.W_in_q.dtype == np.int16
@@ -531,39 +662,67 @@ def test_qat_accepts_1d_arrays():
     rc, exe, X, Y = _build_esn(units=20, T=400)
     # Pass 1D for the K=1 / M=1 case
     result = search_quantization_affine(
-        rc, exe,
-        X[:300].ravel(), Y[:300].ravel(),
-        X[300:400].ravel(), Y[300:400].ravel(),
-        storage_bits=8, n_iterations=1,
+        rc,
+        exe,
+        X[:300].ravel(),
+        Y[:300].ravel(),
+        X[300:400].ravel(),
+        Y[300:400].ravel(),
+        storage_bits=8,
+        n_iterations=1,
     )
     assert isinstance(result, AffineSearchResult)
 
 
 def test_qat_rejects_untrained_exe():
-    from rclite import (InputNode, ReservoirNode, ReadoutNode,
-                         ReservoirComputer, Distribution, Topology, Trainer)
+    from rclite import (
+        InputNode,
+        ReservoirNode,
+        ReadoutNode,
+        ReservoirComputer,
+        Distribution,
+        Topology,
+        Trainer,
+    )
+
     rc = ReservoirComputer(
         input=InputNode(units=1, input_distribution=Distribution.BERNOULLI),
-        reservoir=ReservoirNode(units=10, topology=Topology.SCR,
-                                 chain_weight=0.9, leak_rate=0.3),
-        readout=ReadoutNode(units=1, trainer=Trainer.RIDGE,
-                             include_bias=True),
+        reservoir=ReservoirNode(
+            units=10, topology=Topology.SCR, chain_weight=0.9, leak_rate=0.3
+        ),
+        readout=ReadoutNode(units=1, trainer=Trainer.RIDGE, include_bias=True),
     )
     exe = RCExecutor(rc)
-    X = np.zeros((100, 1)); Y = np.zeros((100, 1))
-    expect_raises(ValueError, search_quantization_affine,
-                   rc, exe, X[:80], Y[:80], X[80:], Y[80:])
+    X = np.zeros((100, 1))
+    Y = np.zeros((100, 1))
+    expect_raises(
+        ValueError,
+        search_quantization_affine,
+        rc,
+        exe,
+        X[:80],
+        Y[:80],
+        X[80:],
+        Y[80:],
+    )
 
 
 def test_qat_does_not_mutate_exe_W_out():
     rc, exe, X, Y = _build_esn(units=20, T=400)
     W_out_before = exe.W_out.copy()
     search_quantization_affine(
-        rc, exe, X[:300], Y[:300], X[300:400], Y[300:400],
-        storage_bits=8, n_iterations=2,
+        rc,
+        exe,
+        X[:300],
+        Y[:300],
+        X[300:400],
+        Y[300:400],
+        storage_bits=8,
+        n_iterations=2,
     )
-    assert np.array_equal(W_out_before, exe.W_out), \
+    assert np.array_equal(W_out_before, exe.W_out), (
         "search_quantization_affine mutated exe.W_out"
+    )
 
 
 # ---------------------------------------------------------------- mixed precision
@@ -571,7 +730,9 @@ def test_qat_does_not_mutate_exe_W_out():
 
 def test_config_w_out_storage_bits_property():
     rc, exe, X, _ = _build_esn(units=20)
-    cfg = calibrate_from_data(rc, exe, X, storage_bits=8, w_out_storage_bits=16)
+    cfg = calibrate_from_data(
+        rc, exe, X, storage_bits=8, w_out_storage_bits=16
+    )
     assert cfg.storage_bits == 8
     assert cfg.w_out_storage_bits == 16
     assert cfg.mixed_precision is True
@@ -585,25 +746,38 @@ def test_config_rejects_w_out_narrower_than_base():
     p16act = AffineParams(scale=0.01, zero_point=3, storage_bits=16)
     p16 = AffineParams(scale=0.01, zero_point=0, storage_bits=16)
     # base = i16 activations, but W_out at i8 → must reject (W_out < base)
-    expect_raises(ValueError, AffineQuantConfig,
-                   input=p16act, u_pre=p16act, state=p16, pre=p16act,
-                   W_in=p16, W_res=p16, W_out_state=p8, output=p16act)
+    expect_raises(
+        ValueError,
+        AffineQuantConfig,
+        input=p16act,
+        u_pre=p16act,
+        state=p16,
+        pre=p16act,
+        W_in=p16,
+        W_res=p16,
+        W_out_state=p8,
+        output=p16act,
+    )
 
 
 def test_mixed_precision_quantize_dtypes():
     rc, exe, X, _ = _build_esn(units=20)
-    cfg = calibrate_from_data(rc, exe, X, storage_bits=8, w_out_storage_bits=16)
+    cfg = calibrate_from_data(
+        rc, exe, X, storage_bits=8, w_out_storage_bits=16
+    )
     qm = quantize_model_affine(rc, exe, cfg)
-    assert qm.W_in_q.dtype == np.int8     # reservoir weights stay i8
+    assert qm.W_in_q.dtype == np.int8  # reservoir weights stay i8
     assert qm.W_res_q.dtype == np.int8
-    assert qm.W_out_q.dtype == np.int16   # readout weights are i16
+    assert qm.W_out_q.dtype == np.int16  # readout weights are i16
     assert qm.storage_bits == 8
     assert qm.w_out_storage_bits == 16
 
 
 def test_mixed_precision_executor_runs():
     rc, exe, X, _ = _build_esn(units=30)
-    cfg = calibrate_from_data(rc, exe, X, storage_bits=8, w_out_storage_bits=16)
+    cfg = calibrate_from_data(
+        rc, exe, X, storage_bits=8, w_out_storage_bits=16
+    )
     qm = quantize_model_affine(rc, exe, cfg)
     Y = AffineQuantizedExecutor(qm).predict(X[200:230])
     assert Y.shape == (30, 1)
@@ -614,35 +788,69 @@ def test_mixed_precision_qat_beats_pure_i8_on_mackey_glass():
     """i8 reservoir + i16 W_out (+ QAT) should beat pure-i8 (+ QAT): the i16
     readout weights recover much of the readout-coefficient quantization loss
     that is the measured pure-i8 bottleneck."""
-    from rclite import (InputNode as IN, ReservoirNode as RN, ReadoutNode as RoN,
-                         ReservoirComputer as RC2, Activation,
-                         Distribution as D, Topology as Tp, Trainer as Tr)
+    from rclite import (
+        InputNode as IN,
+        ReservoirNode as RN,
+        ReadoutNode as RoN,
+        ReservoirComputer as RC2,
+        Distribution as D,
+        Topology as Tp,
+        Trainer as Tr,
+    )
     from examples.forecasting.mackey_glass_esn import mackey_glass
+
     series = mackey_glass(n=2000)
-    X = series[:-1, None]; Y = series[1:, None]
+    X = series[:-1, None]
+    Y = series[1:, None]
     rc = RC2(
-        input=IN(units=1, input_offset=0.0, input_scaling=1.0,
-                 input_distribution=D.BERNOULLI),
-        reservoir=RN(units=80, activation=Activation.TANH, topology=Tp.SCR,
-                     chain_weight=0.9, leak_rate=0.3, seed=42),
-        readout=RoN(units=1, trainer=Tr.RIDGE, regularization=1e-6,
-                    washout=300, include_bias=True, include_input=True),
+        input=IN(
+            units=1,
+            input_offset=0.0,
+            input_scaling=1.0,
+            input_distribution=D.BERNOULLI,
+        ),
+        reservoir=RN(
+            units=80,
+            activation=Activation.TANH,
+            topology=Tp.SCR,
+            chain_weight=0.9,
+            leak_rate=0.3,
+            seed=42,
+        ),
+        readout=RoN(
+            units=1,
+            trainer=Tr.RIDGE,
+            regularization=1e-6,
+            washout=300,
+            include_bias=True,
+            include_input=True,
+        ),
     )
     exe = RCExecutor(rc)
     exe.fit(X[:1500], Y[:1500])
     eX, eY = X[1500:1600], Y[1500:1600]
-    full = X[:1600]; sl = slice(1500, 1600)
+    full = X[:1600]
+    sl = slice(1500, 1600)
     sig = float(np.std(eY))
 
     def nrmse(qm):
         pred = AffineQuantizedExecutor(qm).predict(full)
         return float(np.sqrt(np.mean((pred[sl] - eY) ** 2))) / sig * 100
 
-    r8 = search_quantization_affine(rc, exe, X[:1500], Y[:1500], eX, eY,
-                                     storage_bits=8, n_iterations=1)
-    rm = search_quantization_affine(rc, exe, X[:1500], Y[:1500], eX, eY,
-                                     storage_bits=8, w_out_storage_bits=16,
-                                     n_iterations=1)
+    r8 = search_quantization_affine(
+        rc, exe, X[:1500], Y[:1500], eX, eY, storage_bits=8, n_iterations=1
+    )
+    rm = search_quantization_affine(
+        rc,
+        exe,
+        X[:1500],
+        Y[:1500],
+        eX,
+        eY,
+        storage_bits=8,
+        w_out_storage_bits=16,
+        n_iterations=1,
+    )
     n8 = nrmse(r8.best_qmodel)
     nm = nrmse(rm.best_qmodel)
     assert rm.best_qmodel.mixed_precision is True
@@ -658,21 +866,25 @@ def test_i16_affine_beats_i8_affine_on_same_model():
     output MSE captures the practically-relevant degradation cleanly.
     """
     rc, exe, X, _ = _build_esn(units=60, T=600)
-    cfg8  = calibrate_from_data(rc, exe, X[:500], storage_bits=8)
+    cfg8 = calibrate_from_data(rc, exe, X[:500], storage_bits=8)
     cfg16 = calibrate_from_data(rc, exe, X[:500], storage_bits=16)
-    qm8  = quantize_model_affine(rc, exe, cfg8)
+    qm8 = quantize_model_affine(rc, exe, cfg8)
     qm16 = quantize_model_affine(rc, exe, cfg16)
-    Y_f  = exe.predict(X)
-    Y_8  = AffineQuantizedExecutor(qm8).predict(X)
+    Y_f = exe.predict(X)
+    Y_8 = AffineQuantizedExecutor(qm8).predict(X)
     Y_16 = AffineQuantizedExecutor(qm16).predict(X)
-    mse_8  = float(np.mean((Y_8 [500:600] - Y_f[500:600]) ** 2))
+    mse_8 = float(np.mean((Y_8[500:600] - Y_f[500:600]) ** 2))
     mse_16 = float(np.mean((Y_16[500:600] - Y_f[500:600]) ** 2))
-    assert mse_16 < mse_8, \
+    assert mse_16 < mse_8, (
         f"i16 MSE {mse_16:.4e} should beat i8 MSE {mse_8:.4e} on same model"
+    )
 
 
-TESTS = [v for k, v in list(globals().items())
-         if k.startswith("test_") and callable(v)]
+TESTS = [
+    v
+    for k, v in list(globals().items())
+    if k.startswith("test_") and callable(v)
+]
 
 
 def main() -> int:

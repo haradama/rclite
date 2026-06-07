@@ -10,6 +10,7 @@ Both kernels expose the same C ABI:
 
 so the rclite shared library and the scratch .so are drop-in replacements.
 """
+
 from __future__ import annotations
 import ctypes
 import pathlib
@@ -23,8 +24,13 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 import numpy as np
 
 from rclite import (
-    InputNode, ReservoirNode, ReadoutNode, ReservoirComputer,
-    Activation, Distribution, Topology, Trainer,
+    InputNode,
+    ReservoirNode,
+    ReadoutNode,
+    ReservoirComputer,
+    Activation,
+    Topology,
+    Trainer,
 )
 from rclite.runtime import RCExecutor
 from rclite.codegen import compile_rc
@@ -42,8 +48,9 @@ def _fmt_doubles(arr: np.ndarray) -> str:
     return ", ".join(f"{v:.17g}" for v in flat)
 
 
-def render_scratch_c(rc: ReservoirComputer, exe: RCExecutor,
-                       out_path: pathlib.Path) -> None:
+def render_scratch_c(
+    rc: ReservoirComputer, exe: RCExecutor, out_path: pathlib.Path
+) -> None:
     """Fill the naive C template with the trained weights."""
     K = rc.input.units
     N = rc.reservoir.units
@@ -54,8 +61,7 @@ def render_scratch_c(rc: ReservoirComputer, exe: RCExecutor,
 
     tmpl = TEMPLATE.read_text()
     text = (
-        tmpl
-        .replace("@@N@@", str(N))
+        tmpl.replace("@@N@@", str(N))
         .replace("@@K@@", str(K))
         .replace("@@M@@", str(M))
         .replace("@@F@@", str(F))
@@ -72,10 +78,20 @@ def render_scratch_c(rc: ReservoirComputer, exe: RCExecutor,
     out_path.write_text(text)
 
 
-def build_scratch_so(c_path: pathlib.Path, so_path: pathlib.Path,
-                      cc: str = "gcc") -> None:
-    cmd = [cc, "-O3", "-march=native", "-shared", "-fPIC",
-           str(c_path), "-o", str(so_path), "-lm"]
+def build_scratch_so(
+    c_path: pathlib.Path, so_path: pathlib.Path, cc: str = "gcc"
+) -> None:
+    cmd = [
+        cc,
+        "-O3",
+        "-march=native",
+        "-shared",
+        "-fPIC",
+        str(c_path),
+        "-o",
+        str(so_path),
+        "-lm",
+    ]
     cp = subprocess.run(cmd, capture_output=True, text=True)
     if cp.returncode != 0:
         raise RuntimeError(
@@ -105,25 +121,45 @@ def time_fn(fn, *args, repeats: int = 7) -> float:
     return best
 
 
-def build_esn(N: int, topology: Topology, input_offset: float,
-               seed: int = 42) -> ReservoirComputer:
+def build_esn(
+    N: int, topology: Topology, input_offset: float, seed: int = 42
+) -> ReservoirComputer:
     return ReservoirComputer(
-        input=InputNode(units=1, activation=Activation.IDENTITY,
-                        input_scaling=1.0, input_offset=input_offset, name="in"),
-        reservoir=ReservoirNode(units=N, activation=Activation.TANH,
-                                 spectral_radius=0.95, leak_rate=0.3,
-                                 density=0.05, topology=topology,
-                                 chain_weight=0.9, chain_feedback=0.05,
-                                 seed=seed, name="res"),
-        readout=ReadoutNode(units=1, activation=Activation.IDENTITY,
-                             trainer=Trainer.RIDGE, regularization=1e-6,
-                             washout=200, include_bias=True,
-                             include_input=True, name="out"),
+        input=InputNode(
+            units=1,
+            activation=Activation.IDENTITY,
+            input_scaling=1.0,
+            input_offset=input_offset,
+            name="in",
+        ),
+        reservoir=ReservoirNode(
+            units=N,
+            activation=Activation.TANH,
+            spectral_radius=0.95,
+            leak_rate=0.3,
+            density=0.05,
+            topology=topology,
+            chain_weight=0.9,
+            chain_feedback=0.05,
+            seed=seed,
+            name="res",
+        ),
+        readout=ReadoutNode(
+            units=1,
+            activation=Activation.IDENTITY,
+            trainer=Trainer.RIDGE,
+            regularization=1e-6,
+            washout=200,
+            include_bias=True,
+            include_input=True,
+            name="out",
+        ),
     )
 
 
-def run_one(topology: Topology, N: int, X_tr, Y_tr, X_te,
-             input_offset: float) -> dict:
+def run_one(
+    topology: Topology, N: int, X_tr, Y_tr, X_te, input_offset: float
+) -> dict:
     out_dir = BUILD / f"{topology.name}_N{N}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -181,6 +217,7 @@ def main() -> None:
 
     # Mackey-Glass-ish setup
     from examples.forecasting.mackey_glass_esn import mackey_glass
+
     series = mackey_glass(n=3000)
     X, Y = series[:-1, None], series[1:, None]
     n_train = 2000
@@ -193,8 +230,12 @@ def main() -> None:
         for N in (100, 250, 500):
             cases.append((topology, N))
 
-    print(f"Benchmark: naive 3-loop C (gcc -O3 -march=native) vs rclite LLVM JIT")
-    print(f"Inference: T={X_te.shape[0]} samples, double-precision, K={1}, M={1}")
+    print(
+        f"Benchmark: naive 3-loop C (gcc -O3 -march=native) vs rclite LLVM JIT"
+    )
+    print(
+        f"Inference: T={X_te.shape[0]} samples, double-precision, K={1}, M={1}"
+    )
     print()
     header = (
         f"{'topology':<14} {'N':>5} "

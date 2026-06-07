@@ -18,11 +18,11 @@ benchmarks/tflm_vs_rclite/firmware. Requires arm-none-eabi-gcc + qemu-system-arm
 
     .venv/bin/python benchmarks/sparse_mcu/bench.py
 """
+
 from __future__ import annotations
 import pathlib
 import re
 import shutil
-import statistics
 import subprocess
 import sys
 import tempfile
@@ -32,12 +32,18 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 import numpy as np
 
 from rclite import (
-    InputNode, ReservoirNode, ReadoutNode, ReservoirComputer,
-    Activation, Topology, Trainer,
+    InputNode,
+    ReservoirNode,
+    ReadoutNode,
+    ReservoirComputer,
+    Topology,
+    Trainer,
 )
 from rclite.runtime import RCExecutor
 from rclite.quant.affine import (
-    calibrate_from_data, quantize_model_affine, AffineQuantizedExecutor,
+    calibrate_from_data,
+    quantize_model_affine,
+    AffineQuantizedExecutor,
 )
 from rclite.targets.arduino import emit_affine_kernel_c
 from rclite.ir.passes.sparsify import build_csr
@@ -59,12 +65,23 @@ def _have_tools():
 def _train(units, density, seed=7):
     rc = ReservoirComputer(
         input=InputNode(units=1, name="in"),
-        reservoir=ReservoirNode(units=units, topology=Topology.ESN_STANDARD,
-                                leak_rate=0.35, density=density, seed=seed,
-                                name="res"),
-        readout=ReadoutNode(units=1, trainer=Trainer.RIDGE,
-                            regularization=1e-6, washout=100,
-                            include_bias=True, include_input=False, name="out"),
+        reservoir=ReservoirNode(
+            units=units,
+            topology=Topology.ESN_STANDARD,
+            leak_rate=0.35,
+            density=density,
+            seed=seed,
+            name="res",
+        ),
+        readout=ReadoutNode(
+            units=1,
+            trainer=Trainer.RIDGE,
+            regularization=1e-6,
+            washout=100,
+            include_bias=True,
+            include_input=False,
+            name="out",
+        ),
     )
     exe = RCExecutor(rc)
     rng = np.random.default_rng(seed)
@@ -90,30 +107,40 @@ def _emit_data_h(qm, x_seq):
         u_pre_q = qexe._quantize_u_pre(x_seq[t])
         qexe.step_q(u_pre_q)
         Yref[t] = qexe.predict_one_q(x_raw_q, qexe.state_q).astype(np_t)
-    return "\n".join([
-        "#ifndef RC_DATA_H_", "#define RC_DATA_H_",
-        f"typedef {ct} rc_fw_storage_t;",
-        f"#define RC_FW_T {T_FW}", f"#define RC_FW_K {qm.K}",
-        f"#define RC_FW_M {qm.M}",
-        f"static const rc_fw_storage_t g_x[{T_FW * qm.K}] = {{"
-        + ",".join(str(int(v)) for v in Xq.ravel()) + "};",
-        f"static const rc_fw_storage_t g_y_ref[{T_FW * qm.M}] = {{"
-        + ",".join(str(int(v)) for v in Yref.ravel()) + "};",
-        "#endif", "",
-    ])
+    return "\n".join(
+        [
+            "#ifndef RC_DATA_H_",
+            "#define RC_DATA_H_",
+            f"typedef {ct} rc_fw_storage_t;",
+            f"#define RC_FW_T {T_FW}",
+            f"#define RC_FW_K {qm.K}",
+            f"#define RC_FW_M {qm.M}",
+            f"static const rc_fw_storage_t g_x[{T_FW * qm.K}] = {{"
+            + ",".join(str(int(v)) for v in Xq.ravel())
+            + "};",
+            f"static const rc_fw_storage_t g_y_ref[{T_FW * qm.M}] = {{"
+            + ",".join(str(int(v)) for v in Yref.ravel())
+            + "};",
+            "#endif",
+            "",
+        ]
+    )
 
 
 def _build_and_run(qm, x_seq, sparse, workdir: pathlib.Path):
     """Compile a firmware variant, return (flash, ram, instr_per_step, parity)."""
     workdir.mkdir(parents=True, exist_ok=True)
     (workdir / "rc_kernel.c").write_text(
-        emit_affine_kernel_c(qm, sparse=sparse))
+        emit_affine_kernel_c(qm, sparse=sparse)
+    )
     (workdir / "rc_data.h").write_text(_emit_data_h(qm, x_seq))
     elf = workdir / "fw.elf"
     objs = []
-    for src, inc in [(workdir / "rc_kernel.c", workdir),
-                     (FW / "main_rc.c", workdir),
-                     (FW / "startup.c", None)]:
+    for src, inc in [
+        (workdir / "rc_kernel.c", workdir),
+        (FW / "main_rc.c", workdir),
+        (FW / "startup.c", None),
+    ]:
         o = workdir / (src.stem + ".o")
         cmd = [CC, "-c", *CFLAGS, "-I", str(FW)]
         if inc:
@@ -122,22 +149,55 @@ def _build_and_run(qm, x_seq, sparse, workdir: pathlib.Path):
         subprocess.run(cmd, check=True, capture_output=True, text=True)
         objs.append(str(o))
     subprocess.run(
-        [CC, *ARCH, "-T", str(FW / "nrf51.ld"), "-nostartfiles",
-         "-Wl,--gc-sections", "--specs=nano.specs", "--specs=nosys.specs",
-         *objs, "-lc", "-lgcc", "-lnosys", "-o", str(elf)],
-        check=True, capture_output=True, text=True)
+        [
+            CC,
+            *ARCH,
+            "-T",
+            str(FW / "nrf51.ld"),
+            "-nostartfiles",
+            "-Wl,--gc-sections",
+            "--specs=nano.specs",
+            "--specs=nosys.specs",
+            *objs,
+            "-lc",
+            "-lgcc",
+            "-lnosys",
+            "-o",
+            str(elf),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
 
     # size: Berkeley format → text/data/bss columns
-    sz = subprocess.run([SIZE, str(elf)], check=True, capture_output=True,
-                        text=True).stdout.splitlines()[1].split()
+    sz = (
+        subprocess.run(
+            [SIZE, str(elf)], check=True, capture_output=True, text=True
+        )
+        .stdout.splitlines()[1]
+        .split()
+    )
     text, data, bss = int(sz[0]), int(sz[1]), int(sz[2])
     flash, ram = text + data, data + bss
 
     # run qemu -icount, parse instr_per_step + parity
     cp = subprocess.run(
-        [QEMU, "-M", "microbit", "-nographic", "-semihosting",
-         "-icount", "shift=0", "-kernel", str(elf)],
-        capture_output=True, text=True, timeout=120)
+        [
+            QEMU,
+            "-M",
+            "microbit",
+            "-nographic",
+            "-semihosting",
+            "-icount",
+            "shift=0",
+            "-kernel",
+            str(elf),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
     out = cp.stdout + cp.stderr
     m = re.search(r"instr_per_step:\s*(\d+)", out)
     instr = int(m.group(1)) if m else -1
@@ -172,9 +232,11 @@ def main():
         print("Need arm-none-eabi-gcc + qemu-system-arm on PATH. Aborting.")
         return
     print("Cortex-M0 (nRF51) firmware — dense vs CSR W_res, affine i8\n")
-    header = (f"{'N':>4} {'dens':>5} {'nnz':>6} {'variant':>7} "
-              f"{'Flash B':>8} {'RAM B':>6} {'Wres B':>7} "
-              f"{'instr/step':>11} {'speedup':>8} {'parity':>7}")
+    header = (
+        f"{'N':>4} {'dens':>5} {'nnz':>6} {'variant':>7} "
+        f"{'Flash B':>8} {'RAM B':>6} {'Wres B':>7} "
+        f"{'instr/step':>11} {'speedup':>8} {'parity':>7}"
+    )
     print(header)
     print("-" * len(header))
     for units, density in [(64, 0.1), (96, 0.1), (128, 0.1)]:
@@ -184,14 +246,13 @@ def main():
         N = rc.reservoir.units
         nnz = int(np.count_nonzero(exe.W_res))
         mse_f, mse_q = _accuracy(qm, exe, X, Y)
-        x_seq = X[900:900 + T_FW]
+        x_seq = X[900 : 900 + T_FW]
 
         rows = {}
         with tempfile.TemporaryDirectory() as td:
             td = pathlib.Path(td)
             for label, sp in [("dense", None), ("csr", "csr")]:
-                fl, ram, instr, par = _build_and_run(
-                    qm, x_seq, sp, td / label)
+                fl, ram, instr, par = _build_and_run(qm, x_seq, sp, td / label)
                 rows[label] = (fl, ram, instr, par)
 
         d_instr = rows["dense"][2]
@@ -200,16 +261,24 @@ def main():
             wb = _wres_bytes(qm, label == "csr")
             sp_ratio = (d_instr / instr) if instr > 0 else float("nan")
             sp_str = f"{sp_ratio:.2f}x" if label == "csr" else "-"
-            print(f"{N:>4} {density:>5.2f} {nnz:>6} {label:>7} "
-                  f"{fl:>8} {ram:>6} {wb:>7} {instr:>11} {sp_str:>8} "
-                  f"{'OK' if par else 'FAIL':>7}")
-        print(f"     accuracy: float MSE={mse_f:.3e}  quant(dense==csr) "
-              f"MSE={mse_q:.3e}  (CSR bit-exact → identical accuracy)")
+            print(
+                f"{N:>4} {density:>5.2f} {nnz:>6} {label:>7} "
+                f"{fl:>8} {ram:>6} {wb:>7} {instr:>11} {sp_str:>8} "
+                f"{'OK' if par else 'FAIL':>7}"
+            )
+        print(
+            f"     accuracy: float MSE={mse_f:.3e}  quant(dense==csr) "
+            f"MSE={mse_q:.3e}  (CSR bit-exact → identical accuracy)"
+        )
     print("\nFlash = text+data, RAM = data+bss (arm-none-eabi-size).")
-    print("Wres B = bytes for the W_res representation (dense N*N vs CSR "
-          "val+col+rowptr).")
-    print("instr/step = qemu -icount op-count proxy (not silicon cycles); "
-          "speedup = dense/csr.")
+    print(
+        "Wres B = bytes for the W_res representation (dense N*N vs CSR "
+        "val+col+rowptr)."
+    )
+    print(
+        "instr/step = qemu -icount op-count proxy (not silicon cycles); "
+        "speedup = dense/csr."
+    )
 
 
 if __name__ == "__main__":

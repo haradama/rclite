@@ -22,6 +22,7 @@ Supported (mirrors the LLVM affine path):
   * integer input preprocess (input_offset / input_scaling != 0/1)
   * include_bias / include_input readout blocks
 """
+
 from __future__ import annotations
 from typing import List
 
@@ -42,10 +43,14 @@ def _arr(name: str, ctype: str, values, rd_macro: str) -> str:
     return f"static const {ctype} {name}[] RC_PROGMEM = {{ {body} }};"
 
 
-def emit_affine_kernel_c(qmodel: AffineQuantizedModel,
-                          fn_name: str = "rc_predict",
-                          *, allow_i32_accum: bool = False,
-                          head: str = None, sparse=None) -> str:
+def emit_affine_kernel_c(
+    qmodel: AffineQuantizedModel,
+    fn_name: str = "rc_predict",
+    *,
+    allow_i32_accum: bool = False,
+    head: str = None,
+    sparse=None,
+) -> str:
     """Emit the affine kernel as portable C.
 
     `allow_i32_accum` enables i32 (instead of i64) matmul accumulators
@@ -78,7 +83,10 @@ def emit_affine_kernel_c(qmodel: AffineQuantizedModel,
     qmax = (1 << (sb - 1)) - 1
 
     is_structured = rc.reservoir.topology in (
-        Topology.DLR, Topology.DLRB, Topology.SCR)
+        Topology.DLR,
+        Topology.DLRB,
+        Topology.SCR,
+    )
     topo = rc.reservoir.topology.name
 
     # Sequence-to-label time pooling (aggregation in {MEAN, LAST}). The readout
@@ -100,12 +108,15 @@ def emit_affine_kernel_c(qmodel: AffineQuantizedModel,
     use_sparse = bool(sparse) and not is_structured
     if use_sparse:
         from rclite.ir.passes.sparsify import build_csr
+
         _wres_val, _wres_col, _wres_rowptr = build_csr(qmodel.W_res_q)
         col_t = "int16_t" if N <= 32767 else "int32_t"
         rd_col = "RC_RD16" if N <= 32767 else "RC_RD32"
 
     # Per-channel reservoir-step multiplier (per-row M0/n) for dense topologies.
-    use_per_channel_res = (qmodel.M_res_M0_arr is not None) and not is_structured
+    use_per_channel_res = (
+        qmodel.M_res_M0_arr is not None
+    ) and not is_structured
     # Per-channel readout multiplier (per output-row M0/n).
     use_per_channel_out = qmodel.M_out_state_M0_arr is not None
 
@@ -160,20 +171,74 @@ def emit_affine_kernel_c(qmodel: AffineQuantizedModel,
     a(_arr("rc_W_in", storage_t, qmodel.W_in_q, rd_s))
     a(_arr("rc_W_out", wout_t, qmodel.W_out_q, rd_w))
     a(_arr("rc_row_sum_W_in", "int32_t", qmodel.row_sum_W_in, "RC_RD32"))
-    a(_arr("rc_row_sum_Wout_state", "int32_t",
-            qmodel.row_sum_Wout_state, "RC_RD32"))
+    a(
+        _arr(
+            "rc_row_sum_Wout_state",
+            "int32_t",
+            qmodel.row_sum_Wout_state,
+            "RC_RD32",
+        )
+    )
     if rc.readout.include_input:
-        a(_arr("rc_row_sum_Wout_input", "int32_t",
-                qmodel.row_sum_Wout_input, "RC_RD32"))
+        a(
+            _arr(
+                "rc_row_sum_Wout_input",
+                "int32_t",
+                qmodel.row_sum_Wout_input,
+                "RC_RD32",
+            )
+        )
     if use_per_channel_out:
-        a(_arr("rc_M_out_state_M0", "int32_t", qmodel.M_out_state_M0_arr, "RC_RD32"))
-        a(_arr("rc_M_out_state_n", "int32_t", qmodel.M_out_state_n_arr, "RC_RD32"))
+        a(
+            _arr(
+                "rc_M_out_state_M0",
+                "int32_t",
+                qmodel.M_out_state_M0_arr,
+                "RC_RD32",
+            )
+        )
+        a(
+            _arr(
+                "rc_M_out_state_n",
+                "int32_t",
+                qmodel.M_out_state_n_arr,
+                "RC_RD32",
+            )
+        )
         if rc.readout.include_bias:
-            a(_arr("rc_M_out_bias_M0", "int32_t", qmodel.M_out_bias_M0_arr, "RC_RD32"))
-            a(_arr("rc_M_out_bias_n", "int32_t", qmodel.M_out_bias_n_arr, "RC_RD32"))
+            a(
+                _arr(
+                    "rc_M_out_bias_M0",
+                    "int32_t",
+                    qmodel.M_out_bias_M0_arr,
+                    "RC_RD32",
+                )
+            )
+            a(
+                _arr(
+                    "rc_M_out_bias_n",
+                    "int32_t",
+                    qmodel.M_out_bias_n_arr,
+                    "RC_RD32",
+                )
+            )
         if rc.readout.include_input:
-            a(_arr("rc_M_out_input_M0", "int32_t", qmodel.M_out_input_M0_arr, "RC_RD32"))
-            a(_arr("rc_M_out_input_n", "int32_t", qmodel.M_out_input_n_arr, "RC_RD32"))
+            a(
+                _arr(
+                    "rc_M_out_input_M0",
+                    "int32_t",
+                    qmodel.M_out_input_M0_arr,
+                    "RC_RD32",
+                )
+            )
+            a(
+                _arr(
+                    "rc_M_out_input_n",
+                    "int32_t",
+                    qmodel.M_out_input_n_arr,
+                    "RC_RD32",
+                )
+            )
     if not is_structured:
         if use_sparse:
             a(_arr("rc_W_res_val", storage_t, _wres_val, rd_s))
@@ -190,10 +255,13 @@ def emit_affine_kernel_c(qmodel: AffineQuantizedModel,
     if head == "proba":
         import numpy as _np
         from rclite.quant.softmax_lut import (
-            SoftmaxLUTSpec, build_params as _build_sm,
+            SoftmaxLUTSpec,
+            build_params as _build_sm,
         )
-        _sm = _build_sm(SoftmaxLUTSpec(), cfg.output.scale, sb,
-                        _np.dtype(f"int{sb}"))
+
+        _sm = _build_sm(
+            SoftmaxLUTSpec(), cfg.output.scale, sb, _np.dtype(f"int{sb}")
+        )
         a(_arr("rc_sm_lut", storage_t, _sm.lut_q, rd_s))
         a(f"#define RC_SM_N {_sm.n}")
         a(f"#define RC_SM_DMIN ({_sm.dmin_q})")
@@ -220,9 +288,13 @@ def emit_affine_kernel_c(qmodel: AffineQuantizedModel,
     #     register access on little-endian AVR/x86) and finish with a single
     #     32-bit shift, which gcc *does* inline. always_inline + the constant
     #     n at each call site fold the rounding add and the branch away.
-    a("typedef union { int64_t q; struct { uint32_t lo; int32_t hi; } w; } rc_i64u;")
-    a("static inline __attribute__((always_inline)) "
-      "int32_t rc_rq_(int32_t x, int32_t M0, uint8_t n){")
+    a(
+        "typedef union { int64_t q; struct { uint32_t lo; int32_t hi; } w; } rc_i64u;"
+    )
+    a(
+        "static inline __attribute__((always_inline)) "
+        "int32_t rc_rq_(int32_t x, int32_t M0, uint8_t n){"
+    )
     a("    rc_i64u u;")
     a("    u.q = (int64_t)x * (int64_t)M0 + ((int64_t)1 << (n - 1));")
     a("    if (n >= 32) return u.w.hi >> (n - 32);")
@@ -261,16 +333,22 @@ def emit_affine_kernel_c(qmodel: AffineQuantizedModel,
     elif strat.kind == LUTKind.POLYNOMIAL:
         qf = strat.poly_qf_bits
         a(f"    int32_t cx = pre - {cfg.pre.zero_point};")
-        a(f"    int64_t x = (int64_t)RC_RQ(cx, {art.x_to_qf_M0}, {art.x_to_qf_n});")
+        a(
+            f"    int64_t x = (int64_t)RC_RQ(cx, {art.x_to_qf_M0}, {art.x_to_qf_n});"
+        )
         a(f"    if (x < {-art.x_clip_qf}) x = {-art.x_clip_qf};")
         a(f"    if (x > {art.x_clip_qf}) x = {art.x_clip_qf};")
         a(f"    int64_t x2 = (x * x) >> {qf};")
-        a(f"    int64_t inner = ((x2 * {art.poly_a5_qf}) >> {qf}) + {art.poly_a3_qf};")
+        a(
+            f"    int64_t inner = ((x2 * {art.poly_a5_qf}) >> {qf}) + {art.poly_a3_qf};"
+        )
         a(f"    int64_t outer = ((x2 * inner) >> {qf}) + {art.poly_a1_qf};")
         a(f"    int64_t y = (x * outer) >> {qf};")
         a(f"    if (y < {-art.one_qf}) y = {-art.one_qf};")
         a(f"    if (y > {art.one_qf}) y = {art.one_qf};")
-        a(f"    int32_t d = RC_RQ((int32_t)y, {art.qf_to_state_M0}, {art.qf_to_state_n});")
+        a(
+            f"    int32_t d = RC_RQ((int32_t)y, {art.qf_to_state_M0}, {art.qf_to_state_n});"
+        )
         a(f"    return rc_sat(d + {cfg.state.zero_point});")
     a("}")
     a("")
@@ -301,7 +379,9 @@ def emit_affine_kernel_c(qmodel: AffineQuantizedModel,
     if mean_pool:
         # w_ = clamp(washout, 0, T-1); L_ = T - w_ (pooled step count, >= 1).
         a("    int32_t w_, L_;")
-        a(f"    w_ = ({washout_c} < T) ? {washout_c} : (T - 1); if (w_ < 0) w_ = 0;")
+        a(
+            f"    w_ = ({washout_c} < T) ? {washout_c} : (T - 1); if (w_ < 0) w_ = 0;"
+        )
     a(f"    for (i = 0; i < RC_N; i++) rc_h[i] = {zp_state};")
     if mean_pool:
         a("    for (i = 0; i < RC_N; i++) rc_hsum[i] = 0;")
@@ -311,7 +391,9 @@ def emit_affine_kernel_c(qmodel: AffineQuantizedModel,
     if qmodel.has_integer_preprocess:
         a("        for (k = 0; k < RC_K; k++) {")
         a(f"            int32_t cx = (int32_t)X[t*RC_K + k] - {zp_input};")
-        a(f"            int32_t up = RC_RQ(cx, {qmodel.pre_M0}, {qmodel.pre_n}) + {qmodel.pre_const};")
+        a(
+            f"            int32_t up = RC_RQ(cx, {qmodel.pre_M0}, {qmodel.pre_n}) + {qmodel.pre_const};"
+        )
         a("            rc_u[k] = rc_sat(up);")
         a("        }")
         u_expr = "rc_u[k]"
@@ -323,10 +405,11 @@ def emit_affine_kernel_c(qmodel: AffineQuantizedModel,
     # i64 only when an accumulator could overflow (i16 reservoirs). Values are
     # identical to the i64 path within the safe range, so parity is preserved.
     if allow_i32_accum:
-        res_bits, ro_bits = _accum_bits(qmodel, is_structured,
-                                         chain_weight_q, chain_feedback_q)
+        res_bits, ro_bits = _accum_bits(
+            qmodel, is_structured, chain_weight_q, chain_feedback_q
+        )
     else:
-        res_bits, ro_bits = 64, 64   # safe everywhere (avr-gcc 7.x)
+        res_bits, ro_bits = 64, 64  # safe everywhere (avr-gcc 7.x)
     res_t = "int32_t" if res_bits == 32 else "int64_t"
     ro_t = "int32_t" if ro_bits == 32 else "int64_t"
     res_cast = "(int32_t)" if res_bits == 32 else "(int64_t)"
@@ -339,34 +422,61 @@ def emit_affine_kernel_c(qmodel: AffineQuantizedModel,
     a("        for (i = 0; i < RC_N; i++) {")
     a("            int32_t acc_in = 0;")
     a("            for (k = 0; k < RC_K; k++)")
-    a(f"                acc_in += (int32_t){rd_s}(&rc_W_in[i*RC_K + k]) * (int32_t)({u_expr});")
+    a(
+        f"                acc_in += (int32_t){rd_s}(&rc_W_in[i*RC_K + k]) * (int32_t)({u_expr});"
+    )
     a(f"            acc_in -= {zp_upre} * RC_RD32(&rc_row_sum_W_in[i]);")
-    a(f"            int32_t rq_in = RC_RQ(acc_in, {qmodel.M_in_M0}, {qmodel.M_in_n});")
+    a(
+        f"            int32_t rq_in = RC_RQ(acc_in, {qmodel.M_in_M0}, {qmodel.M_in_n});"
+    )
     # W_res contribution
     if is_structured:
-        _emit_chain_c(a, topo, N, chain_weight_q, chain_feedback_q,
-                       zp_state, rd_s, res_t, res_cast)
+        _emit_chain_c(
+            a,
+            topo,
+            N,
+            chain_weight_q,
+            chain_feedback_q,
+            zp_state,
+            rd_s,
+            res_t,
+            res_cast,
+        )
     elif use_sparse:
         a(f"            {res_t} acc_res = 0;")
         a("            { int32_t rp = RC_RD32(&rc_W_res_rowptr[i]);")
         a("              int32_t rpe = RC_RD32(&rc_W_res_rowptr[i+1]);")
         a("              for (j = rp; j < rpe; j++)")
-        a(f"                acc_res += {res_cast}{rd_s}(&rc_W_res_val[j]) * "
-          f"{res_cast}rc_h[{rd_col}(&rc_W_res_col[j])]; }}")
-        a(f"            acc_res -= {res_cast}{zp_state} * {res_cast}RC_RD32(&rc_row_sum_W_res[i]);")
+        a(
+            f"                acc_res += {res_cast}{rd_s}(&rc_W_res_val[j]) * "
+            f"{res_cast}rc_h[{rd_col}(&rc_W_res_col[j])]; }}"
+        )
+        a(
+            f"            acc_res -= {res_cast}{zp_state} * {res_cast}RC_RD32(&rc_row_sum_W_res[i]);"
+        )
     else:
         a(f"            {res_t} acc_res = 0;")
         a("            for (j = 0; j < RC_N; j++)")
-        a(f"                acc_res += {res_cast}{rd_s}(&rc_W_res[i*RC_N + j]) * {res_cast}rc_h[j];")
-        a(f"            acc_res -= {res_cast}{zp_state} * {res_cast}RC_RD32(&rc_row_sum_W_res[i]);")
+        a(
+            f"                acc_res += {res_cast}{rd_s}(&rc_W_res[i*RC_N + j]) * {res_cast}rc_h[j];"
+        )
+        a(
+            f"            acc_res -= {res_cast}{zp_state} * {res_cast}RC_RD32(&rc_row_sum_W_res[i]);"
+        )
     if use_per_channel_res:
         # per-row (M0[i], n[i]) — reuse the same runtime requantize fn.
-        a(f"            int32_t rq_res = RC_RQ({_clamp('acc_res', res_bits)}, "
-          f"RC_RD32(&rc_M_res_M0[i]), RC_RD32(&rc_M_res_n[i]));")
+        a(
+            f"            int32_t rq_res = RC_RQ({_clamp('acc_res', res_bits)}, "
+            f"RC_RD32(&rc_M_res_M0[i]), RC_RD32(&rc_M_res_n[i]));"
+        )
     else:
-        a(f"            int32_t rq_res = RC_RQ({_clamp('acc_res', res_bits)}, "
-          f"{qmodel.M_res_M0}, {qmodel.M_res_n});")
-    a(f"            rc_pre[i] = rc_sat({zp_pre + qmodel.bias_pre} + rq_in + rq_res);")
+        a(
+            f"            int32_t rq_res = RC_RQ({_clamp('acc_res', res_bits)}, "
+            f"{qmodel.M_res_M0}, {qmodel.M_res_n});"
+        )
+    a(
+        f"            rc_pre[i] = rc_sat({zp_pre + qmodel.bias_pre} + rq_in + rq_res);"
+    )
     a("        }")
 
     # activation + leaky integration
@@ -374,7 +484,9 @@ def emit_affine_kernel_c(qmodel: AffineQuantizedModel,
     a("            int32_t act = rc_activate((int32_t)rc_pre[i]);")
     a(f"            int32_t hc = (int32_t)rc_h[i] - {zp_state};")
     a(f"            int32_t ac = act - {zp_state};")
-    a(f"            int32_t d = RC_RQ(ac - hc, {qmodel.leak_M0}, {qmodel.leak_n});")
+    a(
+        f"            int32_t d = RC_RQ(ac - hc, {qmodel.leak_M0}, {qmodel.leak_n});"
+    )
     a(f"            rc_h[i] = rc_sat({zp_state} + hc + d);")
     a("        }")
 
@@ -391,34 +503,52 @@ def emit_affine_kernel_c(qmodel: AffineQuantizedModel,
         a(f"{ind}for (m = 0; m < RC_M; m++) {{")
         a(f"{ind}    int32_t y = {zp_output};")
         if rc.readout.include_bias:
-            m_bias = ("RC_RD32(&rc_M_out_bias_M0[m]), RC_RD32(&rc_M_out_bias_n[m])"
-                      if use_per_channel_out
-                      else f"{qmodel.M_out_bias_M0}, {qmodel.M_out_bias_n}")
-            a(f"{ind}    y += RC_RQ((int32_t){rd_w}(&rc_W_out[m*RC_F + {off_bias}]), "
-              f"{m_bias});")
+            m_bias = (
+                "RC_RD32(&rc_M_out_bias_M0[m]), RC_RD32(&rc_M_out_bias_n[m])"
+                if use_per_channel_out
+                else f"{qmodel.M_out_bias_M0}, {qmodel.M_out_bias_n}"
+            )
+            a(
+                f"{ind}    y += RC_RQ((int32_t){rd_w}(&rc_W_out[m*RC_F + {off_bias}]), "
+                f"{m_bias});"
+            )
         if rc.readout.include_input:
             a(f"{ind}    {ro_t} acc_i = 0;")
             a(f"{ind}    for (k = 0; k < RC_K; k++)")
-            a(f"{ind}        acc_i += {ro_cast}{rd_w}(&rc_W_out[m*RC_F + {off_input} + k]) "
-              f"* {ro_cast}X[({row})*RC_K + k];")
-            a(f"{ind}    acc_i -= {ro_cast}{zp_input} * {ro_cast}RC_RD32(&rc_row_sum_Wout_input[m]);")
-            m_in = ("RC_RD32(&rc_M_out_input_M0[m]), RC_RD32(&rc_M_out_input_n[m])"
-                    if use_per_channel_out
-                    else f"{qmodel.M_out_input_M0}, {qmodel.M_out_input_n}")
+            a(
+                f"{ind}        acc_i += {ro_cast}{rd_w}(&rc_W_out[m*RC_F + {off_input} + k]) "
+                f"* {ro_cast}X[({row})*RC_K + k];"
+            )
+            a(
+                f"{ind}    acc_i -= {ro_cast}{zp_input} * {ro_cast}RC_RD32(&rc_row_sum_Wout_input[m]);"
+            )
+            m_in = (
+                "RC_RD32(&rc_M_out_input_M0[m]), RC_RD32(&rc_M_out_input_n[m])"
+                if use_per_channel_out
+                else f"{qmodel.M_out_input_M0}, {qmodel.M_out_input_n}"
+            )
             a(f"{ind}    y += RC_RQ({_clamp('acc_i', ro_bits)}, {m_in});")
         a(f"{ind}    {ro_t} acc_s = 0;")
         a(f"{ind}    for (j = 0; j < RC_N; j++)")
-        a(f"{ind}        acc_s += {ro_cast}{rd_w}(&rc_W_out[m*RC_F + {off_state} + j]) "
-          f"* {ro_cast}rc_h[j];")
-        a(f"{ind}    acc_s -= {ro_cast}{zp_state} * {ro_cast}RC_RD32(&rc_row_sum_Wout_state[m]);")
-        m_st = ("RC_RD32(&rc_M_out_state_M0[m]), RC_RD32(&rc_M_out_state_n[m])"
-                if use_per_channel_out
-                else f"{qmodel.M_out_state_M0}, {qmodel.M_out_state_n}")
+        a(
+            f"{ind}        acc_s += {ro_cast}{rd_w}(&rc_W_out[m*RC_F + {off_state} + j]) "
+            f"* {ro_cast}rc_h[j];"
+        )
+        a(
+            f"{ind}    acc_s -= {ro_cast}{zp_state} * {ro_cast}RC_RD32(&rc_row_sum_Wout_state[m]);"
+        )
+        m_st = (
+            "RC_RD32(&rc_M_out_state_M0[m]), RC_RD32(&rc_M_out_state_n[m])"
+            if use_per_channel_out
+            else f"{qmodel.M_out_state_M0}, {qmodel.M_out_state_n}"
+        )
         a(f"{ind}    y += RC_RQ({_clamp('acc_s', ro_bits)}, {m_st});")
         if classify:
             # argmax over the saturated quantized scores (monotone in logits).
             a(f"{ind}    int32_t yq = (int32_t)rc_sat(y);")
-            a(f"{ind}    if (m == 0 || yq > best_v) {{ best_v = yq; best_m = m; }}")
+            a(
+                f"{ind}    if (m == 0 || yq > best_v) {{ best_v = yq; best_m = m; }}"
+            )
         elif proba:
             a(f"{ind}    rc_lg[m] = rc_sat(y);")
         else:
@@ -428,21 +558,33 @@ def emit_affine_kernel_c(qmodel: AffineQuantizedModel,
             a(f"{ind}Y[{row}] = best_m;")
         elif proba:
             a(f"{ind}sm_max = rc_lg[0];")
-            a(f"{ind}for (m = 1; m < RC_M; m++) if (rc_lg[m] > sm_max) sm_max = rc_lg[m];")
+            a(
+                f"{ind}for (m = 1; m < RC_M; m++) if (rc_lg[m] > sm_max) sm_max = rc_lg[m];"
+            )
             a(f"{ind}sm_sum = 0;")
             a(f"{ind}for (m = 0; m < RC_M; m++) {{")
             a(f"{ind}    int32_t d = (int32_t)rc_lg[m] - sm_max;")
             a(f"{ind}    if (d < RC_SM_DMIN) d = RC_SM_DMIN;")
-            a(f"{ind}    int64_t pos = ((int64_t)(d - (RC_SM_DMIN)) * (RC_SM_N - 1) << RC_SM_IDXF) / (-(RC_SM_DMIN));")
+            a(
+                f"{ind}    int64_t pos = ((int64_t)(d - (RC_SM_DMIN)) * (RC_SM_N - 1) << RC_SM_IDXF) / (-(RC_SM_DMIN));"
+            )
             a(f"{ind}    int32_t i0 = (int32_t)(pos >> RC_SM_IDXF);")
-            a(f"{ind}    if (i0 < 0) i0 = 0; if (i0 > RC_SM_N - 2) i0 = RC_SM_N - 2;")
+            a(
+                f"{ind}    if (i0 < 0) i0 = 0; if (i0 > RC_SM_N - 2) i0 = RC_SM_N - 2;"
+            )
             a(f"{ind}    int64_t frac = pos - ((int64_t)i0 << RC_SM_IDXF);")
-            a(f"{ind}    int32_t y0 = {rd_s}(&rc_sm_lut[i0]); int32_t y1 = {rd_s}(&rc_sm_lut[i0 + 1]);")
-            a(f"{ind}    int64_t ev = (int64_t)y0 + (((int64_t)(y1 - y0) * frac) >> RC_SM_IDXF);")
+            a(
+                f"{ind}    int32_t y0 = {rd_s}(&rc_sm_lut[i0]); int32_t y1 = {rd_s}(&rc_sm_lut[i0 + 1]);"
+            )
+            a(
+                f"{ind}    int64_t ev = (int64_t)y0 + (((int64_t)(y1 - y0) * frac) >> RC_SM_IDXF);"
+            )
             a(f"{ind}    rc_eq[m] = (int32_t)ev; sm_sum += ev;")
             a(f"{ind}}}")
             a(f"{ind}for (m = 0; m < RC_M; m++) {{")
-            a(f"{ind}    int64_t p = ((int64_t)rc_eq[m] << RC_SM_PF) / sm_sum;")
+            a(
+                f"{ind}    int64_t p = ((int64_t)rc_eq[m] << RC_SM_PF) / sm_sum;"
+            )
             a(f"{ind}    if (p > RC_QMAX) p = RC_QMAX;")
             a(f"{ind}    Y[({row})*RC_M + m] = (rc_storage_t)p;")
             a(f"{ind}}}")
@@ -451,7 +593,9 @@ def emit_affine_kernel_c(qmodel: AffineQuantizedModel,
         _emit_readout("t", "        ")
     elif mean_pool:
         # Accumulate post-washout states; readout runs once after the loop.
-        a("        if (t >= w_) { for (j = 0; j < RC_N; j++) rc_hsum[j] += rc_h[j]; }")
+        a(
+            "        if (t >= w_) { for (j = 0; j < RC_N; j++) rc_hsum[j] += rc_h[j]; }"
+        )
     # LAST: nothing inside the loop (the final state is the pool).
     a("    }")
     if pooled:
@@ -463,7 +607,9 @@ def emit_affine_kernel_c(qmodel: AffineQuantizedModel,
             a(f"        {sum_t} s = rc_hsum[j];")
             a("        int64_t half = (int64_t)L_ >> 1;")
             a("        int64_t q = (s >= 0) ? (((int64_t)s + half) / L_)")
-            a("                             : (-(((int64_t)(-s) + half) / L_));")
+            a(
+                "                             : (-(((int64_t)(-s) + half) / L_));"
+            )
             a("        rc_h[j] = rc_sat((int32_t)q);")
             a("    }")
         _emit_readout("0", "    ")
@@ -481,8 +627,8 @@ def _accum_bits(qmodel, is_structured, chain_weight_q, chain_feedback_q):
     rc = qmodel.rc
     sb = qmodel.storage_bits
     zp_state = abs(cfg.state.zero_point)
-    MARGIN = 1 << 30                 # leave a bit of headroom under 2^31
-    hmag = 1 << sb                   # bound on |h_q - zp_state|
+    MARGIN = 1 << 30  # leave a bit of headroom under 2^31
+    hmag = 1 << sb  # bound on |h_q - zp_state|
 
     # --- reservoir ---
     if sb != 8:
@@ -492,7 +638,9 @@ def _accum_bits(qmodel, is_structured, chain_weight_q, chain_feedback_q):
         res_max = (abs(chain_weight_q) + abs(chain_feedback_q)) * hmag
         res_bits = 32 if res_max < MARGIN else 64
     else:
-        row_abs = int(np.abs(qmodel.W_res_q.astype(np.int64)).sum(axis=1).max())
+        row_abs = int(
+            np.abs(qmodel.W_res_q.astype(np.int64)).sum(axis=1).max()
+        )
         rs_abs = int(np.abs(qmodel.row_sum_W_res).max())
         res_max = row_abs * hmag + zp_state * rs_abs
         res_bits = 32 if res_max < MARGIN else 64
@@ -505,7 +653,7 @@ def _accum_bits(qmodel, is_structured, chain_weight_q, chain_feedback_q):
         off = 1 if rc.readout.include_bias else 0
         if rc.readout.include_input:
             off += K
-        Wstate = qmodel.W_out_q[:, off:off + N].astype(np.int64)
+        Wstate = qmodel.W_out_q[:, off : off + N].astype(np.int64)
         row_abs = int(np.abs(Wstate).sum(axis=1).max())
         rs_abs = int(np.abs(qmodel.row_sum_Wout_state).max())
         ro_max = row_abs * hmag + zp_state * rs_abs
@@ -518,14 +666,22 @@ def _emit_chain_c(a, topo, N, cw_q, cf_q, zp_state, rd_s, res_t, cast):
     a(f"            {res_t} acc_res = 0;")
     if topo == "SCR":
         a(f"            {{ int32_t ip = (i == 0) ? {N - 1} : (i - 1);")
-        a(f"              acc_res = {cast}{cw_q} * {cast}((int32_t)rc_h[ip] - {zp_state}); }}")
+        a(
+            f"              acc_res = {cast}{cw_q} * {cast}((int32_t)rc_h[ip] - {zp_state}); }}"
+        )
     elif topo == "DLR":
         a("            if (i > 0)")
-        a(f"                acc_res = {cast}{cw_q} * {cast}((int32_t)rc_h[i-1] - {zp_state});")
+        a(
+            f"                acc_res = {cast}{cw_q} * {cast}((int32_t)rc_h[i-1] - {zp_state});"
+        )
     elif topo == "DLRB":
         a("            if (i > 0)")
-        a(f"                acc_res += {cast}{cw_q} * {cast}((int32_t)rc_h[i-1] - {zp_state});")
+        a(
+            f"                acc_res += {cast}{cw_q} * {cast}((int32_t)rc_h[i-1] - {zp_state});"
+        )
         a("            if (i < RC_N - 1)")
-        a(f"                acc_res += {cast}{cf_q} * {cast}((int32_t)rc_h[i+1] - {zp_state});")
+        a(
+            f"                acc_res += {cast}{cf_q} * {cast}((int32_t)rc_h[i+1] - {zp_state});"
+        )
     else:
         raise ValueError(f"_emit_chain_c: unexpected topology {topo}")

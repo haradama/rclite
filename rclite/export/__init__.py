@@ -15,6 +15,7 @@ Both quantization families are supported: the asymmetric *affine* path
 (`QuantizedModel`). The emitted C is bit-exact with the respective Python
 reference executor / LLVM JIT.
 """
+
 from __future__ import annotations
 
 from .info import KernelInfo, info_from_affine, info_from_symmetric

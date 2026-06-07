@@ -9,6 +9,7 @@ argmax is monotone in the readout scores, so quantization introduces no
 class errors except at exact ties; the invariant we assert is that the
 classify kernel agrees with argmax over the *same path's* logits kernel.
 """
+
 from __future__ import annotations
 import sys
 import pathlib
@@ -22,13 +23,23 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import numpy as np
 
 from rclite import (
-    InputNode, ReservoirNode, ReadoutNode, ReservoirComputer,
-    Activation, Topology, Trainer, Task,
+    InputNode,
+    ReservoirNode,
+    ReadoutNode,
+    ReservoirComputer,
+    Activation,
+    Topology,
+    Trainer,
+    Task,
 )
 from rclite.runtime import RCExecutor
 from rclite.quant import (
-    QuantConfig, TanhLUTSpec, I16FixedPoint, I32FixedPoint,
-    quantize_model, QuantizedExecutor,
+    QuantConfig,
+    TanhLUTSpec,
+    I16FixedPoint,
+    I32FixedPoint,
+    quantize_model,
+    QuantizedExecutor,
 )
 from rclite.quant import calibrate_from_data, quantize_model_affine
 from rclite.quant.softmax_lut import SoftmaxLUTSpec, build_params, softmax_q
@@ -69,14 +80,23 @@ def _train_classifier(units=50, washout=80, n_classes=3):
     rc = ReservoirComputer(
         input=InputNode(units=1, activation=Activation.IDENTITY, name="in"),
         reservoir=ReservoirNode(
-            units=units, activation=Activation.TANH, spectral_radius=0.9,
-            leak_rate=0.3, density=0.2, topology=Topology.RANDOM, seed=3,
+            units=units,
+            activation=Activation.TANH,
+            spectral_radius=0.9,
+            leak_rate=0.3,
+            density=0.2,
+            topology=Topology.RANDOM,
+            seed=3,
             name="r",
         ),
         readout=ReadoutNode(
-            units=n_classes, activation=Activation.IDENTITY,
-            trainer=Trainer.RIDGE, regularization=1e-3, washout=washout,
-            task=Task.CLASSIFICATION, name="ro",
+            units=n_classes,
+            activation=Activation.IDENTITY,
+            trainer=Trainer.RIDGE,
+            regularization=1e-3,
+            washout=washout,
+            task=Task.CLASSIFICATION,
+            name="ro",
         ),
     )
     exe = RCExecutor(rc)
@@ -89,25 +109,39 @@ def _run_c_classify(kernel_src, ctype, qx_flat, T, K):
         td = pathlib.Path(td)
         (td / "kernel.c").write_text(kernel_src)
         body = ", ".join(str(int(v)) for v in qx_flat)
-        (td / "main.c").write_text("\n".join([
-            "#include <stdint.h>", "#include <stdio.h>",
-            f'extern void rc_predict(int32_t, const {ctype}*, int32_t*);',
-            "int main(void){",
-            f"  {ctype} X[{T * K}] = {{ {body} }};",
-            f"  int32_t Y[{T}];",
-            f"  rc_predict({T}, X, Y);",
-            f"  for (int i=0;i<{T};i++) printf(\"%d\\n\",(int)Y[i]);",
-            "  return 0; }",
-        ]))
+        (td / "main.c").write_text(
+            "\n".join(
+                [
+                    "#include <stdint.h>",
+                    "#include <stdio.h>",
+                    f"extern void rc_predict(int32_t, const {ctype}*, int32_t*);",
+                    "int main(void){",
+                    f"  {ctype} X[{T * K}] = {{ {body} }};",
+                    f"  int32_t Y[{T}];",
+                    f"  rc_predict({T}, X, Y);",
+                    f'  for (int i=0;i<{T};i++) printf("%d\\n",(int)Y[i]);',
+                    "  return 0; }",
+                ]
+            )
+        )
         r = subprocess.run(
-            ["gcc", "-O2", "-std=c99", "-o", str(td / "a.out"),
-             str(td / "main.c"), str(td / "kernel.c")],
-            capture_output=True, text=True,
+            [
+                "gcc",
+                "-O2",
+                "-std=c99",
+                "-o",
+                str(td / "a.out"),
+                str(td / "main.c"),
+                str(td / "kernel.c"),
+            ],
+            capture_output=True,
+            text=True,
         )
         if r.returncode != 0:
             raise RuntimeError("gcc failed:\n" + r.stderr)
-        out = subprocess.run([str(td / "a.out")], capture_output=True,
-                             text=True).stdout
+        out = subprocess.run(
+            [str(td / "a.out")], capture_output=True, text=True
+        ).stdout
     return np.array([int(v) for v in out.strip().split("\n")], dtype=np.int32)
 
 
@@ -138,9 +172,18 @@ def test_symmetric_classify_c_matches_jit():
     qm = _sym_quantize(rc, exe, target)
     jit = CompiledQuantizedRC(qm, head="classify").predict(Xte)
     sb = qm.target.storage_bits
-    qx = qm.target.quantize_input_array(Xte, qm.config).astype(_NPTYPE[sb]).reshape(-1)
-    cc = _run_c_classify(emit_symmetric_kernel_c(qm, head="classify"),
-                         _CTYPE[sb], qx, Xte.shape[0], qm.K)
+    qx = (
+        qm.target.quantize_input_array(Xte, qm.config)
+        .astype(_NPTYPE[sb])
+        .reshape(-1)
+    )
+    cc = _run_c_classify(
+        emit_symmetric_kernel_c(qm, head="classify"),
+        _CTYPE[sb],
+        qx,
+        Xte.shape[0],
+        qm.K,
+    )
     assert np.array_equal(cc, jit)
 
 
@@ -170,8 +213,13 @@ def test_affine_classify_c_matches_jit():
     qm = _affine_quantize(rc, exe, _calib_X(), 16)
     jit = CompiledAffineRC(qm, head="classify").predict(Xte)
     qx = qm.config.input.quantize_array(Xte).astype(np.int16).reshape(-1)
-    cc = _run_c_classify(emit_affine_kernel_c(qm, head="classify"),
-                         "int16_t", qx, Xte.shape[0], qm.K)
+    cc = _run_c_classify(
+        emit_affine_kernel_c(qm, head="classify"),
+        "int16_t",
+        qx,
+        Xte.shape[0],
+        qm.K,
+    )
     assert np.array_equal(cc, jit)
 
 
@@ -180,27 +228,42 @@ def _run_c_proba(kernel_src, ctype, qx_flat, T, K, M):
         td = pathlib.Path(td)
         (td / "kernel.c").write_text(kernel_src)
         body = ", ".join(str(int(v)) for v in qx_flat)
-        (td / "main.c").write_text("\n".join([
-            "#include <stdint.h>", "#include <stdio.h>",
-            f'extern void rc_predict(int32_t, const {ctype}*, {ctype}*);',
-            "int main(void){",
-            f"  {ctype} X[{T * K}] = {{ {body} }};",
-            f"  {ctype} Y[{T * M}];",
-            f"  rc_predict({T}, X, Y);",
-            f"  for (int i=0;i<{T * M};i++) printf(\"%d\\n\",(int)Y[i]);",
-            "  return 0; }",
-        ]))
+        (td / "main.c").write_text(
+            "\n".join(
+                [
+                    "#include <stdint.h>",
+                    "#include <stdio.h>",
+                    f"extern void rc_predict(int32_t, const {ctype}*, {ctype}*);",
+                    "int main(void){",
+                    f"  {ctype} X[{T * K}] = {{ {body} }};",
+                    f"  {ctype} Y[{T * M}];",
+                    f"  rc_predict({T}, X, Y);",
+                    f'  for (int i=0;i<{T * M};i++) printf("%d\\n",(int)Y[i]);',
+                    "  return 0; }",
+                ]
+            )
+        )
         r = subprocess.run(
-            ["gcc", "-O2", "-std=c99", "-o", str(td / "a.out"),
-             str(td / "main.c"), str(td / "kernel.c")],
-            capture_output=True, text=True,
+            [
+                "gcc",
+                "-O2",
+                "-std=c99",
+                "-o",
+                str(td / "a.out"),
+                str(td / "main.c"),
+                str(td / "kernel.c"),
+            ],
+            capture_output=True,
+            text=True,
         )
         if r.returncode != 0:
             raise RuntimeError("gcc failed:\n" + r.stderr)
-        out = subprocess.run([str(td / "a.out")], capture_output=True,
-                             text=True).stdout
-    return np.array([int(v) for v in out.strip().split("\n")],
-                    dtype=np.int64).reshape(T, M)
+        out = subprocess.run(
+            [str(td / "a.out")], capture_output=True, text=True
+        ).stdout
+    return np.array(
+        [int(v) for v in out.strip().split("\n")], dtype=np.int64
+    ).reshape(T, M)
 
 
 def test_symmetric_proba_matches_reference():
@@ -214,8 +277,12 @@ def test_symmetric_proba_matches_reference():
     # reference softmax_q over reconstructed quantized logits
     qexe = QuantizedExecutor(qm)
     q_logits = np.round(qexe.predict(Xte) * cfg.state_scale).astype(np.int64)
-    sm = build_params(SoftmaxLUTSpec(), 1.0 / cfg.state_scale,
-                      target.storage_bits, target.storage_dtype)
+    sm = build_params(
+        SoftmaxLUTSpec(),
+        1.0 / cfg.state_scale,
+        target.storage_bits,
+        target.storage_dtype,
+    )
     ref = np.stack([softmax_q(q_logits[t], sm) for t in range(len(Xte))])
     ref = ref.astype(np.float64) / (1 << pf)
     assert np.allclose(proba, ref, atol=1e-12)
@@ -231,12 +298,22 @@ def test_symmetric_proba_c_matches_jit():
     cfg = QuantConfig(state_frac=10, input_frac=12, weight_frac=10)
     qm = quantize_model(rc, exe, cfg, lut=TanhLUTSpec(n=256), target=target)
     pf = min(target.storage_bits - 1, 15)
-    jit_q = (CompiledQuantizedRC(qm, head="proba").predict(Xte) * (1 << pf))
+    jit_q = CompiledQuantizedRC(qm, head="proba").predict(Xte) * (1 << pf)
     jit_q = jit_q.round().astype(np.int64)
     sb = target.storage_bits
-    qx = qm.target.quantize_input_array(Xte, qm.config).astype(_NPTYPE[sb]).reshape(-1)
-    cc = _run_c_proba(emit_symmetric_kernel_c(qm, head="proba"),
-                      _CTYPE[sb], qx, Xte.shape[0], qm.K, qm.M)
+    qx = (
+        qm.target.quantize_input_array(Xte, qm.config)
+        .astype(_NPTYPE[sb])
+        .reshape(-1)
+    )
+    cc = _run_c_proba(
+        emit_symmetric_kernel_c(qm, head="proba"),
+        _CTYPE[sb],
+        qx,
+        Xte.shape[0],
+        qm.K,
+        qm.M,
+    )
     assert np.array_equal(cc, jit_q)
 
 
@@ -260,11 +337,17 @@ def test_affine_proba_c_matches_jit():
     rc, exe, Xte = _train_classifier()
     qm = _affine_quantize(rc, exe, _calib_X(), sb)
     pf = min(sb - 1, 15)
-    jit_q = (CompiledAffineRC(qm, head="proba").predict(Xte) * (1 << pf))
+    jit_q = CompiledAffineRC(qm, head="proba").predict(Xte) * (1 << pf)
     jit_q = jit_q.round().astype(np.int64)
     qx = qm.config.input.quantize_array(Xte).astype(_NPTYPE[sb]).reshape(-1)
-    cc = _run_c_proba(emit_affine_kernel_c(qm, head="proba"),
-                      _CTYPE[sb], qx, Xte.shape[0], qm.K, qm.M)
+    cc = _run_c_proba(
+        emit_affine_kernel_c(qm, head="proba"),
+        _CTYPE[sb],
+        qx,
+        Xte.shape[0],
+        qm.K,
+        qm.M,
+    )
     assert np.array_equal(cc, jit_q)
 
 
@@ -284,7 +367,7 @@ def _calib_X():
 
 def _bundle_run(qm, Xte, head, out_ctype, n_out):
     """export_bundle(head=...) → compile main.c + rc_kernel.c → run, return Y."""
-    sb = (qm.target.storage_bits if hasattr(qm, "target") else qm.storage_bits)
+    sb = qm.target.storage_bits if hasattr(qm, "target") else qm.storage_bits
     if hasattr(qm, "target"):
         qx = qm.target.quantize_input_array(Xte, qm.config)
     else:
@@ -293,25 +376,44 @@ def _bundle_run(qm, Xte, head, out_ctype, n_out):
     T, K = Xte.shape[0], qm.K
     body = ", ".join(str(int(v)) for v in qx)
     with tempfile.TemporaryDirectory() as td:
-        out = export_bundle(qm, pathlib.Path(td) / "b", name="rc_clf", head=head)
-        (out / "main.c").write_text("\n".join([
-            "#include <stdint.h>", "#include <stdio.h>", '#include "rc_model.h"',
-            "int main(void){",
-            f"  rc_storage_t X[{T * K}] = {{ {body} }};",
-            f"  {out_ctype} Y[{n_out}];",
-            f"  rc_predict({T}, X, Y);",
-            f"  for (int i=0;i<{n_out};i++) printf(\"%d\\n\",(int)Y[i]);",
-            "  return 0; }",
-        ]))
+        out = export_bundle(
+            qm, pathlib.Path(td) / "b", name="rc_clf", head=head
+        )
+        (out / "main.c").write_text(
+            "\n".join(
+                [
+                    "#include <stdint.h>",
+                    "#include <stdio.h>",
+                    '#include "rc_model.h"',
+                    "int main(void){",
+                    f"  rc_storage_t X[{T * K}] = {{ {body} }};",
+                    f"  {out_ctype} Y[{n_out}];",
+                    f"  rc_predict({T}, X, Y);",
+                    f'  for (int i=0;i<{n_out};i++) printf("%d\\n",(int)Y[i]);',
+                    "  return 0; }",
+                ]
+            )
+        )
         r = subprocess.run(
-            ["gcc", "-O2", "-std=c99", "-I", str(out), "-o", str(out / "a.out"),
-             str(out / "main.c"), str(out / "rc_kernel.c")],
-            capture_output=True, text=True,
+            [
+                "gcc",
+                "-O2",
+                "-std=c99",
+                "-I",
+                str(out),
+                "-o",
+                str(out / "a.out"),
+                str(out / "main.c"),
+                str(out / "rc_kernel.c"),
+            ],
+            capture_output=True,
+            text=True,
         )
         if r.returncode != 0:
             raise RuntimeError("gcc failed:\n" + r.stderr)
-        o = subprocess.run([str(out / "a.out")], capture_output=True,
-                           text=True).stdout
+        o = subprocess.run(
+            [str(out / "a.out")], capture_output=True, text=True
+        ).stdout
     return np.array([int(v) for v in o.strip().split("\n")], dtype=np.int64)
 
 
@@ -332,8 +434,9 @@ def test_bundle_affine_proba():
     qm = _affine_quantize(rc, exe, _calib_X(), 16)
     pf = min(16 - 1, 15)
     cc = _bundle_run(qm, Xte, "proba", "int16_t", Xte.shape[0] * qm.M).reshape(
-        Xte.shape[0], qm.M)
-    jit_q = (CompiledAffineRC(qm, head="proba").predict(Xte) * (1 << pf))
+        Xte.shape[0], qm.M
+    )
+    jit_q = CompiledAffineRC(qm, head="proba").predict(Xte) * (1 << pf)
     jit_q = jit_q.round().astype(np.int64)
     assert np.array_equal(cc, jit_q)
 
@@ -342,8 +445,9 @@ def test_bundle_header_declares_classification():
     rc, exe, Xte = _train_classifier()
     qm = _sym_quantize(rc, exe, I16FixedPoint())
     with tempfile.TemporaryDirectory() as td:
-        out = export_bundle(qm, pathlib.Path(td) / "b", name="rc_clf",
-                            head="classify")
+        out = export_bundle(
+            qm, pathlib.Path(td) / "b", name="rc_clf", head="classify"
+        )
         header = (out / "rc_model.h").read_text()
         assert "RC_NUM_CLASSES 3" in header
         assert "int32_t *Y" in header
@@ -360,27 +464,40 @@ def test_cargo_classify_roundtrip():
     Xs = Xte[:8]
     jit = CompiledQuantizedRC(qm, head="classify").predict(Xs)
     sb = qm.target.storage_bits
-    qx = qm.target.quantize_input_array(Xs, qm.config).astype(_NPTYPE[sb]).reshape(-1)
+    qx = (
+        qm.target.quantize_input_array(Xs, qm.config)
+        .astype(_NPTYPE[sb])
+        .reshape(-1)
+    )
     arr = ", ".join(str(int(v)) for v in qx)
     expect = ", ".join(str(int(v)) for v in jit)
     with tempfile.TemporaryDirectory() as td:
-        out = export_bundle(qm, pathlib.Path(td) / "b", name="rc_clf",
-                            head="classify")
+        out = export_bundle(
+            qm, pathlib.Path(td) / "b", name="rc_clf", head="classify"
+        )
         (out / "tests").mkdir(exist_ok=True)
-        (out / "tests" / "clf.rs").write_text("\n".join([
-            "use rc_clf::*;",
-            "#[test]",
-            "fn classify_matches_jit() {",
-            f"    let xq: [Storage; {len(qx)}] = [{arr}];",
-            f"    let expect: [u32; {len(jit)}] = [{expect}];",
-            "    let mut y = vec![0i32; expect.len()];",
-            "    classify_into(&xq, &mut y);",
-            "    let got: Vec<u32> = y.iter().map(|&c| c as u32).collect();",
-            "    assert_eq!(got, expect);",
-            "}",
-        ]))
-        r = subprocess.run(["cargo", "test", "--quiet"], cwd=str(out),
-                           capture_output=True, text=True)
+        (out / "tests" / "clf.rs").write_text(
+            "\n".join(
+                [
+                    "use rc_clf::*;",
+                    "#[test]",
+                    "fn classify_matches_jit() {",
+                    f"    let xq: [Storage; {len(qx)}] = [{arr}];",
+                    f"    let expect: [u32; {len(jit)}] = [{expect}];",
+                    "    let mut y = vec![0i32; expect.len()];",
+                    "    classify_into(&xq, &mut y);",
+                    "    let got: Vec<u32> = y.iter().map(|&c| c as u32).collect();",
+                    "    assert_eq!(got, expect);",
+                    "}",
+                ]
+            )
+        )
+        r = subprocess.run(
+            ["cargo", "test", "--quiet"],
+            cwd=str(out),
+            capture_output=True,
+            text=True,
+        )
         if r.returncode != 0:
             raise RuntimeError("cargo test failed:\n" + r.stdout + r.stderr)
 
@@ -392,27 +509,43 @@ def test_cargo_classify_roundtrip():
 def test_quantized_sequence_aggregation_rejected():
     from rclite import Aggregation
     from rclite.quant import build_ir_from_quantized
+
     rng = np.random.default_rng(1)
     X = rng.standard_normal((200, 1)) * 0.2
     y = (X[:, 0] > 0).astype(int)
     rc = ReservoirComputer(
         input=InputNode(units=1, activation=Activation.IDENTITY, name="in"),
-        reservoir=ReservoirNode(units=30, activation=Activation.TANH,
-                                 leak_rate=0.3, seed=1, name="r"),
-        readout=ReadoutNode(units=2, activation=Activation.IDENTITY,
-                             trainer=Trainer.RIDGE, washout=10,
-                             task=Task.CLASSIFICATION,
-                             aggregation=Aggregation.MEAN, name="ro"),
+        reservoir=ReservoirNode(
+            units=30,
+            activation=Activation.TANH,
+            leak_rate=0.3,
+            seed=1,
+            name="r",
+        ),
+        readout=ReadoutNode(
+            units=2,
+            activation=Activation.IDENTITY,
+            trainer=Trainer.RIDGE,
+            washout=10,
+            task=Task.CLASSIFICATION,
+            aggregation=Aggregation.MEAN,
+            name="ro",
+        ),
     )
     exe = RCExecutor(rc)
     exe.fit_sequences([X[:100], X[100:]], np.array([0, 1]))
     cfg = QuantConfig(state_frac=14, input_frac=12, weight_frac=10)
     qm = quantize_model(rc, exe, cfg, lut=TanhLUTSpec(n=128))
-    expect_raises(NotImplementedError, build_ir_from_quantized, qm, head="classify")
+    expect_raises(
+        NotImplementedError, build_ir_from_quantized, qm, head="classify"
+    )
 
 
-TESTS = [v for k, v in list(globals().items())
-         if k.startswith("test_") and callable(v)]
+TESTS = [
+    v
+    for k, v in list(globals().items())
+    if k.startswith("test_") and callable(v)
+]
 
 
 def main() -> int:

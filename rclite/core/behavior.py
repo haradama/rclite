@@ -1,8 +1,8 @@
 """SysML v2: package RC::Behavior"""
+
 from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional
 
 from .composite import ReservoirComputer
 from .types import TimeSeries
@@ -17,6 +17,7 @@ class Mode(Enum):
 @dataclass
 class Train:
     """SysML2: action def Train { in X, in Y, in rc, out W }"""
+
     X: TimeSeries
     Y: TimeSeries
     rc: ReservoirComputer
@@ -25,6 +26,7 @@ class Train:
 @dataclass
 class Infer:
     """SysML2: action def Infer { in X, in rc, out Yhat }"""
+
     X: TimeSeries
     rc: ReservoirComputer
 
@@ -39,6 +41,7 @@ class RCMode:
         training  --"done"-->    idle
         inferring --"done"-->    idle
     """
+
     state: Mode = Mode.IDLE
 
     def fit(self) -> None:

@@ -20,6 +20,7 @@ Probabilities are emitted at `Q.prob_frac` in the storage type, where
 exact integer algorithm in `softmax_q` is mirrored bit-for-bit by the LLVM
 lowering and the generated C, and `build_params` precomputes the LUT.
 """
+
 from __future__ import annotations
 from dataclasses import dataclass
 
@@ -38,12 +39,15 @@ class SoftmaxLUTSpec:
     `exp(d_min)` underflows to ~0, so anything below clamps to entry 0.
     `n` is the number of (linearly interpolated) table entries.
     """
+
     d_min: float = -16.0
     n: int = 256
 
     def __post_init__(self):
         if self.d_min >= 0:
-            raise ValueError(f"SoftmaxLUTSpec.d_min must be < 0, got {self.d_min}")
+            raise ValueError(
+                f"SoftmaxLUTSpec.d_min must be < 0, got {self.d_min}"
+            )
         if self.n < 2:
             raise ValueError(f"SoftmaxLUTSpec.n must be >= 2, got {self.n}")
 
@@ -51,11 +55,12 @@ class SoftmaxLUTSpec:
 @dataclass(frozen=True)
 class SoftmaxParams:
     """Precomputed integer parameters for one model's softmax head."""
+
     lut_q: np.ndarray  # (n,) storage dtype, exp samples at Q.prob_frac
-    dmin_q: int        # d_min in quantized-score-difference units (< 0)
+    dmin_q: int  # d_min in quantized-score-difference units (< 0)
     n: int
     idx_frac: int
-    prob_frac: int     # == out_frac; probabilities live at Q.prob_frac
+    prob_frac: int  # == out_frac; probabilities live at Q.prob_frac
     storage_bits: int
 
 
@@ -63,8 +68,9 @@ def _prob_frac(storage_bits: int) -> int:
     return min(storage_bits - 1, 15)
 
 
-def build_params(spec: SoftmaxLUTSpec, s_diff: float, storage_bits: int,
-                 storage_dtype) -> SoftmaxParams:
+def build_params(
+    spec: SoftmaxLUTSpec, s_diff: float, storage_bits: int, storage_dtype
+) -> SoftmaxParams:
     """Build the integer softmax parameters for the given score scale.
 
     `s_diff` is the float value of one quantized-score-difference unit (see
@@ -82,8 +88,12 @@ def build_params(spec: SoftmaxLUTSpec, s_diff: float, storage_bits: int,
     table = np.round(np.exp(ds) * (1 << prob_frac)).astype(np.int64)
     table = np.clip(table, 0, qmax).astype(storage_dtype)
     return SoftmaxParams(
-        lut_q=table, dmin_q=dmin_q, n=spec.n,
-        idx_frac=SM_IDX_FRAC, prob_frac=prob_frac, storage_bits=storage_bits,
+        lut_q=table,
+        dmin_q=dmin_q,
+        n=spec.n,
+        idx_frac=SM_IDX_FRAC,
+        prob_frac=prob_frac,
+        storage_bits=storage_bits,
     )
 
 
@@ -108,7 +118,7 @@ def softmax_q(logits_q: np.ndarray, params: SoftmaxParams) -> np.ndarray:
         d = int(z[m]) - max_q
         if d < dmin_q:
             d = dmin_q
-        num = d - dmin_q                       # in [0, -dmin_q]
+        num = d - dmin_q  # in [0, -dmin_q]
         pos = (num * (n - 1) << idx_frac) // (-dmin_q)
         i0 = pos >> idx_frac
         if i0 < 0:
@@ -116,7 +126,8 @@ def softmax_q(logits_q: np.ndarray, params: SoftmaxParams) -> np.ndarray:
         if i0 > n - 2:
             i0 = n - 2
         frac = pos - (i0 << idx_frac)
-        y0 = int(lut[i0]); y1 = int(lut[i0 + 1])
+        y0 = int(lut[i0])
+        y1 = int(lut[i0 + 1])
         e[m] = y0 + (((y1 - y0) * frac) >> idx_frac)
     s = int(e.sum())
     out = np.zeros(len(z), dtype=np.int64)

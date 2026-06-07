@@ -1,4 +1,5 @@
 """SysML v2: package RC::Ports"""
+
 from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
@@ -16,6 +17,7 @@ class Direction(Enum):
 @dataclass
 class SignalIn:
     """SysML2: port def SignalIn { in signal : TimeSeries }"""
+
     name: str = ""
     item_type: Type = TimeSeries
     direction: Direction = field(default=Direction.IN, init=False)
@@ -24,6 +26,7 @@ class SignalIn:
 @dataclass
 class SignalOut:
     """SysML2: port def SignalOut { out signal : TimeSeries }"""
+
     name: str = ""
     item_type: Type = TimeSeries
     direction: Direction = field(default=Direction.OUT, init=False)
@@ -37,6 +40,7 @@ class WeightMatrix:
     """SysML2: metadata def WeightMatrix
     Stereotype attached to Synapse connections to qualify weights.
     """
+
     sparsity: float = 1.0
     distribution: Distribution = Distribution.NORMAL
     trainable: bool = False
@@ -51,6 +55,7 @@ class WeightMatrix:
 @dataclass
 class Synapse:
     """SysML2: interface def Synapse { source : SignalOut; target : SignalIn; weights : Tensor }"""
+
     source: Port
     target: Port
     spec: WeightMatrix = field(default_factory=WeightMatrix)

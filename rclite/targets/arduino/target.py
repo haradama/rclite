@@ -23,6 +23,7 @@ Use a structured topology (SCR / DLR / DLRB) or `sparse=` so the dense W_res
 matrix is never materialised — that is what keeps the model inside the Uno's
 memory.
 """
+
 from __future__ import annotations
 import pathlib
 import shutil
@@ -31,7 +32,7 @@ from typing import Optional
 
 import numpy as np
 
-from ..target import Target, CompiledArtifact, RunResult
+from ..target import Target, CompiledArtifact
 from ...codegen.templating import render_template
 from .emit_c import emit_affine_kernel_c
 
@@ -63,11 +64,14 @@ class ArduinoUnoTarget(Target):
 
     # ------------------------------------------------------------------
 
-    def compile_affine_quantized(self, qmodel, *,
-                                  output_dir,
-                                  test_inputs: np.ndarray,
-                                  build: Optional[bool] = None,
-                                  ) -> CompiledArtifact:
+    def compile_affine_quantized(
+        self,
+        qmodel,
+        *,
+        output_dir,
+        test_inputs: np.ndarray,
+        build: Optional[bool] = None,
+    ) -> CompiledArtifact:
         """Emit the sketch + kernel; compile for Uno if arduino-cli is present.
 
         `build` forces (True) or skips (False) the arduino-cli compile.
@@ -92,6 +96,7 @@ class ArduinoUnoTarget(Target):
         # executor (same path the host JIT / C kernel reproduce exactly).
         from rclite.core.profile import Aggregation
         from rclite.quant.affine.executor import AffineQuantizedExecutor
+
         cfg = qmodel.config
         X = test_inputs
         if X.ndim == 1:
@@ -112,8 +117,9 @@ class ArduinoUnoTarget(Target):
                 x_raw_q = qexe._quantize_raw_input(X[t])
                 u_pre_q = qexe._quantize_u_pre(X[t])
                 qexe.step_q(u_pre_q)
-                Y_ref_q[t] = qexe.predict_one_q(
-                    x_raw_q, qexe.state_q).astype(np_storage)
+                Y_ref_q[t] = qexe.predict_one_q(x_raw_q, qexe.state_q).astype(
+                    np_storage
+                )
 
         # Render sketch.ino
         x_lit = ", ".join(str(int(v)) for v in X_q.ravel())
@@ -158,17 +164,20 @@ class ArduinoUnoTarget(Target):
 
     # ------------------------------------------------------------------
 
-    def compile_symmetric_online(self, qmodel, *,
-                                  output_dir,
-                                  X: np.ndarray,
-                                  Y: np.ndarray,
-                                  learning_rate: float = 1e-2,
-                                  normalized: bool = False,
-                                  delta: float = 1.0,
-                                  warmup: int = 0,
-                                  sparse=None,
-                                  build: Optional[bool] = None,
-                                  ) -> CompiledArtifact:
+    def compile_symmetric_online(
+        self,
+        qmodel,
+        *,
+        output_dir,
+        X: np.ndarray,
+        Y: np.ndarray,
+        learning_rate: float = 1e-2,
+        normalized: bool = False,
+        delta: float = 1.0,
+        warmup: int = 0,
+        sparse=None,
+        build: Optional[bool] = None,
+    ) -> CompiledArtifact:
         """Emit + (optionally) build an **on-device online-learning** sketch.
 
         Unlike `compile_affine_quantized` (inference only), this wires the
@@ -209,8 +218,12 @@ class ArduinoUnoTarget(Target):
         # Emit the kernel from the INITIAL weights, *before* the reference loop
         # mutates rc_W_out (collect_training_stream learns in place).
         kernel_c = emit_symmetric_online_kernel_c(
-            qmodel, learning_rate, normalized=normalized, delta=delta,
-            sparse=sparse)
+            qmodel,
+            learning_rate,
+            normalized=normalized,
+            delta=delta,
+            sparse=sparse,
+        )
         (sketch_dir / "rc_kernel.c").write_text(kernel_c)
 
         X = np.asarray(X, dtype=np.float64)
@@ -220,8 +233,14 @@ class ArduinoUnoTarget(Target):
         if Y.ndim == 1:
             Y = Y[:, None]
         stream = collect_training_stream(
-            qmodel, X, Y, learning_rate=learning_rate,
-            normalized=normalized, delta=delta, warmup=warmup)
+            qmodel,
+            X,
+            Y,
+            learning_rate=learning_rate,
+            normalized=normalized,
+            delta=delta,
+            warmup=warmup,
+        )
 
         T = int(X.shape[0])
         F = qmodel.F
@@ -275,8 +294,9 @@ class ArduinoUnoTarget(Target):
 
     # ------------------------------------------------------------------
 
-    def _arduino_build(self, sketch_dir: pathlib.Path,
-                        out: pathlib.Path) -> tuple:
+    def _arduino_build(
+        self, sketch_dir: pathlib.Path, out: pathlib.Path
+    ) -> tuple:
         if shutil.which(self.arduino_cli) is None:
             raise RuntimeError(
                 f"{self.arduino_cli} not found on PATH — install arduino-cli "
@@ -284,9 +304,12 @@ class ArduinoUnoTarget(Target):
             )
         build_dir = out / "build"
         cmd = [
-            self.arduino_cli, "compile",
-            "--fqbn", self.fqbn,
-            "--output-dir", str(build_dir),
+            self.arduino_cli,
+            "compile",
+            "--fqbn",
+            self.fqbn,
+            "--output-dir",
+            str(build_dir),
             str(sketch_dir),
         ]
         cp = subprocess.run(cmd, capture_output=True, text=True)

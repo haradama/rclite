@@ -1,4 +1,5 @@
 """Tests for the rclite.quant package — config, LUT, QuantizedExecutor, QAT search."""
+
 from __future__ import annotations
 import pathlib
 import sys
@@ -9,17 +10,29 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import numpy as np
 
 from rclite import (
-    InputNode, ReservoirNode, ReadoutNode, ReservoirComputer,
-    Activation, Distribution, Topology, Trainer,
+    InputNode,
+    ReservoirNode,
+    ReadoutNode,
+    ReservoirComputer,
+    Distribution,
+    Topology,
+    Trainer,
 )
 from rclite.runtime import RCExecutor
 from rclite.quant import (
-    QuantConfig, TanhLUTSpec, I32FixedPoint, I16FixedPoint,
-    quantize_model, QuantizedExecutor,
-    search_quantization, derive_frac_bits,
+    QuantConfig,
+    TanhLUTSpec,
+    I32FixedPoint,
+    I16FixedPoint,
+    quantize_model,
+    QuantizedExecutor,
+    search_quantization,
+    derive_frac_bits,
 )
 from rclite.quant._intops import (
-    fixed_mul_i32, fixed_mul_scalar_i32, tanh_lut_lookup,
+    fixed_mul_i32,
+    fixed_mul_scalar_i32,
+    tanh_lut_lookup,
 )
 
 
@@ -35,18 +48,34 @@ def expect_raises(exc_type, fn, *args, **kwargs):
     raise AssertionError(f"Expected {exc_type.__name__}, none raised")
 
 
-def _build_esn(units=80, topology=Topology.SCR, include_input=True,
-                input_offset=0.0):
+def _build_esn(
+    units=80, topology=Topology.SCR, include_input=True, input_offset=0.0
+):
     rc = ReservoirComputer(
-        input=InputNode(units=1, input_offset=input_offset, input_scaling=1.0,
-                        input_distribution=Distribution.BERNOULLI, name="in"),
-        reservoir=ReservoirNode(units=units, topology=topology,
-                                 chain_weight=0.9, leak_rate=0.3, seed=42,
-                                 name="res"),
-        readout=ReadoutNode(units=1, trainer=Trainer.RIDGE,
-                             regularization=1e-6, washout=80,
-                             include_bias=True, include_input=include_input,
-                             name="out"),
+        input=InputNode(
+            units=1,
+            input_offset=input_offset,
+            input_scaling=1.0,
+            input_distribution=Distribution.BERNOULLI,
+            name="in",
+        ),
+        reservoir=ReservoirNode(
+            units=units,
+            topology=topology,
+            chain_weight=0.9,
+            leak_rate=0.3,
+            seed=42,
+            name="res",
+        ),
+        readout=ReadoutNode(
+            units=1,
+            trainer=Trainer.RIDGE,
+            regularization=1e-6,
+            washout=80,
+            include_bias=True,
+            include_input=include_input,
+            name="out",
+        ),
     )
     exe = RCExecutor(rc)
     rng = np.random.default_rng(0)
@@ -155,8 +184,8 @@ def test_fixed_mul_matches_float_within_quantization():
 
 
 def test_fixed_mul_scalar():
-    a = (0.5 * (1 << 16))
-    b = (0.25 * (1 << 16))
+    a = 0.5 * (1 << 16)
+    b = 0.25 * (1 << 16)
     result = fixed_mul_scalar_i32(int(a), int(b), 16)
     assert abs(result / (1 << 16) - 0.125) < 1e-5
 
@@ -192,8 +221,8 @@ def test_quantize_model_W_out_decoded_matches_float():
     bias_decoded = qm.W_out_q[:, 0].astype(np.float64) / cfg.state_scale
     assert np.allclose(bias_decoded, exe.W_out[:, 0], atol=1e-4)
     # State columns at state_scale
-    state_decoded = qm.W_out_q[:, 1 + K:].astype(np.float64) / cfg.state_scale
-    assert np.allclose(state_decoded, exe.W_out[:, 1 + K:], atol=1e-3)
+    state_decoded = qm.W_out_q[:, 1 + K :].astype(np.float64) / cfg.state_scale
+    assert np.allclose(state_decoded, exe.W_out[:, 1 + K :], atol=1e-3)
 
 
 # ---------------------------------------------------------------- executor
@@ -203,20 +232,28 @@ def test_executor_requires_lut():
     rc, exe, _, _ = _build_esn(units=10)
     cfg = QuantConfig()
     from rclite.quant.model import QuantizedModel
+
     qm = quantize_model(rc, exe, cfg)
     # Strip the LUT and expect failure
     qm_bad = QuantizedModel(
-        rc=qm.rc, target=qm.target, config=qm.config, lut=None,
-        W_in_q=qm.W_in_q, W_res_q=qm.W_res_q, W_out_q=qm.W_out_q,
-        lut_table_q=None, state_init_q=qm.state_init_q,
+        rc=qm.rc,
+        target=qm.target,
+        config=qm.config,
+        lut=None,
+        W_in_q=qm.W_in_q,
+        W_res_q=qm.W_res_q,
+        W_out_q=qm.W_out_q,
+        lut_table_q=None,
+        state_init_q=qm.state_init_q,
     )
     expect_raises(ValueError, QuantizedExecutor, qm_bad)
 
 
 def test_executor_reset():
     rc, exe, X, _ = _build_esn(units=20)
-    qm = quantize_model(rc, exe, QuantConfig(state_frac=18, input_frac=12,
-                                                weight_frac=12))
+    qm = quantize_model(
+        rc, exe, QuantConfig(state_frac=18, input_frac=12, weight_frac=12)
+    )
     qexe = QuantizedExecutor(qm)
     qexe.predict(X[:10])
     s_after = qexe.state_q.copy()
@@ -229,8 +266,9 @@ def test_executor_reset():
 
 def test_executor_state_trajectory_close_to_float():
     rc, exe, X, _ = _build_esn(units=40)
-    qm = quantize_model(rc, exe, QuantConfig(state_frac=20, input_frac=14,
-                                                weight_frac=14))
+    qm = quantize_model(
+        rc, exe, QuantConfig(state_frac=20, input_frac=14, weight_frac=14)
+    )
     qexe = QuantizedExecutor(qm)
     H_q = qexe.collect_states(X[:200])
     H_f = exe.collect_states(X[:200])
@@ -250,20 +288,30 @@ def test_search_converges_below_float_baseline_or_close():
     mse_f32 = float(np.mean((Y_f32 - Y_ev) ** 2))
 
     result = search_quantization(
-        rc, exe, X_tr, Y_tr, X_ev, Y_ev,
+        rc,
+        exe,
+        X_tr,
+        Y_tr,
+        X_ev,
+        Y_ev,
         state_frac_range=(12, 22),
         lut=TanhLUTSpec(n=128),
     )
     # With QAT refit, quantized should reach within 10x of float
-    assert result.best_mse < 10 * mse_f32, \
+    assert result.best_mse < 10 * mse_f32, (
         f"qmse {result.best_mse} too far from float {mse_f32}"
+    )
 
 
 def test_search_history_records_all_tried():
     rc, exe, X, Y = _build_esn(units=30)
     result = search_quantization(
-        rc, exe,
-        X[:200], Y[:200], X[200:250], Y[200:250],
+        rc,
+        exe,
+        X[:200],
+        Y[:200],
+        X[200:250],
+        Y[200:250],
         state_frac_range=(12, 18),
     )
     assert len(result.history) == 7
@@ -278,8 +326,11 @@ def test_derive_frac_bits_handles_zero_data():
     assert derive_frac_bits(np.linspace(-1, 1, 100)) >= 20
 
 
-TESTS = [v for k, v in list(globals().items())
-         if k.startswith("test_") and callable(v)]
+TESTS = [
+    v
+    for k, v in list(globals().items())
+    if k.startswith("test_") and callable(v)
+]
 
 
 def main() -> int:

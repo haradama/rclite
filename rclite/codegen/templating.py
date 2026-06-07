@@ -17,6 +17,7 @@ emitters (``c_kernel_symmetric``, ``arduino/emit_c``, the affine/sparse
 lowerers) stay as Python — their value is bit-exact codegen logic, not text
 assembly, and that logic belongs next to the constants it computes.
 """
+
 from __future__ import annotations
 
 import pathlib

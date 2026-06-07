@@ -5,27 +5,51 @@ can be folded into the existing llvmlite-based lowering with no new
 toolchain dependency. The textual `to_mlir_text()` printer emits ops in
 a form compatible with the rc-bench dialect for future cross-tool use.
 """
+
 from .module import Module
 from .ops import (
     Op,
-    PreprocessInput, ReservoirStep, BuildPhi, ReadoutLinear,
-    FusedStepReadout, TimeLoop, SparseSpec,
-    Argmax, Softmax, AccumulateState, FinalizeAggregate,
+    PreprocessInput,
+    ReservoirStep,
+    BuildPhi,
+    ReadoutLinear,
+    FusedStepReadout,
+    TimeLoop,
+    SparseSpec,
+    Argmax,
+    Softmax,
+    AccumulateState,
+    FinalizeAggregate,
 )
 from .builder import build_ir
 from .printer import to_mlir_text
 from .passes import (
-    StructuralSpecialize, FuseStepReadout, TimeUnroll, SparsifyReservoir,
+    StructuralSpecialize,
+    FuseStepReadout,
+    TimeUnroll,
+    SparsifyReservoir,
     sparse_passes,
 )
 
 __all__ = [
     "Module",
     "Op",
-    "PreprocessInput", "ReservoirStep", "BuildPhi", "ReadoutLinear",
-    "FusedStepReadout", "TimeLoop", "SparseSpec",
-    "Argmax", "Softmax", "AccumulateState", "FinalizeAggregate",
-    "build_ir", "to_mlir_text",
-    "StructuralSpecialize", "FuseStepReadout", "TimeUnroll",
-    "SparsifyReservoir", "sparse_passes",
+    "PreprocessInput",
+    "ReservoirStep",
+    "BuildPhi",
+    "ReadoutLinear",
+    "FusedStepReadout",
+    "TimeLoop",
+    "SparseSpec",
+    "Argmax",
+    "Softmax",
+    "AccumulateState",
+    "FinalizeAggregate",
+    "build_ir",
+    "to_mlir_text",
+    "StructuralSpecialize",
+    "FuseStepReadout",
+    "TimeUnroll",
+    "SparsifyReservoir",
+    "sparse_passes",
 ]

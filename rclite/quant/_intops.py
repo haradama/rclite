@@ -7,6 +7,7 @@ right, truncate to i32 (two's-complement wrap-around).
 Using the same helpers in the QuantizedExecutor and the LLVM emitter
 keeps QAT parity exact.
 """
+
 from __future__ import annotations
 import numpy as np
 
@@ -16,7 +17,9 @@ _INT32_WRAP = np.uint32(0xFFFFFFFF)
 
 def trunc_i32(x_i64: np.ndarray) -> np.ndarray:
     """Truncate i64 → i32 with two's-complement wrap (mod 2^32)."""
-    return (x_i64.astype(np.int64) & _INT32_WRAP).astype(np.uint32).view(np.int32)
+    return (
+        (x_i64.astype(np.int64) & _INT32_WRAP).astype(np.uint32).view(np.int32)
+    )
 
 
 def fixed_mul_i32(a: np.ndarray, b: np.ndarray, shift: int) -> np.ndarray:
@@ -84,6 +87,8 @@ def tanh_lut_lookup(
     frac_q = pos_q - trunc_i32(i0 << state_frac)
     y0 = lut_q[i0]
     y1 = lut_q[i0 + 1]
-    dy = (y1.astype(np.int64) - y0.astype(np.int64))
-    interp = trunc_i32(y0.astype(np.int64) + ((dy * frac_q.astype(np.int64)) >> state_frac))
+    dy = y1.astype(np.int64) - y0.astype(np.int64)
+    interp = trunc_i32(
+        y0.astype(np.int64) + ((dy * frac_q.astype(np.int64)) >> state_frac)
+    )
     return interp

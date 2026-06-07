@@ -26,6 +26,7 @@ with the result byte (0 == pass). Two headless backends are supported:
 A `.nes` built this way also runs on real hardware and any cycle-accurate
 emulator.
 """
+
 from __future__ import annotations
 import os
 import pathlib
@@ -68,13 +69,16 @@ class NesTarget(Target):
 
     # ------------------------------------------------------------------
 
-    def compile_affine_quantized(self, qmodel, *,
-                                 output_dir,
-                                 test_inputs: np.ndarray,
-                                 tol: int = 1,
-                                 build: Optional[bool] = None,
-                                 sparse=None,
-                                 ) -> CompiledArtifact:
+    def compile_affine_quantized(
+        self,
+        qmodel,
+        *,
+        output_dir,
+        test_inputs: np.ndarray,
+        tol: int = 1,
+        build: Optional[bool] = None,
+        sparse=None,
+    ) -> CompiledArtifact:
         """Emit the kernel + harness and link them into a `.nes` cartridge.
 
         `build` forces (True) or skips (False) the llvm-mos link step.
@@ -96,14 +100,16 @@ class NesTarget(Target):
         # Portable affine kernel. i32 accumulators where they provably fit:
         # llvm-mos is a modern clang (no avr-gcc 7.x widening-MAC bug), so this
         # is bit-exact and dodges the 6502's expensive 64-bit libcalls.
-        kernel_c = emit_affine_kernel_c(qmodel, allow_i32_accum=True,
-                                        sparse=sparse)
+        kernel_c = emit_affine_kernel_c(
+            qmodel, allow_i32_accum=True, sparse=sparse
+        )
         kernel_path = out / "rc_kernel.c"
         kernel_path.write_text(kernel_c)
 
         # Quantize test inputs + bit-exact reference outputs via the affine
         # executor (the same path the C kernel reproduces exactly).
         from rclite.quant.affine.executor import AffineQuantizedExecutor
+
         cfg = qmodel.config
         X = test_inputs[:, None] if test_inputs.ndim == 1 else test_inputs
         X_q = cfg.input.quantize_array(X).astype(np_storage)
@@ -114,23 +120,27 @@ class NesTarget(Target):
             x_raw_q = qexe._quantize_raw_input(X[t])
             u_pre_q = qexe._quantize_u_pre(X[t])
             qexe.step_q(u_pre_q)
-            Y_ref_q[t] = qexe.predict_one_q(x_raw_q, qexe.state_q).astype(np_storage)
+            Y_ref_q[t] = qexe.predict_one_q(x_raw_q, qexe.state_q).astype(
+                np_storage
+            )
 
         x_flat = np.ascontiguousarray(X_q).ravel()
         y_flat = np.ascontiguousarray(Y_ref_q).ravel()
 
         main_path = out / "main.c"
-        main_path.write_text(render_template(
-            _SUPPORT_DIR / "main_template_q_affine.c",
-            T_STEPS=str(T),
-            X_LEN=str(len(x_flat)),
-            Y_LEN=str(len(y_flat)),
-            STORAGE_T=storage_t,
-            LUT_KIND=qmodel.lut_strategy.kind.value,
-            TOL=str(int(tol)),
-            X_VALUES_Q=", ".join(str(int(v)) for v in x_flat),
-            Y_VALUES_Q=", ".join(str(int(v)) for v in y_flat),
-        ))
+        main_path.write_text(
+            render_template(
+                _SUPPORT_DIR / "main_template_q_affine.c",
+                T_STEPS=str(T),
+                X_LEN=str(len(x_flat)),
+                Y_LEN=str(len(y_flat)),
+                STORAGE_T=storage_t,
+                LUT_KIND=qmodel.lut_strategy.kind.value,
+                TOL=str(int(tol)),
+                X_VALUES_Q=", ".join(str(int(v)) for v in x_flat),
+                Y_VALUES_Q=", ".join(str(int(v)) for v in y_flat),
+            )
+        )
 
         metadata = {
             "cpu": "6502",
@@ -163,15 +173,23 @@ class NesTarget(Target):
 
     # ------------------------------------------------------------------
 
-    def _build_rom(self, out: pathlib.Path, kernel_path: pathlib.Path,
-                   main_path: pathlib.Path) -> pathlib.Path:
+    def _build_rom(
+        self,
+        out: pathlib.Path,
+        kernel_path: pathlib.Path,
+        main_path: pathlib.Path,
+    ) -> pathlib.Path:
         """Compile + link the kernel and harness into a `.nes` with llvm-mos."""
         self._require_cc()
         rom = out / "rc.nes"
         cmd = [
-            self.cc, "-Os", "-flto",
-            str(main_path), str(kernel_path),
-            "-o", str(rom),
+            self.cc,
+            "-Os",
+            "-flto",
+            str(main_path),
+            str(kernel_path),
+            "-o",
+            str(rom),
         ]
         cp = subprocess.run(cmd, capture_output=True, text=True)
         if cp.returncode != 0:
@@ -183,11 +201,15 @@ class NesTarget(Target):
 
     # -- runner ------------------------------------------------------------
 
-    def run(self, artifact: CompiledArtifact, *,
-            emulator: str = "auto",
-            frames: int = 30000,
-            timeout: float = 120.0,
-            **_) -> RunResult:
+    def run(
+        self,
+        artifact: CompiledArtifact,
+        *,
+        emulator: str = "auto",
+        frames: int = 30000,
+        timeout: float = 120.0,
+        **_,
+    ) -> RunResult:
         """Run the cartridge headlessly and report the blargg ($6000) verdict.
 
         Two backends speak the same de-facto NES test protocol — the harness
@@ -205,57 +227,81 @@ class NesTarget(Target):
         if emulator not in ("auto", "mesen", "fceux"):
             raise ValueError(f"unknown emulator {emulator!r}")
 
-        mesen_bin = (shutil.which("Mesen") or shutil.which("mesen")
-                     or shutil.which("Mesen2"))
+        mesen_bin = (
+            shutil.which("Mesen")
+            or shutil.which("mesen")
+            or shutil.which("Mesen2")
+        )
         fceux_bin = shutil.which("fceux") or shutil.which("/usr/games/fceux")
 
         if emulator == "mesen" or (emulator == "auto" and mesen_bin):
             if mesen_bin is None:
                 raise RuntimeError(
                     "Mesen not found on PATH — install Mesen2 "
-                    "(https://github.com/SourMesen/Mesen2)")
+                    "(https://github.com/SourMesen/Mesen2)"
+                )
             return self._run_mesen(mesen_bin, artifact, frames, timeout)
 
         if emulator == "fceux" or (emulator == "auto" and fceux_bin):
             if fceux_bin is None:
                 raise RuntimeError(
                     "fceux not found on PATH — install it (e.g. "
-                    "`apt install fceux`); it ships Lua scripting")
+                    "`apt install fceux`); it ships Lua scripting"
+                )
             return self._run_fceux(fceux_bin, artifact, frames, timeout)
 
         raise RuntimeError(
             "no NES emulator found on PATH — install Mesen2 (--testrunner) or "
-            "fceux (`apt install fceux`, driven via Lua under xvfb-run)")
+            "fceux (`apt install fceux`, driven via Lua under xvfb-run)"
+        )
 
     def _run_mesen(self, mesen_bin, artifact, frames, timeout) -> RunResult:
         cmd = [mesen_bin, "--testrunner", str(artifact.binary), str(frames)]
-        cp = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        cp = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout
+        )
         output = (cp.stdout or "") + (cp.stderr or "")
-        success = (cp.returncode == 0
-                   and "TEST_PASS" in output and "TEST_FAIL" not in output)
-        return RunResult(success=success, output=output,
-                         returncode=cp.returncode)
+        success = (
+            cp.returncode == 0
+            and "TEST_PASS" in output
+            and "TEST_FAIL" not in output
+        )
+        return RunResult(
+            success=success, output=output, returncode=cp.returncode
+        )
 
     def _run_fceux(self, fceux_bin, artifact, frames, timeout) -> RunResult:
         lua = _SUPPORT_DIR / "fceux_testrunner.lua"
-        cmd = [fceux_bin, "--no-config", "1",
-               "--loadlua", str(lua), str(artifact.binary)]
+        cmd = [
+            fceux_bin,
+            "--no-config",
+            "1",
+            "--loadlua",
+            str(lua),
+            str(artifact.binary),
+        ]
         if shutil.which("xvfb-run") is not None:
             cmd = ["xvfb-run", "-a"] + cmd
         env = dict(os.environ, RCLITE_MAX_FRAMES=str(frames))
         try:
-            cp = subprocess.run(cmd, capture_output=True, text=True,
-                                timeout=timeout, env=env)
+            cp = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=timeout, env=env
+            )
             output = (cp.stdout or "") + (cp.stderr or "")
             returncode = cp.returncode
         except subprocess.TimeoutExpired as e:
-            output = (e.stdout or "") + (e.stderr or "") if isinstance(
-                e.stdout, str) else "TIMEOUT\n"
+            output = (
+                (e.stdout or "") + (e.stderr or "")
+                if isinstance(e.stdout, str)
+                else "TIMEOUT\n"
+            )
             returncode = 99
         # The verdict is the message the harness wrote to $6004 (printed by the
         # Lua watcher), not the exit code: FCEUX's Qt teardown can segfault on
         # exit under xvfb after a clean os.exit(), so we key off the message.
-        success = ("TEST_PASS" in output
-                   and "TEST_FAIL" not in output
-                   and "TIMEOUT" not in output)
+        success = (
+            "TEST_PASS" in output
+            and "TEST_FAIL" not in output
+            and "TIMEOUT" not in output
+        )
         return RunResult(success=success, output=output, returncode=returncode)

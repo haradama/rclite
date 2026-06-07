@@ -30,6 +30,7 @@ Saturation happens at each requantize boundary and is **not** a wrap;
 i.e. values that overflow the storage range clamp to ±qmax, matching
 what a TFLM kernel does.
 """
+
 from __future__ import annotations
 
 import numpy as np
@@ -56,7 +57,9 @@ def _clamp_i32(arr: np.ndarray) -> np.ndarray:
     """Clamp to signed i32 range, return i32. Mirrors the JIT's
     `_clamp_to_i32` before each requantize so Python and JIT agree even
     when an accumulator would overflow i32 (large N or mixed precision)."""
-    return np.clip(arr.astype(np.int64), -(1 << 31), (1 << 31) - 1).astype(np.int32)
+    return np.clip(arr.astype(np.int64), -(1 << 31), (1 << 31) - 1).astype(
+        np.int32
+    )
 
 
 class AffineQuantizedExecutor:
@@ -92,15 +95,17 @@ class AffineQuantizedExecutor:
         q = self.qmodel
         if q.has_integer_preprocess:
             x_raw_q = self._quantize_raw_input(x_float)
-            centered = (x_raw_q.astype(np.int32)
-                        - self.cfg.input.zero_point).astype(np.int32)
+            centered = (
+                x_raw_q.astype(np.int32) - self.cfg.input.zero_point
+            ).astype(np.int32)
             delta = apply_multiplier_array(centered, q.pre_M0, q.pre_n)
             total = (q.pre_const + delta).astype(np.int64)
             return _saturate(total, self.storage_bits).astype(np.int32)
         # Identity preprocess: input and u_pre share scale/zp (by calibration).
         rc = self.qmodel.rc
-        u_pre = (np.asarray(x_float, dtype=np.float64) - rc.input.input_offset) \
-                * rc.input.input_scaling
+        u_pre = (
+            np.asarray(x_float, dtype=np.float64) - rc.input.input_offset
+        ) * rc.input.input_scaling
         return self.cfg.u_pre.quantize_array(u_pre).astype(np.int32)
 
     # ------------------------------------------------------------------
@@ -121,27 +126,30 @@ class AffineQuantizedExecutor:
         # Accumulate in i64 to avoid overflow, then clamp to i32 (matching
         # the JIT) before the requantize.
         if q.K > 0:
-            acc_in = (q.W_in_q.astype(np.int64)
-                       @ u_pre_q.astype(np.int64)
-                       - zp_upre * q.row_sum_W_in.astype(np.int64))
+            acc_in = q.W_in_q.astype(np.int64) @ u_pre_q.astype(
+                np.int64
+            ) - zp_upre * q.row_sum_W_in.astype(np.int64)
         else:
             acc_in = np.zeros(N, dtype=np.int64)
 
         # acc_res[i] = sum_j q_W_res[i,j] * q_h[j] - zp_state * R_res[i]
-        acc_res = (q.W_res_q.astype(np.int64) @ self.state_q.astype(np.int64)
-                    - zp_state * q.row_sum_W_res.astype(np.int64))
+        acc_res = q.W_res_q.astype(np.int64) @ self.state_q.astype(
+            np.int64
+        ) - zp_state * q.row_sum_W_res.astype(np.int64)
 
         # Requantize each contribution to pre-scale, then sum + add zp + bias.
         # Uses integer (M0, n) multipliers so the JIT and this Python ref are
         # bit-exact on the requantize step.
-        rq_in  = apply_multiplier_array(_clamp_i32(acc_in),  q.M_in_M0,  q.M_in_n)
+        rq_in = apply_multiplier_array(_clamp_i32(acc_in), q.M_in_M0, q.M_in_n)
         if q.M_res_M0_arr is not None:
             # per-channel: each reservoir row uses its own (M0[i], n[i]).
             rq_res = apply_multiplier_perrow(
-                _clamp_i32(acc_res), q.M_res_M0_arr, q.M_res_n_arr)
+                _clamp_i32(acc_res), q.M_res_M0_arr, q.M_res_n_arr
+            )
         else:
             rq_res = apply_multiplier_array(
-                _clamp_i32(acc_res), q.M_res_M0, q.M_res_n)
+                _clamp_i32(acc_res), q.M_res_M0, q.M_res_n
+            )
         pre_q = zp_pre + q.bias_pre + rq_in + rq_res
         pre_q = _saturate(pre_q, sb).astype(np.int32)
 
@@ -155,7 +163,9 @@ class AffineQuantizedExecutor:
         diff = a_centered - h_centered
         delta = apply_multiplier_array(diff, q.leak_M0, q.leak_n)
         new_h_centered = h_centered.astype(np.int64) + delta
-        self.state_q = _saturate(new_h_centered + zp_state, sb).astype(np.int32)
+        self.state_q = _saturate(new_h_centered + zp_state, sb).astype(
+            np.int32
+        )
         return self.state_q.copy()
 
     # ------------------------------------------------------------------
@@ -186,9 +196,10 @@ class AffineQuantizedExecutor:
         n = q.lut_strategy.n_entries
         # t_q = (q_pre - qmin) * idx_M0 >> idx_n, in Q.f
         # (apply_multiplier_array implements the M0,n requantize bit-exactly)
-        normalized = (pre_q.astype(np.int64) + art.offset)
-        t_q = apply_multiplier_array(normalized.astype(np.int32),
-                                       art.idx_M0, art.idx_n)
+        normalized = pre_q.astype(np.int64) + art.offset
+        t_q = apply_multiplier_array(
+            normalized.astype(np.int32), art.idx_M0, art.idx_n
+        )
         # Split into integer index and fractional remainder.
         idx = (t_q >> f).astype(np.int64)
         idx = np.clip(idx, 0, n - 2)
@@ -217,8 +228,9 @@ class AffineQuantizedExecutor:
 
         # 1) Convert q_pre to x in Q.qf
         centered = (pre_q.astype(np.int64) - zp_pre).astype(np.int32)
-        x_qf = apply_multiplier_array(centered, art.x_to_qf_M0,
-                                        art.x_to_qf_n).astype(np.int64)
+        x_qf = apply_multiplier_array(
+            centered, art.x_to_qf_M0, art.x_to_qf_n
+        ).astype(np.int64)
         # 2) Clamp |x| ≤ x_clip_qf
         x_qf = np.clip(x_qf, -art.x_clip_qf, art.x_clip_qf)
         # 3) Horner-style poly in x²:
@@ -233,17 +245,18 @@ class AffineQuantizedExecutor:
         # 4) Clamp tanh value to ±1 (= ±one_qf)
         y_qf = np.clip(y_qf, -art.one_qf, art.one_qf)
         # 5) Map y_qf → Δq_state via back multiplier
-        delta = apply_multiplier_array(y_qf.astype(np.int32),
-                                         art.qf_to_state_M0,
-                                         art.qf_to_state_n)
+        delta = apply_multiplier_array(
+            y_qf.astype(np.int32), art.qf_to_state_M0, art.qf_to_state_n
+        )
         out = (delta + zp_state).astype(np.int64)
         return _saturate(out, self.storage_bits).astype(np.int32)
 
     # ------------------------------------------------------------------
     # Readout
 
-    def predict_one_q(self, x_raw_q: np.ndarray,
-                       state_q: np.ndarray) -> np.ndarray:
+    def predict_one_q(
+        self, x_raw_q: np.ndarray, state_q: np.ndarray
+    ) -> np.ndarray:
         """Mixed-scale W_out matmul → y_q (i32 at output scale/zp).
 
         Per-column-block requantize:
@@ -276,21 +289,36 @@ class AffineQuantizedExecutor:
         off = 0
         if rc.readout.include_bias:
             bias_col = _clamp_i32(Wo[:, 0])  # (M,)
-            y_acc += _rq(bias_col, q.M_out_bias_M0, q.M_out_bias_n,
-                         q.M_out_bias_M0_arr, q.M_out_bias_n_arr)
+            y_acc += _rq(
+                bias_col,
+                q.M_out_bias_M0,
+                q.M_out_bias_n,
+                q.M_out_bias_M0_arr,
+                q.M_out_bias_n_arr,
+            )
             off += 1
         if rc.readout.include_input:
-            Wi = Wo[:, off:off + K]  # (M, K)
+            Wi = Wo[:, off : off + K]  # (M, K)
             dot_in = Wi @ x_raw_q.astype(np.int64)  # (M,)
             adj_in = dot_in - zp_input * q.row_sum_Wout_input.astype(np.int64)
-            y_acc += _rq(_clamp_i32(adj_in), q.M_out_input_M0, q.M_out_input_n,
-                         q.M_out_input_M0_arr, q.M_out_input_n_arr)
+            y_acc += _rq(
+                _clamp_i32(adj_in),
+                q.M_out_input_M0,
+                q.M_out_input_n,
+                q.M_out_input_M0_arr,
+                q.M_out_input_n_arr,
+            )
             off += K
-        Ws = Wo[:, off:off + N]  # (M, N)
+        Ws = Wo[:, off : off + N]  # (M, N)
         dot_st = Ws @ state_q.astype(np.int64)
         adj_st = dot_st - zp_state * q.row_sum_Wout_state.astype(np.int64)
-        y_acc += _rq(_clamp_i32(adj_st), q.M_out_state_M0, q.M_out_state_n,
-                     q.M_out_state_M0_arr, q.M_out_state_n_arr)
+        y_acc += _rq(
+            _clamp_i32(adj_st),
+            q.M_out_state_M0,
+            q.M_out_state_n,
+            q.M_out_state_M0_arr,
+            q.M_out_state_n_arr,
+        )
 
         return _saturate(y_acc, self.storage_bits).astype(np.int32)
 
@@ -365,6 +393,7 @@ class AffineQuantizedExecutor:
         post-washout states, LAST returns the final state.
         """
         from rclite.core.profile import Aggregation
+
         if X.ndim == 1:
             X = X[:, None]
         T = X.shape[0]

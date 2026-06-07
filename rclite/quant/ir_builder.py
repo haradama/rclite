@@ -18,13 +18,19 @@ Module-level metadata records `dtype="i32"`, the Q-format fractional
 widths, and the LUT geometry — the LLVM lowering reads these to pick
 shift amounts and clamp constants.
 """
+
 from __future__ import annotations
 
 from rclite.core.profile import Aggregation, Topology
 from rclite.ir.module import Module
 from rclite.ir.ops import (
-    PreprocessInput, ReservoirStep, BuildPhi, ReadoutLinear, TimeLoop,
-    Argmax, Softmax,
+    PreprocessInput,
+    ReservoirStep,
+    BuildPhi,
+    ReadoutLinear,
+    TimeLoop,
+    Argmax,
+    Softmax,
 )
 from .model import QuantizedModel
 from .softmax_lut import SoftmaxLUTSpec, build_params as build_softmax_params
@@ -59,7 +65,9 @@ def build_ir_from_quantized(qmodel: QuantizedModel, *, head=None) -> Module:
     F = qmodel.F
 
     is_structured = rc.reservoir.topology in (
-        Topology.DLR, Topology.DLRB, Topology.SCR
+        Topology.DLR,
+        Topology.DLRB,
+        Topology.SCR,
     )
 
     weights = {
@@ -81,7 +89,8 @@ def build_ir_from_quantized(qmodel: QuantizedModel, *, head=None) -> Module:
         ReservoirStep(
             leak=float(rc.reservoir.leak_rate),
             bias=float(rc.reservoir.bias),
-            N=N, K=K,
+            N=N,
+            K=K,
             topology=rc.reservoir.topology,
             chain_weight=float(rc.reservoir.chain_weight),
             chain_feedback=float(rc.reservoir.chain_feedback),
@@ -90,7 +99,8 @@ def build_ir_from_quantized(qmodel: QuantizedModel, *, head=None) -> Module:
         BuildPhi(
             include_bias=rc.readout.include_bias,
             include_input=rc.readout.include_input,
-            K=K, N=N,
+            K=K,
+            N=N,
         ),
         ReadoutLinear(M=M, F=F),
     )
@@ -99,7 +109,8 @@ def build_ir_from_quantized(qmodel: QuantizedModel, *, head=None) -> Module:
         body = body + (Argmax(M=M),)
     elif head == "proba":
         sm = build_softmax_params(
-            SoftmaxLUTSpec(), s_diff=1.0 / cfg.state_scale,
+            SoftmaxLUTSpec(),
+            s_diff=1.0 / cfg.state_scale,
             storage_bits=qmodel.target.storage_bits,
             storage_dtype=qmodel.target.storage_dtype,
         )
@@ -119,7 +130,9 @@ def build_ir_from_quantized(qmodel: QuantizedModel, *, head=None) -> Module:
         )
 
     return Module(
-        K=K, N=N, M=M,
+        K=K,
+        N=N,
+        M=M,
         weights=weights,
         ops=[TimeLoop(body=body)],
         metadata={
@@ -134,14 +147,20 @@ def build_ir_from_quantized(qmodel: QuantizedModel, *, head=None) -> Module:
             "lut_n": qmodel.lut.n,
             "lut_xmin_q": int(qmodel.lut.xmin * cfg.state_scale),
             "lut_xmax_q": int(qmodel.lut.xmax * cfg.state_scale),
-            "leak_q": qmodel.target.quantize_state(rc.reservoir.leak_rate, cfg),
+            "leak_q": qmodel.target.quantize_state(
+                rc.reservoir.leak_rate, cfg
+            ),
             "bias_q": qmodel.target.quantize_state(rc.reservoir.bias, cfg),
             "head": head or "logits",
-            **({} if sm is None else {
-                "sm_dmin_q": sm.dmin_q,
-                "sm_n": sm.n,
-                "sm_idx_frac": sm.idx_frac,
-                "sm_prob_frac": sm.prob_frac,
-            }),
+            **(
+                {}
+                if sm is None
+                else {
+                    "sm_dmin_q": sm.dmin_q,
+                    "sm_n": sm.n,
+                    "sm_idx_frac": sm.idx_frac,
+                    "sm_prob_frac": sm.prob_frac,
+                }
+            ),
         },
     )

@@ -1,4 +1,5 @@
 """AOT shared-library tests: emit .so, dlopen it, verify parity with Python."""
+
 from __future__ import annotations
 import ctypes
 import pathlib
@@ -13,8 +14,13 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import numpy as np
 
 from rclite import (
-    InputNode, ReservoirNode, ReadoutNode, ReservoirComputer,
-    Activation, Distribution, Topology, Trainer,
+    InputNode,
+    ReservoirNode,
+    ReadoutNode,
+    ReservoirComputer,
+    Activation,
+    Topology,
+    Trainer,
 )
 from rclite.runtime import RCExecutor
 from rclite.codegen import compile_rc
@@ -32,16 +38,33 @@ def expect_raises(exc_type, fn, *args, **kwargs):
     raise AssertionError(f"Expected {exc_type.__name__}, none raised")
 
 
-def _build_and_train(topology: Topology = Topology.ESN_STANDARD, units: int = 80):
+def _build_and_train(
+    topology: Topology = Topology.ESN_STANDARD, units: int = 80
+):
     rc = ReservoirComputer(
-        input=InputNode(units=1, input_scaling=1.0, input_offset=0.5, name="in"),
-        reservoir=ReservoirNode(units=units, activation=Activation.TANH,
-                                topology=topology, spectral_radius=0.9,
-                                chain_weight=0.85, leak_rate=0.3,
-                                density=0.2, seed=7, name="res"),
-        readout=ReadoutNode(units=1, trainer=Trainer.RIDGE,
-                            regularization=1e-6, washout=100,
-                            include_bias=True, include_input=True, name="out"),
+        input=InputNode(
+            units=1, input_scaling=1.0, input_offset=0.5, name="in"
+        ),
+        reservoir=ReservoirNode(
+            units=units,
+            activation=Activation.TANH,
+            topology=topology,
+            spectral_radius=0.9,
+            chain_weight=0.85,
+            leak_rate=0.3,
+            density=0.2,
+            seed=7,
+            name="res",
+        ),
+        readout=ReadoutNode(
+            units=1,
+            trainer=Trainer.RIDGE,
+            regularization=1e-6,
+            washout=100,
+            include_bias=True,
+            include_input=True,
+            name="out",
+        ),
     )
     exe = RCExecutor(rc)
     rng = np.random.default_rng(0)
@@ -135,8 +158,11 @@ def test_aot_parity_dlrb():
 def test_aot_link_failure_surfaces_error():
     rc, exe, _ = _build_and_train()
     jit = compile_rc(rc, exe)
-    expect_raises(RuntimeError, jit.emit_shared_library,
-                  "/nonexistent/dir/that/does/not/exist/librc.so")
+    expect_raises(
+        RuntimeError,
+        jit.emit_shared_library,
+        "/nonexistent/dir/that/does/not/exist/librc.so",
+    )
 
 
 def test_built_c_demo_runs_and_matches_python():
@@ -161,31 +187,45 @@ def test_built_c_demo_runs_and_matches_python():
         src.write_text(
             "#include <stdio.h>\n"
             "#include <stdint.h>\n"
-            "#include \"rc_predict.h\"\n"
+            '#include "rc_predict.h"\n'
             f"int main(void) {{\n"
             f"  double X[{T}] = {{ {x_literals} }};\n"
             f"  double Y[{T}] = {{0}};\n"
             f"  rc_predict((int64_t){T}, X, Y);\n"
-            f"  for (int t = 0; t < {T}; t++) printf(\"%.17g\\n\", Y[t]);\n"
+            f'  for (int t = 0; t < {T}; t++) printf("%.17g\\n", Y[t]);\n'
             f"  return 0;\n"
             f"}}\n"
         )
 
-        cmd = ["gcc", "-O2", "-o", str(bin), str(src),
-               "-L", str(td_path), "-lrc",
-               f"-Wl,-rpath,{td_path}", "-lm",
-               f"-I{td_path}"]
+        cmd = [
+            "gcc",
+            "-O2",
+            "-o",
+            str(bin),
+            str(src),
+            "-L",
+            str(td_path),
+            "-lrc",
+            f"-Wl,-rpath,{td_path}",
+            "-lm",
+            f"-I{td_path}",
+        ]
         cp = subprocess.run(cmd, capture_output=True, text=True)
         if cp.returncode != 0:
             raise AssertionError(f"gcc failed: {cp.stderr}")
-        cp = subprocess.run([str(bin)], capture_output=True, text=True, check=True)
+        cp = subprocess.run(
+            [str(bin)], capture_output=True, text=True, check=True
+        )
         Y_c = np.array([float(line) for line in cp.stdout.strip().split("\n")])
         diff = float(np.max(np.abs(Y_c - Y_ref.ravel())))
         assert diff < 1e-12, f"C demo diverges: max |diff| = {diff}"
 
 
-TESTS = [v for k, v in list(globals().items())
-         if k.startswith("test_") and callable(v)]
+TESTS = [
+    v
+    for k, v in list(globals().items())
+    if k.startswith("test_") and callable(v)
+]
 
 
 def main() -> int:

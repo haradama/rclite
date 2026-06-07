@@ -11,8 +11,9 @@ W_in/W_res quantization is held fixed across the sweep; only `state_frac`
 moves. The new W_out is fit to whatever the quantized reservoir actually
 produces, so the readout absorbs the quantization noise.
 """
+
 from __future__ import annotations
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -50,8 +51,9 @@ def derive_frac_bits(
     return int(max(0, min(max_frac, available_bits - int_bits)))
 
 
-def _augment_phi(rc: ReservoirComputer, X: np.ndarray,
-                  H: np.ndarray) -> np.ndarray:
+def _augment_phi(
+    rc: ReservoirComputer, X: np.ndarray, H: np.ndarray
+) -> np.ndarray:
     """Build phi = [1?] ++ [u?] ++ h for a (T, K) input and (T, N) state."""
     T = H.shape[0]
     parts = []
@@ -63,8 +65,9 @@ def _augment_phi(rc: ReservoirComputer, X: np.ndarray,
     return np.concatenate(parts, axis=1)
 
 
-def _fit_ridge(phi: np.ndarray, Y: np.ndarray,
-                ridge_lambda: float, washout: int) -> np.ndarray:
+def _fit_ridge(
+    phi: np.ndarray, Y: np.ndarray, ridge_lambda: float, washout: int
+) -> np.ndarray:
     """Ridge regression on (T, F) features, (T, M) targets. Returns (M, F)."""
     phi_w = phi[washout:]
     Y_w = Y[washout:]
@@ -100,7 +103,9 @@ def search_quantization(
     if lut is None:
         lut = TanhLUTSpec()
     if input_frac is None:
-        input_frac = derive_frac_bits(np.concatenate([train_X.ravel(), eval_X.ravel()]))
+        input_frac = derive_frac_bits(
+            np.concatenate([train_X.ravel(), eval_X.ravel()])
+        )
     if weight_frac is None:
         weight_frac = derive_frac_bits(exe.W_res)
     if ridge_lambda is None:
@@ -124,8 +129,9 @@ def search_quantization(
 
     lo, hi = state_frac_range
     for sf in range(lo, hi + 1):
-        cfg = QuantConfig(state_frac=sf, input_frac=input_frac,
-                            weight_frac=weight_frac)
+        cfg = QuantConfig(
+            state_frac=sf, input_frac=input_frac, weight_frac=weight_frac
+        )
         try:
             # Build a draft model with the old W_out (will be replaced)
             qm = quantize_model(rc, exe, cfg, target=target, lut=lut)
@@ -140,8 +146,12 @@ def search_quantization(
 
             # Re-quantize W_out under the same config
             qm = QuantizedModel(
-                rc=qm.rc, target=qm.target, config=qm.config, lut=qm.lut,
-                W_in_q=qm.W_in_q, W_res_q=qm.W_res_q,
+                rc=qm.rc,
+                target=qm.target,
+                config=qm.config,
+                lut=qm.lut,
+                W_in_q=qm.W_in_q,
+                W_res_q=qm.W_res_q,
                 W_out_q=quantize_W_out(W_out_new, rc, cfg, target),
                 lut_table_q=qm.lut_table_q,
                 state_init_q=qm.state_init_q,
@@ -168,6 +178,12 @@ def search_quantization(
             best_qmodel = qm
 
     if best_cfg is None or best_qmodel is None:
-        raise RuntimeError("No quantization config in the sweep produced a finite MSE")
-    return SearchResult(best_config=best_cfg, best_mse=best_mse,
-                         best_qmodel=best_qmodel, history=history)
+        raise RuntimeError(
+            "No quantization config in the sweep produced a finite MSE"
+        )
+    return SearchResult(
+        best_config=best_cfg,
+        best_mse=best_mse,
+        best_qmodel=best_qmodel,
+        history=history,
+    )

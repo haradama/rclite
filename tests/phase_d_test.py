@@ -1,5 +1,6 @@
 """Tests for Phase D: i16 LLVM lowering, saturating intrinsics, online LMS,
 I8Affine skeleton."""
+
 from __future__ import annotations
 import pathlib
 import sys
@@ -10,16 +11,28 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import numpy as np
 
 from rclite import (
-    InputNode, ReservoirNode, ReadoutNode, ReservoirComputer,
-    Activation, Distribution, Topology, Trainer,
+    InputNode,
+    ReservoirNode,
+    ReadoutNode,
+    ReservoirComputer,
+    Distribution,
+    Topology,
+    Trainer,
 )
 from rclite.runtime import RCExecutor
 from rclite.quant import (
-    QuantConfig, TanhLUTSpec, I32FixedPoint, I16FixedPoint, I8Affine,
-    quantize_model, QuantizedExecutor, IntegerLMSLearner,
+    QuantConfig,
+    TanhLUTSpec,
+    I32FixedPoint,
+    I16FixedPoint,
+    I8Affine,
+    quantize_model,
+    QuantizedExecutor,
+    IntegerLMSLearner,
 )
 from rclite.codegen.llvm import (
-    CompiledQuantizedRC, emit_quantized_module, _ensure_initialized,
+    CompiledQuantizedRC,
+    emit_quantized_module,
 )
 
 
@@ -35,27 +48,51 @@ def expect_raises(exc_type, fn, *args, **kwargs):
     raise AssertionError(f"Expected {exc_type.__name__}, none raised")
 
 
-def _build_for_quant(units=30, topology=Topology.SCR, state_frac=10,
-                      input_frac=8, weight_frac=8, target=None):
+def _build_for_quant(
+    units=30,
+    topology=Topology.SCR,
+    state_frac=10,
+    input_frac=8,
+    weight_frac=8,
+    target=None,
+):
     rc = ReservoirComputer(
-        input=InputNode(units=1, input_offset=0.0, input_scaling=1.0,
-                        input_distribution=Distribution.BERNOULLI, name="in"),
-        reservoir=ReservoirNode(units=units, topology=topology,
-                                 chain_weight=0.9, leak_rate=0.3, seed=42,
-                                 name="res"),
-        readout=ReadoutNode(units=1, trainer=Trainer.RIDGE,
-                             regularization=1e-6, washout=50,
-                             include_bias=True, include_input=True, name="out"),
+        input=InputNode(
+            units=1,
+            input_offset=0.0,
+            input_scaling=1.0,
+            input_distribution=Distribution.BERNOULLI,
+            name="in",
+        ),
+        reservoir=ReservoirNode(
+            units=units,
+            topology=topology,
+            chain_weight=0.9,
+            leak_rate=0.3,
+            seed=42,
+            name="res",
+        ),
+        readout=ReadoutNode(
+            units=1,
+            trainer=Trainer.RIDGE,
+            regularization=1e-6,
+            washout=50,
+            include_bias=True,
+            include_input=True,
+            name="out",
+        ),
     )
     exe = RCExecutor(rc)
     rng = np.random.default_rng(0)
     X = rng.standard_normal((300, 1)) * 0.15
     Y = np.sin(np.arange(300) * 0.1)[:, None]
     exe.fit(X, Y)
-    cfg = QuantConfig(state_frac=state_frac, input_frac=input_frac,
-                       weight_frac=weight_frac)
-    qm = quantize_model(rc, exe, cfg, target=target or I16FixedPoint(),
-                         lut=TanhLUTSpec(n=64))
+    cfg = QuantConfig(
+        state_frac=state_frac, input_frac=input_frac, weight_frac=weight_frac
+    )
+    qm = quantize_model(
+        rc, exe, cfg, target=target or I16FixedPoint(), lut=TanhLUTSpec(n=64)
+    )
     return rc, exe, qm, X
 
 
@@ -103,10 +140,12 @@ def test_i32_and_i16_paths_both_run_and_finite():
     large readout coefficients, so we only assert structural soundness.)"""
     rc, exe, _, X = _build_for_quant(target=I16FixedPoint())
     cfg = QuantConfig(state_frac=10, input_frac=8, weight_frac=8)
-    qm32 = quantize_model(rc, exe, cfg, target=I32FixedPoint(),
-                          lut=TanhLUTSpec(n=64))
-    qm16 = quantize_model(rc, exe, cfg, target=I16FixedPoint(),
-                          lut=TanhLUTSpec(n=64))
+    qm32 = quantize_model(
+        rc, exe, cfg, target=I32FixedPoint(), lut=TanhLUTSpec(n=64)
+    )
+    qm16 = quantize_model(
+        rc, exe, cfg, target=I16FixedPoint(), lut=TanhLUTSpec(n=64)
+    )
     Y32 = CompiledQuantizedRC(qm32).predict(X[100:130])
     Y16 = CompiledQuantizedRC(qm16).predict(X[100:130])
     assert Y32.shape == Y16.shape
@@ -152,8 +191,9 @@ def test_i8_affine_raises_when_used():
     """Skeleton target raises with a pointer to the implementation roadmap."""
     rc, exe, _, _ = _build_for_quant()
     cfg = QuantConfig(state_frac=4, input_frac=2, weight_frac=2)
-    expect_raises(NotImplementedError, quantize_model,
-                   rc, exe, cfg, target=I8Affine())
+    expect_raises(
+        NotImplementedError, quantize_model, rc, exe, cfg, target=I8Affine()
+    )
 
 
 # ---------------------------------------------------------------- online LMS
@@ -168,9 +208,9 @@ def test_lms_predict_returns_correct_shape():
 
 def test_lms_learns_constant_target():
     """LMS should converge a zero-initialized readout to a constant target."""
-    _, _, qm, X = _build_for_quant(target=I32FixedPoint(),
-                                       state_frac=18, input_frac=12,
-                                       weight_frac=12)
+    _, _, qm, X = _build_for_quant(
+        target=I32FixedPoint(), state_frac=18, input_frac=12, weight_frac=12
+    )
     qm.W_out_q[:] = 0
     learner = IntegerLMSLearner(qm, learning_rate=2e-3)
 
@@ -185,14 +225,15 @@ def test_lms_learns_constant_target():
     mse_early = float(np.mean(errs[50:150]))
     mse_late = float(np.mean(errs[-200:]))
     # Late MSE should be substantially better than early
-    assert mse_late < mse_early * 0.5, \
+    assert mse_late < mse_early * 0.5, (
         f"LMS on constant target: early={mse_early:.4e}, late={mse_late:.4e}"
+    )
 
 
 def test_lms_updates_W_out_q_in_place():
-    rc, exe, qm, X = _build_for_quant(target=I32FixedPoint(),
-                                          state_frac=18, input_frac=12,
-                                          weight_frac=12)
+    rc, exe, qm, X = _build_for_quant(
+        target=I32FixedPoint(), state_frac=18, input_frac=12, weight_frac=12
+    )
     before = qm.W_out_q.copy()
     learner = IntegerLMSLearner(qm, learning_rate=1e-2)
     for t in range(10):
@@ -215,14 +256,16 @@ def test_lms_reset_clears_state():
     # Approximately (W_out changed too, but state should be deterministic)
     # Actually W_out changes also affect predictions but not state
     s2 = learner.state_q
-    assert np.allclose(s1, s2, atol=10), "reset + replay should reproduce state"
+    assert np.allclose(s1, s2, atol=10), (
+        "reset + replay should reproduce state"
+    )
 
 
 def test_nlms_learns_constant_target_eta_near_one():
     """Normalized LMS with eta=0.5 (no scale tuning) converges a zero readout."""
-    _, _, qm, X = _build_for_quant(target=I32FixedPoint(),
-                                       state_frac=18, input_frac=12,
-                                       weight_frac=12)
+    _, _, qm, X = _build_for_quant(
+        target=I32FixedPoint(), state_frac=18, input_frac=12, weight_frac=12
+    )
     qm.W_out_q[:] = 0
     learner = IntegerLMSLearner(qm, learning_rate=0.5, normalized=True)
 
@@ -235,21 +278,30 @@ def test_nlms_learns_constant_target_eta_near_one():
 
     mse_early = float(np.mean(errs[20:60]))
     mse_late = float(np.mean(errs[-100:]))
-    assert mse_late < mse_early * 0.25, \
+    assert mse_late < mse_early * 0.25, (
         f"NLMS on constant target: early={mse_early:.4e}, late={mse_late:.4e}"
+    )
 
 
 def test_nlms_requires_norm_fixed_point_headroom():
     """NLMS raises when 2*input_frac < state_frac (squared-norm underflows)."""
-    _, _, qm, _ = _build_for_quant(target=I32FixedPoint(),
-                                       state_frac=18, input_frac=8,
-                                       weight_frac=12)
-    expect_raises(NotImplementedError,
-                  IntegerLMSLearner, qm, learning_rate=0.5, normalized=True)
+    _, _, qm, _ = _build_for_quant(
+        target=I32FixedPoint(), state_frac=18, input_frac=8, weight_frac=12
+    )
+    expect_raises(
+        NotImplementedError,
+        IntegerLMSLearner,
+        qm,
+        learning_rate=0.5,
+        normalized=True,
+    )
 
 
-TESTS = [v for k, v in list(globals().items())
-         if k.startswith("test_") and callable(v)]
+TESTS = [
+    v
+    for k, v in list(globals().items())
+    if k.startswith("test_") and callable(v)
+]
 
 
 def main() -> int:

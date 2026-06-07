@@ -4,6 +4,7 @@ Covers per-step classification (Task.CLASSIFICATION, Aggregation.NONE) and
 sequence-to-label classification (Aggregation.MEAN / LAST), plus the
 one-hot / softmax / argmax plumbing and ReadoutNode validation.
 """
+
 from __future__ import annotations
 import sys
 import pathlib
@@ -14,8 +15,15 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import numpy as np
 
 from rclite import (
-    InputNode, ReservoirNode, ReadoutNode, ReservoirComputer,
-    Activation, Topology, Trainer, Task, Aggregation,
+    InputNode,
+    ReservoirNode,
+    ReadoutNode,
+    ReservoirComputer,
+    Activation,
+    Topology,
+    Trainer,
+    Task,
+    Aggregation,
 )
 from rclite.runtime import RCExecutor
 from rclite.runtime.reference import _softmax, _one_hot
@@ -38,8 +46,13 @@ def expect_raises(exc_type, fn, *args, **kwargs):
 
 def _reservoir(units=80, seed=1):
     return ReservoirNode(
-        units=units, activation=Activation.TANH, spectral_radius=0.9,
-        leak_rate=0.3, density=0.1, topology=Topology.RANDOM, seed=seed,
+        units=units,
+        activation=Activation.TANH,
+        spectral_radius=0.9,
+        leak_rate=0.3,
+        density=0.1,
+        topology=Topology.RANDOM,
+        seed=seed,
         name="reservoir",
     )
 
@@ -65,12 +78,15 @@ def test_softmax_is_shift_invariant():
 def test_one_hot_arbitrary_labels():
     classes = np.array([2, 5, 9])
     Y = _one_hot(np.array([5, 2, 9, 5]), classes)
-    expected = np.array([
-        [0, 1, 0],
-        [1, 0, 0],
-        [0, 0, 1],
-        [0, 1, 0],
-    ], dtype=float)
+    expected = np.array(
+        [
+            [0, 1, 0],
+            [1, 0, 0],
+            [0, 0, 1],
+            [0, 1, 0],
+        ],
+        dtype=float,
+    )
     assert np.array_equal(Y, expected)
 
 
@@ -81,15 +97,21 @@ def test_one_hot_arbitrary_labels():
 def test_classification_requires_two_units():
     expect_raises(
         ValueError,
-        ReadoutNode, units=1, task=Task.CLASSIFICATION, name="ro",
+        ReadoutNode,
+        units=1,
+        task=Task.CLASSIFICATION,
+        name="ro",
     )
 
 
 def test_classification_rejects_online_trainer():
     expect_raises(
         ValueError,
-        ReadoutNode, units=3, task=Task.CLASSIFICATION,
-        trainer=Trainer.RLS, name="ro",
+        ReadoutNode,
+        units=3,
+        task=Task.CLASSIFICATION,
+        trainer=Trainer.RLS,
+        name="ro",
     )
 
 
@@ -115,9 +137,14 @@ def test_per_step_classification_accuracy():
         input=InputNode(units=1, activation=Activation.IDENTITY, name="in"),
         reservoir=_reservoir(seed=3),
         readout=ReadoutNode(
-            units=2, activation=Activation.IDENTITY, trainer=Trainer.RIDGE,
-            regularization=1e-4, washout=100, include_input=True,
-            task=Task.CLASSIFICATION, name="ro",
+            units=2,
+            activation=Activation.IDENTITY,
+            trainer=Trainer.RIDGE,
+            regularization=1e-4,
+            washout=100,
+            include_input=True,
+            task=Task.CLASSIFICATION,
+            name="ro",
         ),
     )
     exe = RCExecutor(rc)
@@ -141,8 +168,11 @@ def test_predict_proba_argmax_matches_predict_classes():
         input=InputNode(units=1, activation=Activation.IDENTITY, name="in"),
         reservoir=_reservoir(seed=5),
         readout=ReadoutNode(
-            units=2, activation=Activation.IDENTITY, task=Task.CLASSIFICATION,
-            regularization=1e-4, name="ro",
+            units=2,
+            activation=Activation.IDENTITY,
+            task=Task.CLASSIFICATION,
+            regularization=1e-4,
+            name="ro",
         ),
     )
     exe = RCExecutor(rc)
@@ -157,7 +187,9 @@ def test_predict_proba_requires_classification_task():
     rc = ReservoirComputer(
         input=InputNode(units=1, activation=Activation.IDENTITY, name="in"),
         reservoir=_reservoir(),
-        readout=ReadoutNode(units=1, activation=Activation.IDENTITY, name="ro"),
+        readout=ReadoutNode(
+            units=1, activation=Activation.IDENTITY, name="ro"
+        ),
     )
     exe = RCExecutor(rc)
     exe.fit(X, X)  # regression
@@ -172,11 +204,11 @@ def _make_waveform(kind, length, rng):
     """Three trend classes a leaky reservoir separates by temporal integration:
     rising ramp / falling ramp / triangle (up then down)."""
     t = np.linspace(0.0, 1.0, length)
-    if kind == 0:           # rising ramp
+    if kind == 0:  # rising ramp
         s = -1.0 + 2.0 * t
-    elif kind == 1:         # falling ramp
+    elif kind == 1:  # falling ramp
         s = 1.0 - 2.0 * t
-    else:                   # triangle: rise then fall
+    else:  # triangle: rise then fall
         s = 1.0 - 4.0 * np.abs(t - 0.5)
     s = s + 0.05 * rng.standard_normal(length)
     return s[:, None]
@@ -201,9 +233,14 @@ def _run_sequence_classification(aggregation):
         input=InputNode(units=1, activation=Activation.IDENTITY, name="in"),
         reservoir=_reservoir(units=120, seed=9),
         readout=ReadoutNode(
-            units=3, activation=Activation.IDENTITY, trainer=Trainer.RIDGE,
-            regularization=1e-3, washout=10, task=Task.CLASSIFICATION,
-            aggregation=aggregation, name="ro",
+            units=3,
+            activation=Activation.IDENTITY,
+            trainer=Trainer.RIDGE,
+            regularization=1e-3,
+            washout=10,
+            task=Task.CLASSIFICATION,
+            aggregation=aggregation,
+            name="ro",
         ),
     )
     exe = RCExecutor(rc)
@@ -236,8 +273,11 @@ def test_fit_sequences_requires_aggregation():
         input=InputNode(units=1, activation=Activation.IDENTITY, name="in"),
         reservoir=_reservoir(),
         readout=ReadoutNode(
-            units=3, activation=Activation.IDENTITY, task=Task.CLASSIFICATION,
-            aggregation=Aggregation.NONE, name="ro",
+            units=3,
+            activation=Activation.IDENTITY,
+            task=Task.CLASSIFICATION,
+            aggregation=Aggregation.NONE,
+            name="ro",
         ),
     )
     exe = RCExecutor(rc)
@@ -253,9 +293,14 @@ def test_sequence_regression_returns_scores():
         input=InputNode(units=1, activation=Activation.IDENTITY, name="in"),
         reservoir=_reservoir(seed=4),
         readout=ReadoutNode(
-            units=1, activation=Activation.IDENTITY, trainer=Trainer.RIDGE,
-            regularization=1e-4, washout=5, task=Task.REGRESSION,
-            aggregation=Aggregation.MEAN, name="ro",
+            units=1,
+            activation=Activation.IDENTITY,
+            trainer=Trainer.RIDGE,
+            regularization=1e-4,
+            washout=5,
+            task=Task.REGRESSION,
+            aggregation=Aggregation.MEAN,
+            name="ro",
         ),
     )
     exe = RCExecutor(rc)
@@ -264,8 +309,11 @@ def test_sequence_regression_returns_scores():
     assert out.shape == (20, 1)
 
 
-TESTS = [v for k, v in list(globals().items())
-         if k.startswith("test_") and callable(v)]
+TESTS = [
+    v
+    for k, v in list(globals().items())
+    if k.startswith("test_") and callable(v)
+]
 
 
 def main() -> int:

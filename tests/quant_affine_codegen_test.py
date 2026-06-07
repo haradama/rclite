@@ -4,6 +4,7 @@ Verifies bit-exact parity between the Python `AffineQuantizedExecutor`
 and the JIT kernel emitted by `_AffineLowerer`, across storage widths,
 topologies, and readout configurations.
 """
+
 from __future__ import annotations
 import pathlib
 import sys
@@ -14,16 +15,25 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import numpy as np
 
 from rclite import (
-    InputNode, ReservoirNode, ReadoutNode, ReservoirComputer,
-    Activation, Distribution, Topology, Trainer,
+    InputNode,
+    ReservoirNode,
+    ReadoutNode,
+    ReservoirComputer,
+    Distribution,
+    Topology,
+    Trainer,
 )
 from rclite.runtime import RCExecutor
 from rclite.quant import (
-    calibrate_from_data, quantize_model_affine, AffineQuantizedExecutor,
-    quantize_multiplier, build_ir_from_quantized_affine,
+    calibrate_from_data,
+    quantize_model_affine,
+    AffineQuantizedExecutor,
+    quantize_multiplier,
+    build_ir_from_quantized_affine,
 )
 from rclite.quant.affine.multiplier import (
-    apply_multiplier_scalar, apply_multiplier_array,
+    apply_multiplier_scalar,
+    apply_multiplier_array,
 )
 from rclite.codegen.llvm import CompiledAffineRC, emit_quantized_affine_module
 
@@ -40,26 +50,48 @@ def expect_raises(exc_type, fn, *args, **kwargs):
     raise AssertionError(f"Expected {exc_type.__name__}, none raised")
 
 
-def _build_and_quant(storage_bits=8, units=20, topology=Topology.SCR,
-                       include_bias=True, include_input=True, T=300, seed=0,
-                       lut_strategy=None):
+def _build_and_quant(
+    storage_bits=8,
+    units=20,
+    topology=Topology.SCR,
+    include_bias=True,
+    include_input=True,
+    T=300,
+    seed=0,
+    lut_strategy=None,
+):
     rc = ReservoirComputer(
-        input=InputNode(units=1, input_offset=0.0, input_scaling=1.0,
-                        input_distribution=Distribution.BERNOULLI, name="in"),
-        reservoir=ReservoirNode(units=units, topology=topology,
-                                 chain_weight=0.9, leak_rate=0.3, seed=42,
-                                 name="res"),
-        readout=ReadoutNode(units=1, trainer=Trainer.RIDGE,
-                             regularization=1e-6, washout=40,
-                             include_bias=include_bias,
-                             include_input=include_input, name="out"),
+        input=InputNode(
+            units=1,
+            input_offset=0.0,
+            input_scaling=1.0,
+            input_distribution=Distribution.BERNOULLI,
+            name="in",
+        ),
+        reservoir=ReservoirNode(
+            units=units,
+            topology=topology,
+            chain_weight=0.9,
+            leak_rate=0.3,
+            seed=42,
+            name="res",
+        ),
+        readout=ReadoutNode(
+            units=1,
+            trainer=Trainer.RIDGE,
+            regularization=1e-6,
+            washout=40,
+            include_bias=include_bias,
+            include_input=include_input,
+            name="out",
+        ),
     )
     exe = RCExecutor(rc)
     rng = np.random.default_rng(seed)
     X = rng.standard_normal((T, 1)) * 0.15
     Y = np.sin(np.arange(T) * 0.1)[:, None]
-    exe.fit(X[:T - 40], Y[:T - 40])
-    cfg = calibrate_from_data(rc, exe, X[:T - 40], storage_bits=storage_bits)
+    exe.fit(X[: T - 40], Y[: T - 40])
+    cfg = calibrate_from_data(rc, exe, X[: T - 40], storage_bits=storage_bits)
     qm = quantize_model_affine(rc, exe, cfg)
     return rc, exe, qm, X
 
@@ -85,8 +117,9 @@ def test_quantize_multiplier_M0_in_normalized_range():
     """For any positive M, M0 should land in [2^30, 2^31)."""
     for M in (1e-6, 1e-3, 0.3, 0.5, 1.0, 1.5, 100.0, 1e6):
         M0, n = quantize_multiplier(M)
-        assert (1 << 30) <= M0 < (1 << 31), \
+        assert (1 << 30) <= M0 < (1 << 31), (
             f"M={M}: M0={M0} not in [2^30, 2^31)"
+        )
 
 
 def test_quantize_multiplier_reproduces_value():
@@ -105,8 +138,9 @@ def test_apply_multiplier_scalar_and_array_match():
     arr_res = apply_multiplier_array(xs.astype(np.int32), M0, n)
     for i, x in enumerate(xs.tolist()):
         scalar = apply_multiplier_scalar(int(x), M0, n)
-        assert int(arr_res[i]) == scalar, \
+        assert int(arr_res[i]) == scalar, (
             f"x={x}: array={arr_res[i]} scalar={scalar}"
+        )
 
 
 # ---------------------------------------------------------------- IR builder
@@ -120,11 +154,22 @@ def test_build_ir_metadata_present():
     assert md["dtype"] == "i8"
     assert md["storage_bits"] == 8
     # Affine-specific metadata
-    for key in ("zp_input", "zp_state", "zp_pre", "zp_output",
-                  "lut_offset", "bias_pre",
-                  "M_in_M0", "M_in_n", "M_res_M0", "M_res_n",
-                  "leak_M0", "leak_n",
-                  "M_out_state_M0", "M_out_state_n"):
+    for key in (
+        "zp_input",
+        "zp_state",
+        "zp_pre",
+        "zp_output",
+        "lut_offset",
+        "bias_pre",
+        "M_in_M0",
+        "M_in_n",
+        "M_res_M0",
+        "M_res_n",
+        "leak_M0",
+        "leak_n",
+        "M_out_state_M0",
+        "M_out_state_n",
+    ):
         assert key in md, f"missing metadata key: {key}"
 
 
@@ -133,12 +178,20 @@ def test_build_ir_weights_include_row_sums():
     # IR globals; structured topologies (the default in _build_and_quant)
     # now intentionally skip emitting W_res — see
     # `test_structured_topology_omits_W_res_global` in quant_affine_lut_test.
-    _, _, qm, _ = _build_and_quant(include_bias=True, include_input=True,
-                                       topology=Topology.ESN_STANDARD)
+    _, _, qm, _ = _build_and_quant(
+        include_bias=True, include_input=True, topology=Topology.ESN_STANDARD
+    )
     mod = build_ir_from_quantized_affine(qm)
-    for name in ("W_in", "W_res", "W_out", "lut_table",
-                  "row_sum_W_in", "row_sum_W_res",
-                  "row_sum_Wout_state", "row_sum_Wout_input"):
+    for name in (
+        "W_in",
+        "W_res",
+        "W_out",
+        "lut_table",
+        "row_sum_W_in",
+        "row_sum_W_res",
+        "row_sum_Wout_state",
+        "row_sum_Wout_input",
+    ):
         assert name in mod.weights, f"missing weight: {name}"
 
 
@@ -146,14 +199,25 @@ def test_build_ir_supports_nontrivial_preprocess():
     """offset != 0 or scaling != 1 used to raise NotImplementedError; now we
     emit a PreprocessInput op + integer preprocess metadata instead."""
     from rclite.ir.ops import PreprocessInput, TimeLoop
+
     rc = ReservoirComputer(
-        input=InputNode(units=1, input_offset=0.5, input_scaling=1.0,
-                        input_distribution=Distribution.BERNOULLI),
-        reservoir=ReservoirNode(units=10, topology=Topology.SCR,
-                                 chain_weight=0.9, leak_rate=0.3),
-        readout=ReadoutNode(units=1, trainer=Trainer.RIDGE,
-                             regularization=1e-6, washout=20,
-                             include_bias=True, include_input=True),
+        input=InputNode(
+            units=1,
+            input_offset=0.5,
+            input_scaling=1.0,
+            input_distribution=Distribution.BERNOULLI,
+        ),
+        reservoir=ReservoirNode(
+            units=10, topology=Topology.SCR, chain_weight=0.9, leak_rate=0.3
+        ),
+        readout=ReadoutNode(
+            units=1,
+            trainer=Trainer.RIDGE,
+            regularization=1e-6,
+            washout=20,
+            include_bias=True,
+            include_input=True,
+        ),
     )
     exe = RCExecutor(rc)
     rng = np.random.default_rng(0)
@@ -171,7 +235,9 @@ def test_build_ir_supports_nontrivial_preprocess():
             for body_op in op.body:
                 if isinstance(body_op, PreprocessInput):
                     found = True
-    assert found, "PreprocessInput op missing from IR for non-trivial preprocess"
+    assert found, (
+        "PreprocessInput op missing from IR for non-trivial preprocess"
+    )
     assert mod.metadata["has_integer_preprocess"] is True
     assert mod.metadata["pre_M0"] != 0
 
@@ -208,7 +274,9 @@ def test_parity_i8_scr():
 
 
 def test_parity_i8_dense():
-    _, _, qm, X = _build_and_quant(storage_bits=8, topology=Topology.ESN_STANDARD)
+    _, _, qm, X = _build_and_quant(
+        storage_bits=8, topology=Topology.ESN_STANDARD
+    )
     _assert_jit_python_parity(qm, X[200:230])
 
 
@@ -228,7 +296,9 @@ def test_parity_i16_scr():
 
 
 def test_parity_i16_dense():
-    _, _, qm, X = _build_and_quant(storage_bits=16, topology=Topology.ESN_STANDARD)
+    _, _, qm, X = _build_and_quant(
+        storage_bits=16, topology=Topology.ESN_STANDARD
+    )
     _assert_jit_python_parity(qm, X[200:230])
 
 
@@ -258,8 +328,9 @@ def test_parity_across_seeds_i8():
 
 def test_parity_across_seeds_i16():
     for seed in (0, 1, 2, 3):
-        _, _, qm, X = _build_and_quant(seed=seed, units=30, T=400,
-                                          storage_bits=16)
+        _, _, qm, X = _build_and_quant(
+            seed=seed, units=30, T=400, storage_bits=16
+        )
         _assert_jit_python_parity(qm, X[300:330])
 
 
@@ -271,55 +342,87 @@ def test_parity_mixed_precision_i8_state_i16_wout():
     between the Python reference and the JIT kernel."""
     for topology in (Topology.SCR, Topology.ESN_STANDARD):
         rc = ReservoirComputer(
-            input=InputNode(units=1, input_offset=0.0, input_scaling=1.0,
-                            input_distribution=Distribution.BERNOULLI),
-            reservoir=ReservoirNode(units=24, topology=topology,
-                                     chain_weight=0.9, leak_rate=0.3, seed=42),
-            readout=ReadoutNode(units=1, trainer=Trainer.RIDGE,
-                                 regularization=1e-6, washout=40,
-                                 include_bias=True, include_input=True),
+            input=InputNode(
+                units=1,
+                input_offset=0.0,
+                input_scaling=1.0,
+                input_distribution=Distribution.BERNOULLI,
+            ),
+            reservoir=ReservoirNode(
+                units=24,
+                topology=topology,
+                chain_weight=0.9,
+                leak_rate=0.3,
+                seed=42,
+            ),
+            readout=ReadoutNode(
+                units=1,
+                trainer=Trainer.RIDGE,
+                regularization=1e-6,
+                washout=40,
+                include_bias=True,
+                include_input=True,
+            ),
         )
         exe = RCExecutor(rc)
         rng = np.random.default_rng(0)
         X = rng.standard_normal((300, 1)) * 0.15
         Y = np.sin(np.arange(300) * 0.1)[:, None]
         exe.fit(X[:260], Y[:260])
-        cfg = calibrate_from_data(rc, exe, X[:260], storage_bits=8,
-                                    w_out_storage_bits=16)
+        cfg = calibrate_from_data(
+            rc, exe, X[:260], storage_bits=8, w_out_storage_bits=16
+        )
         qm = quantize_model_affine(rc, exe, cfg)
         assert qm.W_out_q.dtype == np.int16
         assert qm.W_in_q.dtype == np.int8
         Y_jit = CompiledAffineRC(qm).predict(X[200:230])
         Y_py = AffineQuantizedExecutor(qm).predict(X[200:230])
         diff = float(np.max(np.abs(Y_jit - Y_py)))
-        assert diff == 0.0, f"{topology.name} mixed-prec: JIT vs Py diff = {diff}"
+        assert diff == 0.0, (
+            f"{topology.name} mixed-prec: JIT vs Py diff = {diff}"
+        )
 
 
 def test_mixed_precision_ir_emits_i16_wout_global():
     """The W_out global should be i16 while X/Y pointers stay i8."""
     rc = ReservoirComputer(
-        input=InputNode(units=1, input_offset=0.0, input_scaling=1.0,
-                        input_distribution=Distribution.BERNOULLI),
-        reservoir=ReservoirNode(units=20, topology=Topology.SCR,
-                                 chain_weight=0.9, leak_rate=0.3, seed=42),
-        readout=ReadoutNode(units=1, trainer=Trainer.RIDGE,
-                             regularization=1e-6, washout=40,
-                             include_bias=True, include_input=True),
+        input=InputNode(
+            units=1,
+            input_offset=0.0,
+            input_scaling=1.0,
+            input_distribution=Distribution.BERNOULLI,
+        ),
+        reservoir=ReservoirNode(
+            units=20,
+            topology=Topology.SCR,
+            chain_weight=0.9,
+            leak_rate=0.3,
+            seed=42,
+        ),
+        readout=ReadoutNode(
+            units=1,
+            trainer=Trainer.RIDGE,
+            regularization=1e-6,
+            washout=40,
+            include_bias=True,
+            include_input=True,
+        ),
     )
     exe = RCExecutor(rc)
     rng = np.random.default_rng(0)
     X = rng.standard_normal((200, 1)) * 0.15
     Y = np.sin(np.arange(200) * 0.1)[:, None]
     exe.fit(X[:160], Y[:160])
-    cfg = calibrate_from_data(rc, exe, X[:160], storage_bits=8,
-                                w_out_storage_bits=16)
+    cfg = calibrate_from_data(
+        rc, exe, X[:160], storage_bits=8, w_out_storage_bits=16
+    )
     qm = quantize_model_affine(rc, exe, cfg)
     ir_text = str(emit_quantized_affine_module(qm))
     # W_out global is i16; kernel signature (X/Y) is i8*
     assert "i8*" in ir_text
     # llvmlite quotes global names: @"W_out" = internal constant [F x i16] ...
     assert '@"W_out" = internal constant' in ir_text
-    assert "x i16]" in ir_text   # W_out array element type is i16
+    assert "x i16]" in ir_text  # W_out array element type is i16
 
 
 def test_compiled_affine_ir_text_property():
@@ -345,8 +448,11 @@ def test_storage_bits_16_uses_i64_accumulator():
     assert "alloca i64" in ir_text
 
 
-TESTS = [v for k, v in list(globals().items())
-         if k.startswith("test_") and callable(v)]
+TESTS = [
+    v
+    for k, v in list(globals().items())
+    if k.startswith("test_") and callable(v)
+]
 
 
 def main() -> int:

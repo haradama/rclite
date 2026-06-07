@@ -1,6 +1,7 @@
 """SysML v2: package RC::Constraints"""
+
 from __future__ import annotations
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, List, Optional, Protocol, runtime_checkable
 
 from rclite.core.blocks import ReservoirNode
@@ -18,6 +19,7 @@ class ESPChecker(Protocol):
     Implemented by `rc_idl.verification.InputDrivenESPCheck`. Kept as a
     Protocol so that this module stays free of numpy / runtime imports.
     """
+
     def violations(self) -> List[str]: ...
 
 
@@ -61,6 +63,7 @@ class WellPosedReservoir:
     operating trajectory is shown to be contractive. Range checks on
     leak_rate and density always apply.
     """
+
     subject: ReservoirNode
     empirical_check: Optional[Any] = None  # ESPChecker
 

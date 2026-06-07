@@ -8,6 +8,7 @@ per-step predictions AND the final learned readout are **bit-identical**
 structured (SCR) / CSR-sparse W_res. This is the firmware-descent half of the
 ROADMAP "RLS/LMS の C/firmware 降下 + オンライン更新の bit-exact 検証" item.
 """
+
 from __future__ import annotations
 import pathlib
 import shutil
@@ -21,13 +22,21 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import numpy as np
 
 from rclite import (
-    InputNode, ReservoirNode, ReadoutNode, ReservoirComputer,
-    Activation, Topology, Trainer,
+    InputNode,
+    ReservoirNode,
+    ReadoutNode,
+    ReservoirComputer,
+    Topology,
+    Trainer,
 )
 from rclite.runtime import RCExecutor
 from rclite.quant import (
-    QuantConfig, TanhLUTSpec, I32FixedPoint, I16FixedPoint,
-    quantize_model, IntegerLMSLearner,
+    QuantConfig,
+    TanhLUTSpec,
+    I32FixedPoint,
+    I16FixedPoint,
+    quantize_model,
+    IntegerLMSLearner,
 )
 from rclite.export.c_kernel_symmetric import emit_symmetric_online_kernel_c
 
@@ -39,14 +48,27 @@ HAVE_GCC = shutil.which("gcc") is not None
 
 def _model(topology=Topology.ESN_STANDARD, units=24, density=0.2, seed=7):
     rc = ReservoirComputer(
-        input=InputNode(units=1, input_offset=0.0, input_scaling=1.0,
-                        name="in"),
-        reservoir=ReservoirNode(units=units, topology=topology,
-                                chain_weight=0.9, leak_rate=0.3,
-                                density=density, seed=seed, name="res"),
-        readout=ReadoutNode(units=1, trainer=Trainer.RIDGE,
-                            regularization=1e-6, washout=40,
-                            include_bias=True, include_input=True, name="out"),
+        input=InputNode(
+            units=1, input_offset=0.0, input_scaling=1.0, name="in"
+        ),
+        reservoir=ReservoirNode(
+            units=units,
+            topology=topology,
+            chain_weight=0.9,
+            leak_rate=0.3,
+            density=density,
+            seed=seed,
+            name="res",
+        ),
+        readout=ReadoutNode(
+            units=1,
+            trainer=Trainer.RIDGE,
+            regularization=1e-6,
+            washout=40,
+            include_bias=True,
+            include_input=True,
+            name="out",
+        ),
     )
     exe = RCExecutor(rc)
     rng = np.random.default_rng(seed)
@@ -63,8 +85,9 @@ def _python_reference(qm, X, Y, lr, warmup, *, normalized=False, delta=1.0):
     quantized inputs / targets / predictions so the C kernel can be fed the
     exact same integer stream.
     """
-    learner = IntegerLMSLearner(qm, learning_rate=lr,
-                                normalized=normalized, delta=delta)
+    learner = IntegerLMSLearner(
+        qm, learning_rate=lr, normalized=normalized, delta=delta
+    )
     exe = learner._executor
     cfg = learner.cfg
     target = learner.target
@@ -78,22 +101,25 @@ def _python_reference(qm, X, Y, lr, warmup, *, normalized=False, delta=1.0):
         state_q = exe.state_q
         y_pred_q = exe.predict_one_q(u_q, state_q).astype(np.int32)
         if t < warmup:
-            y_target_q = np.zeros(M, dtype=np.int32)   # unused (no update)
+            y_target_q = np.zeros(M, dtype=np.int32)  # unused (no update)
             warm_flags.append(1)
         else:
             y_target_q = np.array(
                 [target.quantize_state(float(v), cfg) for v in Y[t]],
-                dtype=np.int32)
+                dtype=np.int32,
+            )
             error_q = y_target_q.astype(np.int64) - y_pred_q.astype(np.int64)
             learner._apply_lms_update(error_q, u_q, state_q)
             warm_flags.append(0)
         u_stream.append(u_q)
         yt_stream.append(y_target_q)
         yp_stream.append(y_pred_q)
-    return (np.array(u_stream, dtype=np.int64),
-            np.array(yt_stream, dtype=np.int64),
-            np.array(yp_stream, dtype=np.int64),
-            np.array(warm_flags, dtype=np.int64))
+    return (
+        np.array(u_stream, dtype=np.int64),
+        np.array(yt_stream, dtype=np.int64),
+        np.array(yp_stream, dtype=np.int64),
+        np.array(warm_flags, dtype=np.int64),
+    )
 
 
 def _run_c(kernel_src, u_stream, yt_stream, warm_flags, T, K, M, F, ctype):
@@ -121,30 +147,49 @@ def _run_c(kernel_src, u_stream, yt_stream, warm_flags, T, K, M, F, ctype):
             f"  for (t = 0; t < {T}; t++) {{\n"
             f"    if (W[t]) rc_infer_step(&U[t*{K}], yp);\n"
             f"    else rc_train_step(&U[t*{K}], &YT[t*{M}], yp);\n"
-            f"    for (m = 0; m < {M}; m++) printf(\"%d\\n\", (int)yp[m]);\n"
+            f'    for (m = 0; m < {M}; m++) printf("%d\\n", (int)yp[m]);\n'
             "  }\n"
             f"  rc_export_W_out(Wout);\n"
-            f"  for (i = 0; i < {M * F}; i++) printf(\"%d\\n\", (int)Wout[i]);\n"
+            f'  for (i = 0; i < {M * F}; i++) printf("%d\\n", (int)Wout[i]);\n'
             "  return 0;\n}\n"
         )
         (td / "main.c").write_text(main)
         exe_path = td / "a.out"
         r = subprocess.run(
-            ["gcc", "-O2", "-std=c99", "-o", str(exe_path),
-             str(td / "main.c"), str(td / "kernel.c")],
-            capture_output=True, text=True)
+            [
+                "gcc",
+                "-O2",
+                "-std=c99",
+                "-o",
+                str(exe_path),
+                str(td / "main.c"),
+                str(td / "kernel.c"),
+            ],
+            capture_output=True,
+            text=True,
+        )
         if r.returncode != 0:
             raise RuntimeError("gcc failed:\n" + r.stderr)
-        out = subprocess.run([str(exe_path)], capture_output=True,
-                             text=True).stdout
+        out = subprocess.run(
+            [str(exe_path)], capture_output=True, text=True
+        ).stdout
         vals = [int(v) for v in out.strip().split("\n")]
-        preds = np.array(vals[:T * M], dtype=np.int64).reshape(T, M)
-        final_w = np.array(vals[T * M:], dtype=np.int64).reshape(M, F)
+        preds = np.array(vals[: T * M], dtype=np.int64).reshape(T, M)
+        final_w = np.array(vals[T * M :], dtype=np.int64).reshape(M, F)
         return preds, final_w
 
 
-def _check(topology, *, sparse=None, lr=1e-2, warmup=20,
-           target=None, cfg=None, normalized=False, delta=1.0):
+def _check(
+    topology,
+    *,
+    sparse=None,
+    lr=1e-2,
+    warmup=20,
+    target=None,
+    cfg=None,
+    normalized=False,
+    delta=1.0,
+):
     if not HAVE_GCC:
         print("  (skip: gcc not on PATH)")
         return
@@ -155,22 +200,28 @@ def _check(topology, *, sparse=None, lr=1e-2, warmup=20,
 
     # Generate C from the INITIAL weights before the reference mutates them.
     kernel_src = emit_symmetric_online_kernel_c(
-        qm, lr, normalized=normalized, delta=delta, sparse=sparse)
+        qm, lr, normalized=normalized, delta=delta, sparse=sparse
+    )
 
     T, K, M, F = X.shape[0], qm.K, qm.M, qm.F
     u_stream, yt_stream, yp_ref, warm = _python_reference(
-        qm, X, Y, lr, warmup, normalized=normalized, delta=delta)
+        qm, X, Y, lr, warmup, normalized=normalized, delta=delta
+    )
     w_ref = np.asarray(qm.W_out_q, dtype=np.int64)
 
     ctype = {8: "int8_t", 16: "int16_t", 32: "int32_t"}[qm.target.storage_bits]
-    yp_c, w_c = _run_c(kernel_src, u_stream, yt_stream, warm, T, K, M, F, ctype)
+    yp_c, w_c = _run_c(
+        kernel_src, u_stream, yt_stream, warm, T, K, M, F, ctype
+    )
 
     assert np.array_equal(yp_c, yp_ref), (
         f"per-step predictions diverged (topology={topology.name}, "
-        f"sparse={sparse}): max|Δ|={np.max(np.abs(yp_c - yp_ref))}")
+        f"sparse={sparse}): max|Δ|={np.max(np.abs(yp_c - yp_ref))}"
+    )
     assert np.array_equal(w_c, w_ref), (
         f"final W_out diverged (topology={topology.name}, sparse={sparse}): "
-        f"max|Δ|={np.max(np.abs(w_c - w_ref))}")
+        f"max|Δ|={np.max(np.abs(w_c - w_ref))}"
+    )
     # Sanity: learning actually moved the readout.
     assert not np.array_equal(w_ref, np.asarray(qm.W_out_q)) or True
 
@@ -193,14 +244,20 @@ def test_online_lms_c_i16_bit_exact():
     A deliberately large learning rate drives updates past the i16 range so
     the saturating-add path is exercised; C must still match the reference
     bit-for-bit (both saturate to [-32768, 32767])."""
-    _check(Topology.ESN_STANDARD, target=I16FixedPoint(),
-           cfg=QuantConfig(state_frac=10, input_frac=8, weight_frac=8),
-           lr=5e-2)
+    _check(
+        Topology.ESN_STANDARD,
+        target=I16FixedPoint(),
+        cfg=QuantConfig(state_frac=10, input_frac=8, weight_frac=8),
+        lr=5e-2,
+    )
 
 
 def test_online_lms_c_i16_structured_bit_exact():
-    _check(Topology.SCR, target=I16FixedPoint(),
-           cfg=QuantConfig(state_frac=10, input_frac=8, weight_frac=8))
+    _check(
+        Topology.SCR,
+        target=I16FixedPoint(),
+        cfg=QuantConfig(state_frac=10, input_frac=8, weight_frac=8),
+    )
 
 
 def test_online_nlms_c_dense_bit_exact():
@@ -217,9 +274,13 @@ def test_online_nlms_c_sparse_bit_exact():
 
 
 def test_online_nlms_c_i16_bit_exact():
-    _check(Topology.ESN_STANDARD, target=I16FixedPoint(),
-           cfg=QuantConfig(state_frac=10, input_frac=8, weight_frac=8),
-           normalized=True, lr=0.5)
+    _check(
+        Topology.ESN_STANDARD,
+        target=I16FixedPoint(),
+        cfg=QuantConfig(state_frac=10, input_frac=8, weight_frac=8),
+        normalized=True,
+        lr=0.5,
+    )
 
 
 def test_online_nlms_converges_faster_than_lms():
@@ -229,8 +290,9 @@ def test_online_nlms_converges_faster_than_lms():
         return
     rc, exe, X, _ = _model(topology=Topology.ESN_STANDARD)
     cfg = QuantConfig(state_frac=18, input_frac=12, weight_frac=12)
-    qm = quantize_model(rc, exe, cfg, target=I32FixedPoint(),
-                        lut=TanhLUTSpec(n=64))
+    qm = quantize_model(
+        rc, exe, cfg, target=I32FixedPoint(), lut=TanhLUTSpec(n=64)
+    )
     qm.W_out_q[:] = 0
     lr = 0.5
     kernel_src = emit_symmetric_online_kernel_c(qm, lr, normalized=True)
@@ -239,14 +301,17 @@ def test_online_nlms_converges_faster_than_lms():
     Xrep = np.array([X[t % X.shape[0]] for t in range(Tn)])
     Yrep = np.full((Tn, 1), target_val)
     u_stream, yt_stream, yp_ref, warm = _python_reference(
-        qm, Xrep, Yrep, lr, warmup=0, normalized=True)
-    yp_c, _ = _run_c(kernel_src, u_stream, yt_stream, warm,
-                     Tn, qm.K, qm.M, qm.F, "int32_t")
+        qm, Xrep, Yrep, lr, warmup=0, normalized=True
+    )
+    yp_c, _ = _run_c(
+        kernel_src, u_stream, yt_stream, warm, Tn, qm.K, qm.M, qm.F, "int32_t"
+    )
     pred_f = yp_c[:, 0].astype(np.float64) / cfg.state_scale
     mse_early = float(np.mean((pred_f[20:60] - target_val) ** 2))
     mse_late = float(np.mean((pred_f[-100:] - target_val) ** 2))
-    assert mse_late < mse_early * 0.25, \
+    assert mse_late < mse_early * 0.25, (
         f"NLMS on constant target: early={mse_early:.4e}, late={mse_late:.4e}"
+    )
 
 
 def test_online_lms_c_learns_constant_target():
@@ -256,8 +321,9 @@ def test_online_lms_c_learns_constant_target():
         return
     rc, exe, X, _ = _model(topology=Topology.ESN_STANDARD)
     cfg = QuantConfig(state_frac=18, input_frac=12, weight_frac=12)
-    qm = quantize_model(rc, exe, cfg, target=I32FixedPoint(),
-                        lut=TanhLUTSpec(n=64))
+    qm = quantize_model(
+        rc, exe, cfg, target=I32FixedPoint(), lut=TanhLUTSpec(n=64)
+    )
     qm.W_out_q[:] = 0
     lr = 2e-3
     kernel_src = emit_symmetric_online_kernel_c(qm, lr)
@@ -266,15 +332,18 @@ def test_online_lms_c_learns_constant_target():
     Xrep = np.array([X[t % X.shape[0]] for t in range(Tn)])
     Yrep = np.full((Tn, 1), target_val)
     u_stream, yt_stream, yp_ref, warm = _python_reference(
-        qm, Xrep, Yrep, lr, warmup=0)
+        qm, Xrep, Yrep, lr, warmup=0
+    )
     ctype = "int32_t"
-    yp_c, _ = _run_c(kernel_src, u_stream, yt_stream, warm,
-                     Tn, qm.K, qm.M, qm.F, ctype)
+    yp_c, _ = _run_c(
+        kernel_src, u_stream, yt_stream, warm, Tn, qm.K, qm.M, qm.F, ctype
+    )
     pred_f = yp_c[:, 0].astype(np.float64) / cfg.state_scale
     mse_early = float(np.mean((pred_f[50:150] - target_val) ** 2))
     mse_late = float(np.mean((pred_f[-200:] - target_val) ** 2))
-    assert mse_late < mse_early * 0.5, \
+    assert mse_late < mse_early * 0.5, (
         f"C online LMS on constant target: early={mse_early:.4e}, late={mse_late:.4e}"
+    )
 
 
 TESTS = [

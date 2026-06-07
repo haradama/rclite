@@ -1,4 +1,5 @@
 """Numpy-dependent tests for the runtime + verification modules."""
+
 from __future__ import annotations
 import sys
 import pathlib
@@ -9,12 +10,19 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import numpy as np
 
 from rclite import (
-    InputNode, ReservoirNode, ReadoutNode, ReservoirComputer,
-    WellPosedReservoir, ConstraintViolation,
-    Activation, Distribution, Topology, Trainer,
+    InputNode,
+    ReservoirNode,
+    ReadoutNode,
+    ReservoirComputer,
+    WellPosedReservoir,
+    ConstraintViolation,
+    Activation,
+    Distribution,
+    Topology,
+    Trainer,
 )
 from rclite.runtime import (
-    RCExecutor, RLSTrainer, LMSTrainer, FORCETrainer,
+    RCExecutor,
 )
 from rclite.verification import (
     InputDrivenESPCheck,
@@ -43,7 +51,9 @@ def _sample_series(n=1500):
     rng = np.random.default_rng(0)
     x = np.zeros(n + 100)
     for t in range(18, n + 100):
-        x[t] = x[t - 1] + 0.2 * x[t - 17] / (1 + x[t - 17] ** 10) - 0.1 * x[t - 1]
+        x[t] = (
+            x[t - 1] + 0.2 * x[t - 17] / (1 + x[t - 17] ** 10) - 0.1 * x[t - 1]
+        )
         if t < 30:
             x[t] = 1.2 + 0.05 * rng.standard_normal()
     return x[100:]
@@ -51,15 +61,32 @@ def _sample_series(n=1500):
 
 def _build(sr: float, leak: float = 0.3, seed: int = 42, units: int = 200):
     return ReservoirComputer(
-        input=InputNode(units=1, activation=Activation.IDENTITY,
-                        input_scaling=1.0, input_offset=0.9, name="in"),
-        reservoir=ReservoirNode(units=units, activation=Activation.TANH,
-                                spectral_radius=sr, leak_rate=leak,
-                                density=0.05, seed=seed, name="res"),
-        readout=ReadoutNode(units=1, activation=Activation.IDENTITY,
-                            trainer=Trainer.RIDGE, regularization=1e-6,
-                            washout=200, include_bias=True, include_input=True,
-                            name="out"),
+        input=InputNode(
+            units=1,
+            activation=Activation.IDENTITY,
+            input_scaling=1.0,
+            input_offset=0.9,
+            name="in",
+        ),
+        reservoir=ReservoirNode(
+            units=units,
+            activation=Activation.TANH,
+            spectral_radius=sr,
+            leak_rate=leak,
+            density=0.05,
+            seed=seed,
+            name="res",
+        ),
+        readout=ReadoutNode(
+            units=1,
+            activation=Activation.IDENTITY,
+            trainer=Trainer.RIDGE,
+            regularization=1e-6,
+            washout=200,
+            include_bias=True,
+            include_input=True,
+            name="out",
+        ),
     )
 
 
@@ -86,10 +113,13 @@ def test_yildiz_check_accepts_sr_above_one_when_contractive():
     req = WellPosedReservoir(
         rc.reservoir,
         empirical_check=InputDrivenESPCheck(
-            executor=exe, sample_input=series[:, None],
+            executor=exe,
+            sample_input=series[:, None],
         ),
     )
-    assert req.satisfied(), f"Should pass for ρ=1.1 with contractive trajectory, violations: {req.violations()}"
+    assert req.satisfied(), (
+        f"Should pass for ρ=1.1 with contractive trajectory, violations: {req.violations()}"
+    )
     assert any("conservative structural" in w for w in req.warnings())
 
 
@@ -100,7 +130,8 @@ def test_yildiz_check_rejects_clearly_unstable():
     req = WellPosedReservoir(
         rc.reservoir,
         empirical_check=InputDrivenESPCheck(
-            executor=exe, sample_input=series[:, None],
+            executor=exe,
+            sample_input=series[:, None],
         ),
     )
     assert not req.satisfied()
@@ -111,20 +142,29 @@ def test_mle_rejects_short_trajectory():
     rc = _build(sr=0.9)
     exe = RCExecutor(rc)
     short = np.zeros((50, 1))
-    expect_raises(ValueError, maximum_lyapunov_exponent, exe, short, warmup=200)
+    expect_raises(
+        ValueError, maximum_lyapunov_exponent, exe, short, warmup=200
+    )
 
 
 def test_mle_rejects_non_tanh_activation():
     rc = ReservoirComputer(
         input=InputNode(units=1, activation=Activation.IDENTITY, name="in"),
-        reservoir=ReservoirNode(units=50, activation=Activation.RELU,
-                                spectral_radius=0.9, density=0.1, name="res"),
+        reservoir=ReservoirNode(
+            units=50,
+            activation=Activation.RELU,
+            spectral_radius=0.9,
+            density=0.1,
+            name="res",
+        ),
         readout=ReadoutNode(units=1, name="out"),
     )
     exe = RCExecutor(rc)
     expect_raises(
         NotImplementedError,
-        maximum_lyapunov_exponent, exe, _sample_series()[:, None],
+        maximum_lyapunov_exponent,
+        exe,
+        _sample_series()[:, None],
     )
 
 
@@ -153,8 +193,9 @@ def test_dlr_matrix_structure():
     N = 8
     rc = ReservoirComputer(
         input=InputNode(units=1, name="in"),
-        reservoir=ReservoirNode(units=N, topology=Topology.DLR,
-                                chain_weight=0.7, name="res"),
+        reservoir=ReservoirNode(
+            units=N, topology=Topology.DLR, chain_weight=0.7, name="res"
+        ),
         readout=ReadoutNode(units=1, name="out"),
     )
     exe = RCExecutor(rc)
@@ -173,8 +214,9 @@ def test_scr_matrix_structure():
     r = 0.9
     rc = ReservoirComputer(
         input=InputNode(units=1, name="in"),
-        reservoir=ReservoirNode(units=N, topology=Topology.SCR,
-                                chain_weight=r, name="res"),
+        reservoir=ReservoirNode(
+            units=N, topology=Topology.SCR, chain_weight=r, name="res"
+        ),
         readout=ReadoutNode(units=1, name="out"),
     )
     exe = RCExecutor(rc)
@@ -193,8 +235,13 @@ def test_dlrb_matrix_structure():
     r, b = 0.6, 0.1
     rc = ReservoirComputer(
         input=InputNode(units=1, name="in"),
-        reservoir=ReservoirNode(units=N, topology=Topology.DLRB,
-                                chain_weight=r, chain_feedback=b, name="res"),
+        reservoir=ReservoirNode(
+            units=N,
+            topology=Topology.DLRB,
+            chain_weight=r,
+            chain_feedback=b,
+            name="res",
+        ),
         readout=ReadoutNode(units=1, name="out"),
     )
     exe = RCExecutor(rc)
@@ -210,14 +257,30 @@ def test_dlrb_matrix_structure():
 def test_structured_esn_end_to_end():
     series = _sample_series()
     rc = ReservoirComputer(
-        input=InputNode(units=1, input_distribution=Distribution.BERNOULLI,
-                         input_scaling=0.5, input_offset=0.9, name="in"),
-        reservoir=ReservoirNode(units=200, topology=Topology.SCR,
-                                 chain_weight=0.9, leak_rate=0.3,
-                                 activation=Activation.TANH, name="res"),
-        readout=ReadoutNode(units=1, trainer=Trainer.RIDGE,
-                             regularization=1e-6, washout=200,
-                             include_bias=True, include_input=True, name="out"),
+        input=InputNode(
+            units=1,
+            input_distribution=Distribution.BERNOULLI,
+            input_scaling=0.5,
+            input_offset=0.9,
+            name="in",
+        ),
+        reservoir=ReservoirNode(
+            units=200,
+            topology=Topology.SCR,
+            chain_weight=0.9,
+            leak_rate=0.3,
+            activation=Activation.TANH,
+            name="res",
+        ),
+        readout=ReadoutNode(
+            units=1,
+            trainer=Trainer.RIDGE,
+            regularization=1e-6,
+            washout=200,
+            include_bias=True,
+            include_input=True,
+            name="out",
+        ),
     )
     exe = RCExecutor(rc)
     X, Y = series[:-1, None], series[1:, None]
@@ -229,8 +292,12 @@ def test_structured_esn_end_to_end():
 
 def test_bernoulli_input_weights_are_plus_minus_one():
     rc = ReservoirComputer(
-        input=InputNode(units=3, input_distribution=Distribution.BERNOULLI, name="in"),
-        reservoir=ReservoirNode(units=50, topology=Topology.SCR, chain_weight=0.7, name="res"),
+        input=InputNode(
+            units=3, input_distribution=Distribution.BERNOULLI, name="in"
+        ),
+        reservoir=ReservoirNode(
+            units=50, topology=Topology.SCR, chain_weight=0.7, name="res"
+        ),
         readout=ReadoutNode(units=1, name="out"),
     )
     exe = RCExecutor(rc)
@@ -239,15 +306,31 @@ def test_bernoulli_input_weights_are_plus_minus_one():
 
 def _make_online_esn(trainer: Trainer, units: int = 200):
     return ReservoirComputer(
-        input=InputNode(units=1, input_scaling=1.0, input_offset=0.9, name="in"),
-        reservoir=ReservoirNode(units=units, activation=Activation.TANH,
-                                 spectral_radius=0.9, leak_rate=0.3,
-                                 density=0.1, seed=42, name="res"),
-        readout=ReadoutNode(units=1, activation=Activation.IDENTITY,
-                             trainer=trainer, regularization=1e-6,
-                             washout=200, include_bias=True, include_input=True,
-                             learning_rate=1e-2, forgetting_factor=0.999,
-                             init_variance=1e-2, name="out"),
+        input=InputNode(
+            units=1, input_scaling=1.0, input_offset=0.9, name="in"
+        ),
+        reservoir=ReservoirNode(
+            units=units,
+            activation=Activation.TANH,
+            spectral_radius=0.9,
+            leak_rate=0.3,
+            density=0.1,
+            seed=42,
+            name="res",
+        ),
+        readout=ReadoutNode(
+            units=1,
+            activation=Activation.IDENTITY,
+            trainer=trainer,
+            regularization=1e-6,
+            washout=200,
+            include_bias=True,
+            include_input=True,
+            learning_rate=1e-2,
+            forgetting_factor=0.999,
+            init_variance=1e-2,
+            name="out",
+        ),
     )
 
 
@@ -256,7 +339,9 @@ def test_rls_converges_close_to_batch_ridge():
     X, Y = series[:-1, None], series[1:, None]
     # Batch ridge baseline
     rc_b = _make_online_esn(Trainer.RIDGE)
-    rc_b.readout.regularization = 1e-2  # match RLS init_variance regularization
+    rc_b.readout.regularization = (
+        1e-2  # match RLS init_variance regularization
+    )
     exe_b = RCExecutor(rc_b)
     exe_b.fit(X, Y)
     yhat_b = exe_b.predict(X[1000:])
@@ -268,8 +353,9 @@ def test_rls_converges_close_to_batch_ridge():
     yhat_o = exe_o.predict(X[1000:])
     rmse_o = float(np.sqrt(np.mean((yhat_o - Y[1000:]) ** 2)))
     # RLS should land within ~3x of batch
-    assert rmse_o < max(3 * rmse_b, 0.01), \
+    assert rmse_o < max(3 * rmse_b, 0.01), (
         f"RLS RMSE {rmse_o} should be close to ridge {rmse_b}"
+    )
 
 
 def test_lms_makes_progress():
@@ -294,15 +380,27 @@ def test_force_requires_feedback():
 def test_force_with_feedback_runs():
     rc = ReservoirComputer(
         input=InputNode(units=1, input_offset=0.9, name="in"),
-        reservoir=ReservoirNode(units=100, activation=Activation.TANH,
-                                spectral_radius=1.2, leak_rate=0.5,
-                                density=0.1, has_feedback=True,
-                                seed=7, name="res"),
-        readout=ReadoutNode(units=1, activation=Activation.IDENTITY,
-                            trainer=Trainer.FORCE, washout=100,
-                            include_bias=True, include_input=False,
-                            forgetting_factor=1.0, init_variance=1.0,
-                            name="out"),
+        reservoir=ReservoirNode(
+            units=100,
+            activation=Activation.TANH,
+            spectral_radius=1.2,
+            leak_rate=0.5,
+            density=0.1,
+            has_feedback=True,
+            seed=7,
+            name="res",
+        ),
+        readout=ReadoutNode(
+            units=1,
+            activation=Activation.IDENTITY,
+            trainer=Trainer.FORCE,
+            washout=100,
+            include_bias=True,
+            include_input=False,
+            forgetting_factor=1.0,
+            init_variance=1.0,
+            name="out",
+        ),
     )
     exe = RCExecutor(rc)
     series = _sample_series(n=1500)
@@ -311,7 +409,9 @@ def test_force_with_feedback_runs():
     assert np.all(np.isfinite(yhat))
     early = float(np.mean((yhat[100:300] - Y[100:300]) ** 2))
     late = float(np.mean((yhat[-300:] - Y[-300:]) ** 2))
-    assert late < early, f"FORCE should reduce error: early={early}, late={late}"
+    assert late < early, (
+        f"FORCE should reduce error: early={early}, late={late}"
+    )
 
 
 def test_ridge_fit_rejects_online_trainer():
@@ -333,8 +433,11 @@ def test_free_run_shape_and_finite():
     assert np.all(np.isfinite(fr))
 
 
-TESTS = [v for k, v in list(globals().items())
-         if k.startswith("test_") and callable(v)]
+TESTS = [
+    v
+    for k, v in list(globals().items())
+    if k.startswith("test_") and callable(v)
+]
 
 
 def main() -> int:

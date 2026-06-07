@@ -24,6 +24,7 @@ The 256-entry tanh LUT maps each storable `q_pre` to its corresponding
 The readout follows the mirage scheme: one per-tensor scale for W_out
 plus three multipliers (one per phi column block).
 """
+
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
@@ -35,7 +36,7 @@ from rclite.runtime.reference import RCExecutor
 
 from .types import AffineQuantConfig
 from .multiplier import quantize_multiplier, quantize_multiplier_array
-from .lut import LUTStrategy, LUTKind, LUTArtifacts, build_lut_artifacts
+from .lut import LUTStrategy, LUTArtifacts, build_lut_artifacts
 
 
 @dataclass
@@ -56,14 +57,14 @@ class AffineQuantizedModel:
     config: AffineQuantConfig
 
     # Integer weights (symmetric, zero_point = 0)
-    W_in_q: np.ndarray   # (N, K) storage dtype
+    W_in_q: np.ndarray  # (N, K) storage dtype
     W_res_q: np.ndarray  # (N, N) storage dtype
     W_out_q: np.ndarray  # (M, F) storage dtype
 
     # Per-row weight sums for zero-point cross-term folding.
-    row_sum_W_in: np.ndarray   # (N,)  int32
+    row_sum_W_in: np.ndarray  # (N,)  int32
     row_sum_W_res: np.ndarray  # (N,)  int32
-    bias_pre: int              # round(reservoir.bias / s_pre)
+    bias_pre: int  # round(reservoir.bias / s_pre)
 
     # Reservoir-step multipliers (float for reference + integer for compute).
     M_in: float
@@ -81,14 +82,16 @@ class AffineQuantizedModel:
     # input_scaling != 1). For the identity case (the common case),
     # `has_integer_preprocess = False` and the kernel uses X directly as u_pre.
     has_integer_preprocess: bool = False
-    pre_M0: int = 0       # multiplier on (q_x - zp_input)
+    pre_M0: int = 0  # multiplier on (q_x - zp_input)
     pre_n: int = 0
-    pre_const: int = 0    # zp_u_pre + round(-offset * scaling / s_upre)
+    pre_const: int = 0  # zp_u_pre + round(-offset * scaling / s_upre)
     # Tanh activation strategy + precomputed data. `lut_q` / `lut_offset`
     # carry the table data for DIRECT and LINEAR_INTERP. POLYNOMIAL stores
     # its multipliers in `lut_artifacts` and leaves `lut_q` empty.
     lut_strategy: LUTStrategy = field(default_factory=LUTStrategy.direct)
-    lut_q: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.int8))
+    lut_q: np.ndarray = field(
+        default_factory=lambda: np.zeros(0, dtype=np.int8)
+    )
     lut_offset: int = 0
     lut_artifacts: Optional[LUTArtifacts] = None
     # Leaky integration multiplier (= leak rate, in [0, 1])
@@ -96,16 +99,18 @@ class AffineQuantizedModel:
     leak_n: int = 0
 
     # Readout: mixed-scale W_out matmul → output
-    M_out_bias: float = 0.0          # s_W_out / s_y
-    M_out_input: float = 0.0         # s_W_out * s_input / s_y
-    M_out_state: float = 0.0         # s_W_out * s_state / s_y
+    M_out_bias: float = 0.0  # s_W_out / s_y
+    M_out_input: float = 0.0  # s_W_out * s_input / s_y
+    M_out_state: float = 0.0  # s_W_out * s_state / s_y
     M_out_bias_M0: int = 0
     M_out_bias_n: int = 0
     M_out_input_M0: int = 0
     M_out_input_n: int = 0
     M_out_state_M0: int = 0
     M_out_state_n: int = 0
-    row_sum_Wout_input: Optional[np.ndarray] = None  # (M,) int32 (if include_input)
+    row_sum_Wout_input: Optional[np.ndarray] = (
+        None  # (M,) int32 (if include_input)
+    )
     row_sum_Wout_state: Optional[np.ndarray] = None  # (M,) int32
     # Per-channel (per output-row) readout multipliers. When set (length M),
     # the readout requantize uses these per-row (M0[m], n[m]) instead of the
@@ -124,37 +129,58 @@ class AffineQuantizedModel:
         N = self.rc.reservoir.units
         K = self.rc.input.units
         M = self.rc.readout.units
-        F = ((1 if self.rc.readout.include_bias else 0)
-             + (K if self.rc.readout.include_input else 0)
-             + N)
+        F = (
+            (1 if self.rc.readout.include_bias else 0)
+            + (K if self.rc.readout.include_input else 0)
+            + N
+        )
         if self.W_in_q.shape != (N, K):
             raise ValueError(f"W_in_q shape {self.W_in_q.shape} != ({N}, {K})")
         if self.W_res_q.shape != (N, N):
-            raise ValueError(f"W_res_q shape {self.W_res_q.shape} != ({N}, {N})")
+            raise ValueError(
+                f"W_res_q shape {self.W_res_q.shape} != ({N}, {N})"
+            )
         if self.W_out_q.shape != (M, F):
-            raise ValueError(f"W_out_q shape {self.W_out_q.shape} != ({M}, {F})")
+            raise ValueError(
+                f"W_out_q shape {self.W_out_q.shape} != ({M}, {F})"
+            )
         if self.state_init_q is None:
-            self.state_init_q = np.full(N, cfg.state.zero_point,
-                                          dtype=cfg.state.storage_dtype)
+            self.state_init_q = np.full(
+                N, cfg.state.zero_point, dtype=cfg.state.storage_dtype
+            )
 
     @property
-    def N(self) -> int: return self.rc.reservoir.units
+    def N(self) -> int:
+        return self.rc.reservoir.units
+
     @property
-    def K(self) -> int: return self.rc.input.units
+    def K(self) -> int:
+        return self.rc.input.units
+
     @property
-    def M(self) -> int: return self.rc.readout.units
+    def M(self) -> int:
+        return self.rc.readout.units
+
     @property
     def F(self) -> int:
         K = self.K
-        return ((1 if self.rc.readout.include_bias else 0)
-                + (K if self.rc.readout.include_input else 0)
-                + self.N)
+        return (
+            (1 if self.rc.readout.include_bias else 0)
+            + (K if self.rc.readout.include_input else 0)
+            + self.N
+        )
+
     @property
-    def storage_bits(self) -> int: return self.config.storage_bits
+    def storage_bits(self) -> int:
+        return self.config.storage_bits
+
     @property
-    def w_out_storage_bits(self) -> int: return self.config.w_out_storage_bits
+    def w_out_storage_bits(self) -> int:
+        return self.config.w_out_storage_bits
+
     @property
-    def mixed_precision(self) -> bool: return self.config.mixed_precision
+    def mixed_precision(self) -> bool:
+        return self.config.mixed_precision
 
 
 def quantize_model_affine(
@@ -188,7 +214,7 @@ def quantize_model_affine(
         pass
 
     # Weight quantization (symmetric, zp=0).
-    W_in_q  = config.W_in.quantize_array(exe.W_in)
+    W_in_q = config.W_in.quantize_array(exe.W_in)
     # W_res: per-tensor (single scale) by default, or per-channel (per
     # reservoir-row scale) when config.W_res_scales is set.
     per_channel_res = config.W_res_scales is not None
@@ -197,12 +223,15 @@ def quantize_model_affine(
         N_res = exe.W_res.shape[0]
         if W_res_scales.shape != (N_res,):
             raise ValueError(
-                f"W_res_scales shape {W_res_scales.shape} != ({N_res},)")
+                f"W_res_scales shape {W_res_scales.shape} != ({N_res},)"
+            )
         qmax = (1 << (config.W_res.storage_bits - 1)) - 1
         qmin = -(1 << (config.W_res.storage_bits - 1))
         W_res_q = np.clip(
             np.rint(exe.W_res / W_res_scales[:, None]).astype(np.int64),
-            qmin, qmax).astype(config.W_res.storage_dtype)
+            qmin,
+            qmax,
+        ).astype(config.W_res.storage_dtype)
     else:
         W_res_q = config.W_res.quantize_array(exe.W_res)
     # W_out: per-column-block scales (mirage-style). Each block is quantized
@@ -226,39 +255,46 @@ def quantize_model_affine(
     if rc.readout.include_bias:
         if per_channel_out:
             W_out_q[:, 0:1] = _q_block_perrow(
-                W_out[:, 0:1], config.W_out_bias_scales)
+                W_out[:, 0:1], config.W_out_bias_scales
+            )
         else:
             W_out_q[:, 0:1] = config.W_out_bias.quantize_array(W_out[:, 0:1])
         off = 1
     if rc.readout.include_input:
         if per_channel_out:
-            W_out_q[:, off:off + K] = _q_block_perrow(
-                W_out[:, off:off + K], config.W_out_input_scales)
+            W_out_q[:, off : off + K] = _q_block_perrow(
+                W_out[:, off : off + K], config.W_out_input_scales
+            )
         else:
-            W_out_q[:, off:off + K] = config.W_out_input.quantize_array(
-                W_out[:, off:off + K])
+            W_out_q[:, off : off + K] = config.W_out_input.quantize_array(
+                W_out[:, off : off + K]
+            )
         off += K
     if per_channel_out:
-        W_out_q[:, off:off + N] = _q_block_perrow(
-            W_out[:, off:off + N], config.W_out_state_scales)
+        W_out_q[:, off : off + N] = _q_block_perrow(
+            W_out[:, off : off + N], config.W_out_state_scales
+        )
     else:
-        W_out_q[:, off:off + N] = config.W_out_state.quantize_array(
-            W_out[:, off:off + N])
+        W_out_q[:, off : off + N] = config.W_out_state.quantize_array(
+            W_out[:, off : off + N]
+        )
 
     # Per-row weight sums for the zp folding (kept as i32 so LLVM globals
     # don't need an i64 path).
-    row_sum_W_in  = W_in_q.astype(np.int32).sum(axis=1).astype(np.int32)
+    row_sum_W_in = W_in_q.astype(np.int32).sum(axis=1).astype(np.int32)
     row_sum_W_res = W_res_q.astype(np.int32).sum(axis=1).astype(np.int32)
 
     # Bias contribution at pre scale
     bias_pre = int(round(float(rc.reservoir.bias) / config.pre.scale))
 
     # Reservoir-step multipliers
-    M_in  = (config.W_in.scale  * config.u_pre.scale) / config.pre.scale
+    M_in = (config.W_in.scale * config.u_pre.scale) / config.pre.scale
     # M_res: scalar (per-tensor) or per-row array (per-channel).
     if per_channel_res:
         M_res_arr = (W_res_scales * config.state.scale) / config.pre.scale
-        M_res = float(M_res_arr.max())  # representative (float-ref convenience)
+        M_res = float(
+            M_res_arr.max()
+        )  # representative (float-ref convenience)
         M_res_M0_arr, M_res_n_arr = quantize_multiplier_array(M_res_arr)
     else:
         M_res = (config.W_res.scale * config.state.scale) / config.pre.scale
@@ -273,18 +309,24 @@ def quantize_model_affine(
     s_y = config.output.scale
     off = 1 if rc.readout.include_bias else 0
     if rc.readout.include_input:
-        row_sum_Wout_input = (W_out_q[:, off:off + K]
-                              .astype(np.int32).sum(axis=1).astype(np.int32))
+        row_sum_Wout_input = (
+            W_out_q[:, off : off + K]
+            .astype(np.int32)
+            .sum(axis=1)
+            .astype(np.int32)
+        )
         M_out_input = (config.W_out_input.scale * config.input.scale) / s_y
         off += K
     else:
         row_sum_Wout_input = None
         M_out_input = 0.0
-    row_sum_Wout_state = (W_out_q[:, off:off + N]
-                          .astype(np.int32).sum(axis=1).astype(np.int32))
+    row_sum_Wout_state = (
+        W_out_q[:, off : off + N].astype(np.int32).sum(axis=1).astype(np.int32)
+    )
     M_out_state = (config.W_out_state.scale * config.state.scale) / s_y
-    M_out_bias = (config.W_out_bias.scale / s_y
-                   if rc.readout.include_bias else 0.0)
+    M_out_bias = (
+        config.W_out_bias.scale / s_y if rc.readout.include_bias else 0.0
+    )
 
     # Integer (M0, n) decompositions for every requantize multiplier.
     M_in_M0, M_in_n = quantize_multiplier(M_in)
@@ -295,18 +337,26 @@ def quantize_model_affine(
     M_out_state_M0, M_out_state_n = quantize_multiplier(M_out_state)
 
     # Per-channel readout multipliers (per output row), when enabled.
-    (M_out_bias_M0_arr, M_out_bias_n_arr,
-     M_out_input_M0_arr, M_out_input_n_arr,
-     M_out_state_M0_arr, M_out_state_n_arr) = (None,) * 6
+    (
+        M_out_bias_M0_arr,
+        M_out_bias_n_arr,
+        M_out_input_M0_arr,
+        M_out_input_n_arr,
+        M_out_state_M0_arr,
+        M_out_state_n_arr,
+    ) = (None,) * 6
     if per_channel_out:
         M_out_state_M0_arr, M_out_state_n_arr = quantize_multiplier_array(
-            config.W_out_state_scales * config.state.scale / s_y)
+            config.W_out_state_scales * config.state.scale / s_y
+        )
         if rc.readout.include_bias:
             M_out_bias_M0_arr, M_out_bias_n_arr = quantize_multiplier_array(
-                config.W_out_bias_scales / s_y)
+                config.W_out_bias_scales / s_y
+            )
         if rc.readout.include_input:
             M_out_input_M0_arr, M_out_input_n_arr = quantize_multiplier_array(
-                config.W_out_input_scales * config.input.scale / s_y)
+                config.W_out_input_scales * config.input.scale / s_y
+            )
 
     # Integer preprocess multipliers (only needed for non-identity preprocess).
     offset = float(rc.input.input_offset)
@@ -324,29 +374,45 @@ def quantize_model_affine(
         pre_const = 0
 
     return AffineQuantizedModel(
-        rc=rc, config=config,
-        W_in_q=W_in_q, W_res_q=W_res_q, W_out_q=W_out_q,
+        rc=rc,
+        config=config,
+        W_in_q=W_in_q,
+        W_res_q=W_res_q,
+        W_out_q=W_out_q,
         lut_strategy=lut_strategy,
-        lut_q=lut_q, lut_offset=lut_offset,
+        lut_q=lut_q,
+        lut_offset=lut_offset,
         lut_artifacts=lut_artifacts,
-        row_sum_W_in=row_sum_W_in, row_sum_W_res=row_sum_W_res,
+        row_sum_W_in=row_sum_W_in,
+        row_sum_W_res=row_sum_W_res,
         bias_pre=bias_pre,
-        M_in=M_in, M_res=M_res,
-        M_in_M0=M_in_M0, M_in_n=M_in_n,
-        M_res_M0=M_res_M0, M_res_n=M_res_n,
-        M_res_M0_arr=M_res_M0_arr, M_res_n_arr=M_res_n_arr,
-        leak_M0=leak_M0, leak_n=leak_n,
+        M_in=M_in,
+        M_res=M_res,
+        M_in_M0=M_in_M0,
+        M_in_n=M_in_n,
+        M_res_M0=M_res_M0,
+        M_res_n=M_res_n,
+        M_res_M0_arr=M_res_M0_arr,
+        M_res_n_arr=M_res_n_arr,
+        leak_M0=leak_M0,
+        leak_n=leak_n,
         M_out_bias=M_out_bias,
         M_out_input=M_out_input,
         M_out_state=M_out_state,
-        M_out_bias_M0=M_out_bias_M0, M_out_bias_n=M_out_bias_n,
-        M_out_input_M0=M_out_input_M0, M_out_input_n=M_out_input_n,
-        M_out_state_M0=M_out_state_M0, M_out_state_n=M_out_state_n,
+        M_out_bias_M0=M_out_bias_M0,
+        M_out_bias_n=M_out_bias_n,
+        M_out_input_M0=M_out_input_M0,
+        M_out_input_n=M_out_input_n,
+        M_out_state_M0=M_out_state_M0,
+        M_out_state_n=M_out_state_n,
         has_integer_preprocess=has_integer_preprocess,
-        pre_M0=pre_M0, pre_n=pre_n, pre_const=pre_const,
+        pre_M0=pre_M0,
+        pre_n=pre_n,
+        pre_const=pre_const,
         row_sum_Wout_input=row_sum_Wout_input,
         row_sum_Wout_state=row_sum_Wout_state,
-        M_out_bias_M0_arr=M_out_bias_M0_arr, M_out_bias_n_arr=M_out_bias_n_arr,
+        M_out_bias_M0_arr=M_out_bias_M0_arr,
+        M_out_bias_n_arr=M_out_bias_n_arr,
         M_out_input_M0_arr=M_out_input_M0_arr,
         M_out_input_n_arr=M_out_input_n_arr,
         M_out_state_M0_arr=M_out_state_M0_arr,

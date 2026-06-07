@@ -16,14 +16,13 @@ Saturating add at each update prevents wrap-around when the learning
 rate is too high. An LLVM emit for the same update kernel is sketched at
 the bottom — defer integration until needed.
 """
+
 from __future__ import annotations
-from typing import Optional
 
 import numpy as np
 
 from .model import QuantizedModel
 from .executor import QuantizedExecutor
-from ._intops import fixed_mul_scalar_i32, trunc_i32
 
 
 def _sadd_sat(a: int, b: int, storage_bits: int) -> int:
@@ -74,8 +73,14 @@ class IntegerLMSLearner:
     current model's output; use `step` to feed (x, y_target) pairs.
     """
 
-    def __init__(self, qmodel: QuantizedModel, learning_rate: float = 1e-2,
-                 *, normalized: bool = False, delta: float = 1.0):
+    def __init__(
+        self,
+        qmodel: QuantizedModel,
+        learning_rate: float = 1e-2,
+        *,
+        normalized: bool = False,
+        delta: float = 1.0,
+    ):
         self.qmodel = qmodel
         self.cfg = qmodel.config
         self.target = qmodel.target
@@ -89,7 +94,8 @@ class IntegerLMSLearner:
             if 2 * inp_f < sf:
                 raise NotImplementedError(
                     "NLMS needs 2*input_frac >= state_frac for the squared-"
-                    f"norm fixed point (got input_frac={inp_f}, state_frac={sf})")
+                    f"norm fixed point (got input_frac={inp_f}, state_frac={sf})"
+                )
             self.delta_q = int(self.delta * (1 << sf))
         self._executor = QuantizedExecutor(qmodel)
 
@@ -119,7 +125,9 @@ class IntegerLMSLearner:
     def _quantize_input(self, u: np.ndarray) -> np.ndarray:
         rc = self.qmodel.rc
         u_pre = (u - rc.input.input_offset) * rc.input.input_scaling
-        return self.target.quantize_input_array(u_pre, self.cfg).astype(np.int32)
+        return self.target.quantize_input_array(u_pre, self.cfg).astype(
+            np.int32
+        )
 
     def step(self, x_f: np.ndarray, y_target_f: np.ndarray) -> np.ndarray:
         """Process one streaming sample. Returns the (dequantized) prediction.
@@ -140,11 +148,14 @@ class IntegerLMSLearner:
 
         # Quantize target at state_scale
         y_target_q = np.array(
-            [self.target.quantize_state(float(v), self.cfg) for v in y_target_f],
+            [
+                self.target.quantize_state(float(v), self.cfg)
+                for v in y_target_f
+            ],
             dtype=np.int32,
         )
 
-        error_q = (y_target_q.astype(np.int64) - y_pred_q.astype(np.int64))
+        error_q = y_target_q.astype(np.int64) - y_pred_q.astype(np.int64)
 
         # Update W_out_q with column-specific shifts
         self._apply_lms_update(error_q, u_pre_q, state_q)
@@ -207,10 +218,16 @@ class IntegerLMSLearner:
         return ro.predict(X)
 
 
-def collect_training_stream(qmodel: QuantizedModel, X: np.ndarray,
-                            Y: np.ndarray, *, learning_rate: float,
-                            normalized: bool = False, delta: float = 1.0,
-                            warmup: int = 0) -> dict:
+def collect_training_stream(
+    qmodel: QuantizedModel,
+    X: np.ndarray,
+    Y: np.ndarray,
+    *,
+    learning_rate: float,
+    normalized: bool = False,
+    delta: float = 1.0,
+    warmup: int = 0,
+) -> dict:
     """Drive `IntegerLMSLearner` over (X, Y); return the integer I/O streams a
     deployed kernel must reproduce, plus the final learned readout.
 
@@ -235,8 +252,9 @@ def collect_training_stream(qmodel: QuantizedModel, X: np.ndarray,
         X = X[:, None]
     if Y.ndim == 1:
         Y = Y[:, None]
-    learner = IntegerLMSLearner(qmodel, learning_rate=learning_rate,
-                                normalized=normalized, delta=delta)
+    learner = IntegerLMSLearner(
+        qmodel, learning_rate=learning_rate, normalized=normalized, delta=delta
+    )
     exe = learner._executor
     cfg = learner.cfg
     target = learner.target
@@ -255,7 +273,8 @@ def collect_training_stream(qmodel: QuantizedModel, X: np.ndarray,
         else:
             y_target_q = np.array(
                 [target.quantize_state(float(v), cfg) for v in Y[t]],
-                dtype=np.int32)
+                dtype=np.int32,
+            )
             error_q = y_target_q.astype(np.int64) - y_pred_q.astype(np.int64)
             learner._apply_lms_update(error_q, u_q, state_q)
             yt_stream[t] = y_target_q

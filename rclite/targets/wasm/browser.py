@@ -16,6 +16,7 @@ reactor, and emits a small ES-module loader (`rclite.js`) plus a runnable
   - quantized i8/i16/i32 build: **zero imports** (tanh is a LUT) -- a fully
     self-contained module.
 """
+
 from __future__ import annotations
 import os
 import pathlib
@@ -44,14 +45,20 @@ def _resolve_wasm_ld() -> list[str]:
     try:
         sysroot = subprocess.run(
             ["rustc", "--print", "sysroot"],
-            capture_output=True, text=True, check=True,
+            capture_output=True,
+            text=True,
+            check=True,
         ).stdout.strip()
     except Exception:
         sysroot = ""
     if sysroot:
         for root, _dirs, files in os.walk(sysroot):
             if "rust-lld" in files:
-                return [str(pathlib.Path(root) / "rust-lld"), "-flavor", "wasm"]
+                return [
+                    str(pathlib.Path(root) / "rust-lld"),
+                    "-flavor",
+                    "wasm",
+                ]
     raise RuntimeError(
         "no wasm linker found -- install `wasm-ld` (LLVM/lld) or ensure "
         "rustc ships `rust-lld` (rustup component `llvm-tools` / the wasm "
@@ -62,23 +69,33 @@ def _resolve_wasm_ld() -> list[str]:
 class BrowserWasm(WasmTarget):
     """WebAssembly reactor target for browsers / JS runtimes."""
 
-    def __init__(self, dtype: str = "f32", *,
-                 simd: bool = True,
-                 rustc: str = "rustc",
-                 rust_target: str = "wasm32-wasip1",
-                 opt_level: str = "2",
-                 loader_name: str = "rclite.js",
-                 wasm_name: Optional[str] = None):
-        super().__init__(dtype=dtype, simd=simd, rustc=rustc,
-                         rust_target=rust_target, opt_level=opt_level)
+    def __init__(
+        self,
+        dtype: str = "f32",
+        *,
+        simd: bool = True,
+        rustc: str = "rustc",
+        rust_target: str = "wasm32-wasip1",
+        opt_level: str = "2",
+        loader_name: str = "rclite.js",
+        wasm_name: Optional[str] = None,
+    ):
+        super().__init__(
+            dtype=dtype,
+            simd=simd,
+            rustc=rustc,
+            rust_target=rust_target,
+            opt_level=opt_level,
+        )
         self.loader_name = loader_name
         self._wasm_name_override = wasm_name
-        self.name = (f"wasm32/browser+simd128" if simd else "wasm32/browser")
+        self.name = f"wasm32/browser+simd128" if simd else "wasm32/browser"
 
     # ------------------------------------------------------------------ link
 
-    def _link_reactor(self, rc_o: pathlib.Path, wasm: pathlib.Path, *,
-                      import_tanhf: bool) -> None:
+    def _link_reactor(
+        self, rc_o: pathlib.Path, wasm: pathlib.Path, *, import_tanhf: bool
+    ) -> None:
         ld = _resolve_wasm_ld()
         # `--allow-undefined` lets the f32 kernel's `tanhf` become an import
         # for JS to satisfy. It is also required for wasm-ld to synthesize the
@@ -91,7 +108,9 @@ class BrowserWasm(WasmTarget):
             "--export=memory",
             "--export=__heap_base",
             "--strip-debug",
-            str(rc_o), "-o", str(wasm),
+            str(rc_o),
+            "-o",
+            str(wasm),
         ]
         cp = subprocess.run(cmd, capture_output=True, text=True)
         if cp.returncode != 0:
@@ -102,13 +121,26 @@ class BrowserWasm(WasmTarget):
 
     # --------------------------------------------------------------- emit JS
 
-    def _emit_loader_and_demo(self, out: pathlib.Path, *, dtype: str,
-                              K: int, M: int, array_ctor: str, bytes_per: int,
-                              has_tanhf: bool, input_scale: float,
-                              state_scale: float, in_offset: float,
-                              in_scaling: float, wasm_name: str,
-                              demo_input: np.ndarray, T: int,
-                              imports: list[str], wasm_size: int) -> list[pathlib.Path]:
+    def _emit_loader_and_demo(
+        self,
+        out: pathlib.Path,
+        *,
+        dtype: str,
+        K: int,
+        M: int,
+        array_ctor: str,
+        bytes_per: int,
+        has_tanhf: bool,
+        input_scale: float,
+        state_scale: float,
+        in_offset: float,
+        in_scaling: float,
+        wasm_name: str,
+        demo_input: np.ndarray,
+        T: int,
+        imports: list[str],
+        wasm_size: int,
+    ) -> list[pathlib.Path]:
         loader = render_template(
             _SUPPORT_DIR / "browser_loader.js",
             DTYPE=dtype,
@@ -144,11 +176,16 @@ class BrowserWasm(WasmTarget):
 
     # ---------------------------------------------------------- public: f32
 
-    def compile(self, rc, exe, *,
-                output_dir,
-                test_inputs: Optional[np.ndarray] = None,
-                expected_outputs: Optional[np.ndarray] = None,
-                **_) -> CompiledArtifact:
+    def compile(
+        self,
+        rc,
+        exe,
+        *,
+        output_dir,
+        test_inputs: Optional[np.ndarray] = None,
+        expected_outputs: Optional[np.ndarray] = None,
+        **_,
+    ) -> CompiledArtifact:
         if test_inputs is None:
             raise ValueError(
                 "Browser deployment needs `test_inputs` for the demo page"
@@ -158,8 +195,12 @@ class BrowserWasm(WasmTarget):
         out.mkdir(parents=True, exist_ok=True)
 
         cc_obj = cross_compile_rc(
-            rc, exe, triple=self.triple, dtype=self.dtype,
-            features=self._features(), vectorize=self.simd,
+            rc,
+            exe,
+            triple=self.triple,
+            dtype=self.dtype,
+            features=self._features(),
+            vectorize=self.simd,
         )
         rc_o = out / "rc_predict.o"
         cc_obj.emit_object(str(rc_o))
@@ -181,11 +222,22 @@ class BrowserWasm(WasmTarget):
         T = x_in.shape[0]
 
         sources = self._emit_loader_and_demo(
-            out, dtype="f32", K=K, M=M, array_ctor="Float32Array",
-            bytes_per=4, has_tanhf=True, input_scale=1.0, state_scale=1.0,
-            in_offset=rc.input.input_offset, in_scaling=rc.input.input_scaling,
-            wasm_name=wasm_name, demo_input=x_in, T=T,
-            imports=info.imports, wasm_size=wasm.stat().st_size,
+            out,
+            dtype="f32",
+            K=K,
+            M=M,
+            array_ctor="Float32Array",
+            bytes_per=4,
+            has_tanhf=True,
+            input_scale=1.0,
+            state_scale=1.0,
+            in_offset=rc.input.input_offset,
+            in_scaling=rc.input.input_scaling,
+            wasm_name=wasm_name,
+            demo_input=x_in,
+            T=T,
+            imports=info.imports,
+            wasm_size=wasm.stat().st_size,
         )
 
         return CompiledArtifact(
@@ -202,17 +254,18 @@ class BrowserWasm(WasmTarget):
                 "reactor": True,
                 "imports": info.imports,
                 "exports": info.exports,
-                "K": K, "M": M, "T": T,
+                "K": K,
+                "M": M,
+                "T": T,
                 "wasm_size": wasm.stat().st_size,
             },
         )
 
     # ---------------------------------------------------- public: quantized
 
-    def compile_quantized(self, qmodel, *,
-                          output_dir,
-                          test_inputs: np.ndarray,
-                          **_) -> CompiledArtifact:
+    def compile_quantized(
+        self, qmodel, *, output_dir, test_inputs: np.ndarray, **_
+    ) -> CompiledArtifact:
         if test_inputs is None:
             raise ValueError(
                 "Browser quantized deployment needs `test_inputs` for the demo"
@@ -221,7 +274,9 @@ class BrowserWasm(WasmTarget):
         out.mkdir(parents=True, exist_ok=True)
 
         sw = qmodel.target.storage_bits
-        array_ctor = {8: "Int8Array", 16: "Int16Array", 32: "Int32Array"}.get(sw)
+        array_ctor = {8: "Int8Array", 16: "Int16Array", 32: "Int32Array"}.get(
+            sw
+        )
         bytes_per = {8: 1, 16: 2, 32: 4}.get(sw)
         if array_ctor is None:
             raise NotImplementedError(
@@ -246,12 +301,22 @@ class BrowserWasm(WasmTarget):
         T = x_in.shape[0]
 
         sources = self._emit_loader_and_demo(
-            out, dtype=f"i{sw}", K=K, M=M, array_ctor=array_ctor,
-            bytes_per=bytes_per, has_tanhf=False,
-            input_scale=cfg.input_scale, state_scale=cfg.state_scale,
-            in_offset=rc.input.input_offset, in_scaling=rc.input.input_scaling,
-            wasm_name=wasm_name, demo_input=x_in, T=T,
-            imports=info.imports, wasm_size=wasm.stat().st_size,
+            out,
+            dtype=f"i{sw}",
+            K=K,
+            M=M,
+            array_ctor=array_ctor,
+            bytes_per=bytes_per,
+            has_tanhf=False,
+            input_scale=cfg.input_scale,
+            state_scale=cfg.state_scale,
+            in_offset=rc.input.input_offset,
+            in_scaling=rc.input.input_scaling,
+            wasm_name=wasm_name,
+            demo_input=x_in,
+            T=T,
+            imports=info.imports,
+            wasm_size=wasm.stat().st_size,
         )
 
         return CompiledArtifact(
@@ -268,7 +333,9 @@ class BrowserWasm(WasmTarget):
                 "reactor": True,
                 "imports": info.imports,
                 "exports": info.exports,
-                "K": K, "M": M, "T": T,
+                "K": K,
+                "M": M,
+                "T": T,
                 "state_frac": cfg.state_frac,
                 "wasm_size": wasm.stat().st_size,
             },
@@ -276,10 +343,14 @@ class BrowserWasm(WasmTarget):
 
     # --------------------------------------------------------------- runner
 
-    def run(self, artifact: CompiledArtifact, *,
-            wasmtime: str = "wasmtime",
-            timeout: float = 60.0,
-            **_) -> RunResult:
+    def run(
+        self,
+        artifact: CompiledArtifact,
+        *,
+        wasmtime: str = "wasmtime",
+        timeout: float = 60.0,
+        **_,
+    ) -> RunResult:
         """Smoke-check the reactor.
 
         A reactor has no `_start`, so it can't be "run" as a WASI command.
@@ -288,7 +359,9 @@ class BrowserWasm(WasmTarget):
         --invoke` to confirm `rc_predict` is callable in a non-WASI host.
         """
         info = inspect_wasm(str(artifact.binary))
-        missing = [s for s in ("rc_predict", "memory") if s not in info.exports]
+        missing = [
+            s for s in ("rc_predict", "memory") if s not in info.exports
+        ]
         if missing:
             return RunResult(
                 success=False,
@@ -299,26 +372,41 @@ class BrowserWasm(WasmTarget):
             # f32: needs env.tanhf supplied by a JS host -- can't exec here.
             return RunResult(
                 success=True,
-                output=(f"reactor OK (structure-only check)\n"
-                        f"imports={info.imports}\nexports={info.exports}"),
+                output=(
+                    f"reactor OK (structure-only check)\n"
+                    f"imports={info.imports}\nexports={info.exports}"
+                ),
                 returncode=0,
             )
         if shutil.which(wasmtime) is None:
             return RunResult(
                 success=True,
-                output=(f"reactor OK (no wasmtime to exec)\n"
-                        f"exports={info.exports}"),
+                output=(
+                    f"reactor OK (no wasmtime to exec)\nexports={info.exports}"
+                ),
                 returncode=0,
             )
         cp = subprocess.run(
-            [wasmtime, "run", "--invoke", "rc_predict",
-             str(artifact.binary), "1", "1024", "2048"],
-            capture_output=True, text=True, timeout=timeout,
+            [
+                wasmtime,
+                "run",
+                "--invoke",
+                "rc_predict",
+                str(artifact.binary),
+                "1",
+                "1024",
+                "2048",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
         )
         ok = cp.returncode == 0
         return RunResult(
             success=ok,
-            output=(f"wasmtime --invoke rc_predict -> exit {cp.returncode}\n"
-                    f"exports={info.exports}\n{cp.stderr}"),
+            output=(
+                f"wasmtime --invoke rc_predict -> exit {cp.returncode}\n"
+                f"exports={info.exports}\n{cp.stderr}"
+            ),
             returncode=cp.returncode,
         )

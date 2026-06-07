@@ -7,8 +7,9 @@ Concrete targets:
   - `I8Symmetric`   — i8 storage, i32 accumulator (symmetric Q-format).
   - `I8Affine`      — skeleton-only; see class docstring for the roadmap.
 """
+
 from __future__ import annotations
-from abc import ABC, abstractmethod
+from abc import ABC
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -21,8 +22,8 @@ class QuantTarget(ABC):
     """Abstract quantization target."""
 
     name: ClassVar[str]
-    storage_bits: ClassVar[int]      # bit width of the stored values (e.g. 32)
-    accum_bits: ClassVar[int]        # bit width of the multiply-accumulate register
+    storage_bits: ClassVar[int]  # bit width of the stored values (e.g. 32)
+    accum_bits: ClassVar[int]  # bit width of the multiply-accumulate register
     signed: ClassVar[bool] = True
 
     @property
@@ -54,19 +55,27 @@ class QuantTarget(ABC):
     def quantize_weight(self, w: float, cfg: QuantConfig) -> int:
         return self._saturate(int(w * cfg.weight_scale))
 
-    def quantize_state_array(self, arr: np.ndarray, cfg: QuantConfig) -> np.ndarray:
+    def quantize_state_array(
+        self, arr: np.ndarray, cfg: QuantConfig
+    ) -> np.ndarray:
         return self._saturate_array(np.asarray(arr) * cfg.state_scale)
 
-    def quantize_input_array(self, arr: np.ndarray, cfg: QuantConfig) -> np.ndarray:
+    def quantize_input_array(
+        self, arr: np.ndarray, cfg: QuantConfig
+    ) -> np.ndarray:
         return self._saturate_array(np.asarray(arr) * cfg.input_scale)
 
-    def quantize_weight_array(self, arr: np.ndarray, cfg: QuantConfig) -> np.ndarray:
+    def quantize_weight_array(
+        self, arr: np.ndarray, cfg: QuantConfig
+    ) -> np.ndarray:
         return self._saturate_array(np.asarray(arr) * cfg.weight_scale)
 
     def dequantize_state(self, q: int, cfg: QuantConfig) -> float:
         return q / cfg.state_scale
 
-    def dequantize_state_array(self, q: np.ndarray, cfg: QuantConfig) -> np.ndarray:
+    def dequantize_state_array(
+        self, q: np.ndarray, cfg: QuantConfig
+    ) -> np.ndarray:
         return q.astype(np.float64) / cfg.state_scale
 
     def _saturate(self, x: int) -> int:
@@ -93,6 +102,7 @@ class I32FixedPoint(QuantTarget):
       input*weight       → shift by weight_frac+input_frac-state_frac  (input path)
       LUT interpolation  → shift by state_frac
     """
+
     name: ClassVar[str] = "i32"
     storage_bits: ClassVar[int] = 32
     accum_bits: ClassVar[int] = 64
@@ -101,6 +111,7 @@ class I32FixedPoint(QuantTarget):
 @dataclass(frozen=True)
 class I16FixedPoint(QuantTarget):
     """i16 storage, i32 accumulator. Smaller binary, more saturation risk."""
+
     name: ClassVar[str] = "i16"
     storage_bits: ClassVar[int] = 16
     accum_bits: ClassVar[int] = 32
@@ -122,6 +133,7 @@ class I8Symmetric(QuantTarget):
     stay in this range. For TFLM-class footprint with asymmetric scales
     and per-tensor zero points, use `I8Affine` instead (when implemented).
     """
+
     name: ClassVar[str] = "i8"
     storage_bits: ClassVar[int] = 8
     accum_bits: ClassVar[int] = 32
@@ -167,6 +179,7 @@ class I8Affine(QuantTarget):
     Constructing `quantize_model(..., target=I8Affine())` raises with a
     pointer to this docstring.
     """
+
     name: ClassVar[str] = "i8-affine"
     storage_bits: ClassVar[int] = 8
     accum_bits: ClassVar[int] = 32

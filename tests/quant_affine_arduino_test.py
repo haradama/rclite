@@ -5,6 +5,7 @@ by compiling it with *host* gcc (the source is platform-independent; on a
 host the PROGMEM macros are no-ops). The arduino-cli build (real AVR) is a
 size/smoke check, skipped when the toolchain is absent.
 """
+
 from __future__ import annotations
 import pathlib
 import shutil
@@ -18,12 +19,19 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import numpy as np
 
 from rclite import (
-    InputNode, ReservoirNode, ReadoutNode, ReservoirComputer,
-    Activation, Distribution, Topology, Trainer,
+    InputNode,
+    ReservoirNode,
+    ReadoutNode,
+    ReservoirComputer,
+    Distribution,
+    Topology,
+    Trainer,
 )
 from rclite.runtime import RCExecutor
 from rclite.quant import (
-    calibrate_from_data, quantize_model_affine, AffineQuantizedExecutor,
+    calibrate_from_data,
+    quantize_model_affine,
+    AffineQuantizedExecutor,
     LUTStrategy,
 )
 from rclite.targets.arduino import emit_affine_kernel_c, ArduinoUnoTarget
@@ -36,25 +44,53 @@ _HAVE_GCC = shutil.which("gcc") is not None
 _HAVE_ARDUINO = shutil.which("arduino-cli") is not None
 
 
-def _build(topology=Topology.SCR, storage_bits=8, w_out_storage_bits=None,
-            strategy=None, units=24, T=200, seed=0,
-            input_offset=0.0, input_scaling=1.0):
+def _build(
+    topology=Topology.SCR,
+    storage_bits=8,
+    w_out_storage_bits=None,
+    strategy=None,
+    units=24,
+    T=200,
+    seed=0,
+    input_offset=0.0,
+    input_scaling=1.0,
+):
     rc = ReservoirComputer(
-        input=InputNode(units=1, input_offset=input_offset,
-                        input_scaling=input_scaling,
-                        input_distribution=Distribution.BERNOULLI),
-        reservoir=ReservoirNode(units=units, topology=topology, chain_weight=0.9,
-                                 chain_feedback=0.1, leak_rate=0.3, seed=42),
-        readout=ReadoutNode(units=1, trainer=Trainer.RIDGE, regularization=1e-6,
-                             washout=30, include_bias=True, include_input=True),
+        input=InputNode(
+            units=1,
+            input_offset=input_offset,
+            input_scaling=input_scaling,
+            input_distribution=Distribution.BERNOULLI,
+        ),
+        reservoir=ReservoirNode(
+            units=units,
+            topology=topology,
+            chain_weight=0.9,
+            chain_feedback=0.1,
+            leak_rate=0.3,
+            seed=42,
+        ),
+        readout=ReadoutNode(
+            units=1,
+            trainer=Trainer.RIDGE,
+            regularization=1e-6,
+            washout=30,
+            include_bias=True,
+            include_input=True,
+        ),
     )
     exe = RCExecutor(rc)
     rng = np.random.default_rng(seed)
     X = rng.standard_normal((T, 1)) * 0.2
     Y = np.sin(np.arange(T) * 0.1)[:, None]
-    exe.fit(X[:T - 50], Y[:T - 50])
-    cfg = calibrate_from_data(rc, exe, X[:T - 50], storage_bits=storage_bits,
-                                w_out_storage_bits=w_out_storage_bits)
+    exe.fit(X[: T - 50], Y[: T - 50])
+    cfg = calibrate_from_data(
+        rc,
+        exe,
+        X[: T - 50],
+        storage_bits=storage_bits,
+        w_out_storage_bits=w_out_storage_bits,
+    )
     qm = quantize_model_affine(rc, exe, cfg, lut_strategy=strategy)
     return rc, exe, qm, X
 
@@ -78,26 +114,41 @@ def _host_c_qy(qm, X_float, tmp: pathlib.Path, allow_i32_accum=False):
     q_x = cfg.input.quantize_array(X_float).astype(np.int64).reshape(-1)
     T = X_float.shape[0]
     (tmp / "kernel.c").write_text(
-        emit_affine_kernel_c(qm, allow_i32_accum=allow_i32_accum))
-    main = "\n".join([
-        "#include <stdint.h>", "#include <stdio.h>",
-        f'extern void rc_predict(int32_t, const {ctype}*, {ctype}*);',
-        "int main(void){",
-        f"  {ctype} X[{T * qm.K}] = {{ {', '.join(str(int(v)) for v in q_x)} }};",
-        f"  {ctype} Y[{T * qm.M}];",
-        f"  rc_predict({T}, X, Y);",
-        f"  for (int i = 0; i < {T * qm.M}; i++) printf(\"%d\\n\", (int)Y[i]);",
-        "  return 0; }",
-    ])
+        emit_affine_kernel_c(qm, allow_i32_accum=allow_i32_accum)
+    )
+    main = "\n".join(
+        [
+            "#include <stdint.h>",
+            "#include <stdio.h>",
+            f"extern void rc_predict(int32_t, const {ctype}*, {ctype}*);",
+            "int main(void){",
+            f"  {ctype} X[{T * qm.K}] = {{ {', '.join(str(int(v)) for v in q_x)} }};",
+            f"  {ctype} Y[{T * qm.M}];",
+            f"  rc_predict({T}, X, Y);",
+            f'  for (int i = 0; i < {T * qm.M}; i++) printf("%d\\n", (int)Y[i]);',
+            "  return 0; }",
+        ]
+    )
     (tmp / "main.c").write_text(main)
     exe_path = tmp / "a.out"
     r = subprocess.run(
-        ["gcc", "-O2", "-std=c99", "-o", str(exe_path),
-         str(tmp / "main.c"), str(tmp / "kernel.c")],
-        capture_output=True, text=True)
+        [
+            "gcc",
+            "-O2",
+            "-std=c99",
+            "-o",
+            str(exe_path),
+            str(tmp / "main.c"),
+            str(tmp / "kernel.c"),
+        ],
+        capture_output=True,
+        text=True,
+    )
     if r.returncode != 0:
         raise RuntimeError("gcc failed:\n" + r.stderr)
-    out = subprocess.run([str(exe_path)], capture_output=True, text=True).stdout
+    out = subprocess.run(
+        [str(exe_path)], capture_output=True, text=True
+    ).stdout
     vals = [int(v) for v in out.strip().split("\n")]
     return np.array(vals, dtype=np.int64).reshape(T, qm.M)
 
@@ -111,10 +162,13 @@ def _assert_host_parity(qm, X_eval):
     # path (faster, used where the compiler handles it).
     for allow_i32 in (False, True):
         with tempfile.TemporaryDirectory() as td:
-            b = _host_c_qy(qm, X_eval, pathlib.Path(td), allow_i32_accum=allow_i32)
+            b = _host_c_qy(
+                qm, X_eval, pathlib.Path(td), allow_i32_accum=allow_i32
+            )
             diff = int(np.max(np.abs(a - b)))
-            assert diff == 0, \
+            assert diff == 0, (
                 f"host C vs Python q_y diff = {diff} (allow_i32_accum={allow_i32})"
+            )
 
 
 # ---------------------------------------------------------------- C emitter shape
@@ -131,7 +185,7 @@ def test_emitted_c_has_progmem_and_rc_predict():
 def test_emitted_c_structured_omits_w_res():
     _, _, qm, _ = _build(topology=Topology.SCR)
     src = emit_affine_kernel_c(qm)
-    assert "rc_W_res" not in src   # SCR uses scalar chain, no dense W_res
+    assert "rc_W_res" not in src  # SCR uses scalar chain, no dense W_res
 
 
 def test_emitted_c_dense_includes_w_res():
@@ -149,46 +203,55 @@ def test_host_parity_scr_direct():
 
 
 def test_host_parity_scr_interp():
-    _, _, qm, X = _build(topology=Topology.SCR,
-                          strategy=LUTStrategy.linear_interp(64))
+    _, _, qm, X = _build(
+        topology=Topology.SCR, strategy=LUTStrategy.linear_interp(64)
+    )
     _assert_host_parity(qm, X[150:175])
 
 
 def test_host_parity_scr_poly():
-    _, _, qm, X = _build(topology=Topology.SCR,
-                          strategy=LUTStrategy.polynomial(degree=5))
+    _, _, qm, X = _build(
+        topology=Topology.SCR, strategy=LUTStrategy.polynomial(degree=5)
+    )
     _assert_host_parity(qm, X[150:175])
 
 
 def test_host_parity_dlr():
-    _, _, qm, X = _build(topology=Topology.DLR,
-                          strategy=LUTStrategy.linear_interp(64))
+    _, _, qm, X = _build(
+        topology=Topology.DLR, strategy=LUTStrategy.linear_interp(64)
+    )
     _assert_host_parity(qm, X[150:175])
 
 
 def test_host_parity_dlrb():
-    _, _, qm, X = _build(topology=Topology.DLRB,
-                          strategy=LUTStrategy.linear_interp(64))
+    _, _, qm, X = _build(
+        topology=Topology.DLRB, strategy=LUTStrategy.linear_interp(64)
+    )
     _assert_host_parity(qm, X[150:175])
 
 
 def test_host_parity_dense():
-    _, _, qm, X = _build(topology=Topology.ESN_STANDARD,
-                          strategy=LUTStrategy.direct())
+    _, _, qm, X = _build(
+        topology=Topology.ESN_STANDARD, strategy=LUTStrategy.direct()
+    )
     _assert_host_parity(qm, X[150:175])
 
 
 def test_host_parity_mixed_precision():
-    _, _, qm, X = _build(topology=Topology.SCR, storage_bits=8,
-                          w_out_storage_bits=16,
-                          strategy=LUTStrategy.linear_interp(64))
+    _, _, qm, X = _build(
+        topology=Topology.SCR,
+        storage_bits=8,
+        w_out_storage_bits=16,
+        strategy=LUTStrategy.linear_interp(64),
+    )
     assert qm.W_out_q.dtype == np.int16
     _assert_host_parity(qm, X[150:175])
 
 
 def test_host_parity_i16():
-    _, _, qm, X = _build(topology=Topology.SCR, storage_bits=16,
-                          strategy=LUTStrategy.direct())
+    _, _, qm, X = _build(
+        topology=Topology.SCR, storage_bits=16, strategy=LUTStrategy.direct()
+    )
     _assert_host_parity(qm, X[150:175])
 
 
@@ -200,8 +263,11 @@ def test_host_parity_i16_dense():
     so the AVR bench uses a small interp LUT; the algorithm itself is correct
     at i16, as this exercises with a DIRECT LUT on the host.
     """
-    _, _, qm, X = _build(topology=Topology.ESN_STANDARD, storage_bits=16,
-                          strategy=LUTStrategy.direct())
+    _, _, qm, X = _build(
+        topology=Topology.ESN_STANDARD,
+        storage_bits=16,
+        strategy=LUTStrategy.direct(),
+    )
     _assert_host_parity(qm, X[150:175])
 
 
@@ -209,6 +275,7 @@ def test_direct_lut_rejects_oversized_storage():
     """A DIRECT activation LUT for i32 would need 2**32 entries — quantizing
     must raise a clear error fast, not hang on a ~34 GB allocation."""
     from rclite.quant import calibrate_from_data, quantize_model_affine
+
     rc, exe, _, X = _build(topology=Topology.SCR, storage_bits=8)
     cfg = calibrate_from_data(rc, exe, X[:150], storage_bits=32)
     try:
@@ -220,9 +287,12 @@ def test_direct_lut_rejects_oversized_storage():
 
 
 def test_host_parity_with_preprocess():
-    _, _, qm, X = _build(topology=Topology.SCR, input_offset=0.3,
-                          input_scaling=1.5,
-                          strategy=LUTStrategy.linear_interp(64))
+    _, _, qm, X = _build(
+        topology=Topology.SCR,
+        input_offset=0.3,
+        input_scaling=1.5,
+        strategy=LUTStrategy.linear_interp(64),
+    )
     assert qm.has_integer_preprocess
     _assert_host_parity(qm, X[150:175])
 
@@ -232,14 +302,18 @@ def test_host_parity_with_preprocess():
 
 def test_arduino_emit_without_build():
     """Emitting the sketch must not require arduino-cli."""
-    _, _, qm, X = _build(topology=Topology.SCR,
-                          strategy=LUTStrategy.linear_interp(64))
+    _, _, qm, X = _build(
+        topology=Topology.SCR, strategy=LUTStrategy.linear_interp(64)
+    )
     with tempfile.TemporaryDirectory() as td:
         art = ArduinoUnoTarget().compile_affine_quantized(
-            qm, output_dir=pathlib.Path(td), test_inputs=X[150:160], build=False,
+            qm,
+            output_dir=pathlib.Path(td),
+            test_inputs=X[150:160],
+            build=False,
         )
-        assert art.sources[0].exists()   # sketch.ino
-        assert art.sources[1].exists()   # rc_kernel.c
+        assert art.sources[0].exists()  # sketch.ino
+        assert art.sources[1].exists()  # rc_kernel.c
         assert art.binary is None
         assert art.metadata["fqbn"] == "arduino:avr:uno"
 
@@ -248,23 +322,34 @@ def test_arduino_cli_build_fits_uno():
     """Real AVR compile: must fit the Uno (Flash < 32K, SRAM < 2K)."""
     if not _HAVE_ARDUINO:
         return
-    _, _, qm, X = _build(topology=Topology.SCR, storage_bits=8,
-                          w_out_storage_bits=16,
-                          strategy=LUTStrategy.linear_interp(64))
+    _, _, qm, X = _build(
+        topology=Topology.SCR,
+        storage_bits=8,
+        w_out_storage_bits=16,
+        strategy=LUTStrategy.linear_interp(64),
+    )
     with tempfile.TemporaryDirectory() as td:
         art = ArduinoUnoTarget().compile_affine_quantized(
-            qm, output_dir=pathlib.Path(td), test_inputs=X[150:160], build=True,
+            qm,
+            output_dir=pathlib.Path(td),
+            test_inputs=X[150:160],
+            build=True,
         )
         md = art.metadata
         if "flash_bytes" in md:
-            assert md["flash_bytes"] < 32768, f"flash {md['flash_bytes']} > 32K"
+            assert md["flash_bytes"] < 32768, (
+                f"flash {md['flash_bytes']} > 32K"
+            )
         if "sram_bytes" in md:
             assert md["sram_bytes"] < 2048, f"SRAM {md['sram_bytes']} > 2K"
         assert art.binary is not None and art.binary.exists()
 
 
-TESTS = [v for k, v in list(globals().items())
-         if k.startswith("test_") and callable(v)]
+TESTS = [
+    v
+    for k, v in list(globals().items())
+    if k.startswith("test_") and callable(v)
+]
 
 
 def main() -> int:

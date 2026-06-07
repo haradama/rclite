@@ -21,6 +21,7 @@ NRMSE versus the single-pass calibration.
 held-out MSE on eval_X / eval_Y) is returned. 1-2 iterations usually
 suffice; more is rarely worth the compute.
 """
+
 from __future__ import annotations
 from dataclasses import dataclass, field, replace as _replace
 from typing import List, Optional, Tuple
@@ -46,8 +47,9 @@ class AffineSearchResult:
     history: List[Tuple[int, float]] = field(default_factory=list)
 
 
-def _augment_phi(rc: ReservoirComputer, X: np.ndarray,
-                  H: np.ndarray) -> np.ndarray:
+def _augment_phi(
+    rc: ReservoirComputer, X: np.ndarray, H: np.ndarray
+) -> np.ndarray:
     """phi = [1?] ++ [u?] ++ h  for (T, K) input and (T, N) state."""
     T = H.shape[0]
     parts = []
@@ -59,8 +61,9 @@ def _augment_phi(rc: ReservoirComputer, X: np.ndarray,
     return np.concatenate(parts, axis=1)
 
 
-def _fit_ridge(phi: np.ndarray, Y: np.ndarray,
-                ridge_lambda: float, washout: int) -> np.ndarray:
+def _fit_ridge(
+    phi: np.ndarray, Y: np.ndarray, ridge_lambda: float, washout: int
+) -> np.ndarray:
     """Ridge regression on (T, F) features, (T, M) targets. Returns (M, F)."""
     phi_w = phi[washout:]
     Y_w = Y[washout:]
@@ -85,8 +88,8 @@ def _recalibrate_for_new_W_out(
     (the model is *trying* to match these). W_out blocks keep their
     (possibly wider) mixed-precision width.
     """
-    sb = cfg.storage_bits             # activations / output width
-    wob = cfg.w_out_storage_bits       # readout-weight width (mixed precision)
+    sb = cfg.storage_bits  # activations / output width
+    wob = cfg.w_out_storage_bits  # readout-weight width (mixed precision)
     K = rc.input.units
     N = rc.reservoir.units
     off = 0
@@ -94,17 +97,21 @@ def _recalibrate_for_new_W_out(
     W_out_input_p = None
     if rc.readout.include_bias:
         W_out_bias_p = AffineParams.symmetric_absmax(
-            W_out_new[:, 0:1], storage_bits=wob)
+            W_out_new[:, 0:1], storage_bits=wob
+        )
         off = 1
     if rc.readout.include_input:
         W_out_input_p = AffineParams.symmetric_absmax(
-            W_out_new[:, off:off + K], storage_bits=wob)
+            W_out_new[:, off : off + K], storage_bits=wob
+        )
         off += K
     W_out_state_p = AffineParams.symmetric_absmax(
-        W_out_new[:, off:off + N], storage_bits=wob)
+        W_out_new[:, off : off + N], storage_bits=wob
+    )
     # Use the post-washout targets — that's what the model is fit to.
     output_p = AffineParams.asymmetric_minmax(
-        train_Y[washout:], storage_bits=sb)
+        train_Y[washout:], storage_bits=sb
+    )
     return _replace(
         cfg,
         W_out_bias=W_out_bias_p,
@@ -147,17 +154,26 @@ def search_quantization_affine(
         raise ValueError("exe has no trained readout — call exe.fit() first")
     if calibration_X is None:
         calibration_X = train_X
-    if train_X.ndim == 1: train_X = train_X[:, None]
-    if train_Y.ndim == 1: train_Y = train_Y[:, None]
-    if eval_X.ndim == 1:  eval_X  = eval_X[:, None]
-    if eval_Y.ndim == 1:  eval_Y  = eval_Y[:, None]
+    if train_X.ndim == 1:
+        train_X = train_X[:, None]
+    if train_Y.ndim == 1:
+        train_Y = train_Y[:, None]
+    if eval_X.ndim == 1:
+        eval_X = eval_X[:, None]
+    if eval_Y.ndim == 1:
+        eval_Y = eval_Y[:, None]
     if ridge_lambda is None:
         ridge_lambda = float(rc.readout.regularization)
     washout = int(rc.readout.washout)
 
     # Round 0: single-pass calibration from float traces.
-    cfg = calibrate_from_data(rc, exe, calibration_X, storage_bits=storage_bits,
-                               w_out_storage_bits=w_out_storage_bits)
+    cfg = calibrate_from_data(
+        rc,
+        exe,
+        calibration_X,
+        storage_bits=storage_bits,
+        w_out_storage_bits=w_out_storage_bits,
+    )
     W_out_current = np.asarray(exe.W_out).copy()
 
     history: List[Tuple[int, float]] = []
@@ -165,8 +181,13 @@ def search_quantization_affine(
 
     for it in range(n_iterations + 1):
         # Build the quantized model with the current cfg + W_out
-        qm = quantize_model_affine(rc, exe, cfg, W_out_override=W_out_current,
-                                    lut_strategy=lut_strategy)
+        qm = quantize_model_affine(
+            rc,
+            exe,
+            cfg,
+            W_out_override=W_out_current,
+            lut_strategy=lut_strategy,
+        )
 
         # Held-out evaluation: warm up with train_X, then measure on eval_X.
         qexe_eval = AffineQuantizedExecutor(qm)

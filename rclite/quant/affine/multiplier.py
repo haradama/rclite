@@ -15,6 +15,7 @@ calls `SaturatingRoundingDoublingHighMul` minus the doubling, simplified).
 Python and LLVM both implement this exactly the same way, so the Python
 reference and the JIT kernel agree bit-for-bit on the requantize step.
 """
+
 from __future__ import annotations
 from typing import Tuple
 import math
@@ -65,7 +66,7 @@ def apply_multiplier_scalar(x: int, M0: int, n: int) -> int:
     """
     prod = int(x) * int(M0)
     if n > 0:
-        prod += (1 << (n - 1))
+        prod += 1 << (n - 1)
     # Python's >> on negative ints is arithmetic (floors toward -inf), same as ashr
     return prod >> n
 
@@ -99,8 +100,9 @@ def quantize_multiplier_array(M_arr: np.ndarray):
     return M0, n
 
 
-def apply_multiplier_perrow(x_arr: np.ndarray, M0_arr: np.ndarray,
-                            n_arr: np.ndarray) -> np.ndarray:
+def apply_multiplier_perrow(
+    x_arr: np.ndarray, M0_arr: np.ndarray, n_arr: np.ndarray
+) -> np.ndarray:
     """Per-row `apply_multiplier_scalar`: x[i] requantized by (M0[i], n[i]).
 
     Same round-half-up `(x*M0 + (1<<(n-1))) >> n` as `apply_multiplier_array`,
@@ -112,6 +114,8 @@ def apply_multiplier_perrow(x_arr: np.ndarray, M0_arr: np.ndarray,
     M0_64 = np.asarray(M0_arr, dtype=np.int64)
     n64 = np.asarray(n_arr, dtype=np.int64)
     prod = x64 * M0_64
-    bias = np.where(n64 > 0, np.int64(1) << np.maximum(n64 - 1, 0), np.int64(0))
+    bias = np.where(
+        n64 > 0, np.int64(1) << np.maximum(n64 - 1, 0), np.int64(0)
+    )
     prod = prod + bias
     return prod >> n64

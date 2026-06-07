@@ -5,6 +5,7 @@ width is also recorded so quantize/dequantize knows how to saturate.
 `AffineQuantConfig` bundles params for every quantity in a reservoir
 computer — weights symmetric, activations possibly asymmetric.
 """
+
 from __future__ import annotations
 from dataclasses import dataclass
 
@@ -48,19 +49,25 @@ class AffineParams:
 
     def quantize_array(self, arr) -> np.ndarray:
         qmin, qmax = self._range()
-        q = (np.rint(np.asarray(arr, dtype=np.float64) / self.scale)
-             .astype(np.int64)) + self.zero_point
+        q = (
+            np.rint(np.asarray(arr, dtype=np.float64) / self.scale).astype(
+                np.int64
+            )
+        ) + self.zero_point
         return np.clip(q, qmin, qmax).astype(self.storage_dtype)
 
     def dequantize(self, q: int) -> float:
         return (int(q) - self.zero_point) * self.scale
 
     def dequantize_array(self, q_arr) -> np.ndarray:
-        return (np.asarray(q_arr, dtype=np.float64) - self.zero_point) * self.scale
+        return (
+            np.asarray(q_arr, dtype=np.float64) - self.zero_point
+        ) * self.scale
 
     @classmethod
-    def symmetric_absmax(cls, arr, storage_bits: int = 8,
-                          eps: float = 1e-8) -> "AffineParams":
+    def symmetric_absmax(
+        cls, arr, storage_bits: int = 8, eps: float = 1e-8
+    ) -> "AffineParams":
         """Pick scale from max |arr|; zero_point=0. TFLM weight convention."""
         m = float(np.max(np.abs(np.asarray(arr, dtype=np.float64))))
         if m < eps:
@@ -69,8 +76,9 @@ class AffineParams:
         return cls(scale=m / max_q, zero_point=0, storage_bits=storage_bits)
 
     @staticmethod
-    def symmetric_absmax_peraxis(arr, storage_bits: int = 8,
-                                 eps: float = 1e-8) -> np.ndarray:
+    def symmetric_absmax_peraxis(
+        arr, storage_bits: int = 8, eps: float = 1e-8
+    ) -> np.ndarray:
         """Per-row symmetric scales: scale[i] = max|arr[i,:]| / qmax.
 
         Returns a 1-D array of per-row scales (zero_point=0 throughout), the
@@ -84,8 +92,9 @@ class AffineParams:
         return (m / max_q).astype(np.float64)
 
     @classmethod
-    def asymmetric_minmax(cls, arr, storage_bits: int = 8,
-                           eps: float = 1e-8) -> "AffineParams":
+    def asymmetric_minmax(
+        cls, arr, storage_bits: int = 8, eps: float = 1e-8
+    ) -> "AffineParams":
         """Pick scale + zero_point from observed [min, max] range.
 
         Follows TFLM convention: the representable range always includes
@@ -131,17 +140,17 @@ class AffineQuantConfig:
     still "per-tensor" in the TFLM sense within its block.
     """
 
-    input: AffineParams                       # raw X
-    u_pre: AffineParams                       # preprocessed input
-    state: AffineParams                       # reservoir state h AND tanh activated
-    pre: AffineParams                         # pre-activation
-    W_in: AffineParams                        # symmetric (zp=0)
-    W_res: AffineParams                       # symmetric (zp=0)
-    W_out_state: AffineParams                 # symmetric (zp=0), state-col block
-    output: AffineParams                      # readout y
+    input: AffineParams  # raw X
+    u_pre: AffineParams  # preprocessed input
+    state: AffineParams  # reservoir state h AND tanh activated
+    pre: AffineParams  # pre-activation
+    W_in: AffineParams  # symmetric (zp=0)
+    W_res: AffineParams  # symmetric (zp=0)
+    W_out_state: AffineParams  # symmetric (zp=0), state-col block
+    output: AffineParams  # readout y
     # Optional: present only when the readout has those phi components.
-    W_out_bias: AffineParams | None = None    # symmetric (zp=0)
-    W_out_input: AffineParams | None = None   # symmetric (zp=0)
+    W_out_bias: AffineParams | None = None  # symmetric (zp=0)
+    W_out_input: AffineParams | None = None  # symmetric (zp=0)
     # Optional per-channel (per reservoir-row) scales for W_res. When set
     # (length N), W_res is quantized per output row instead of per-tensor
     # and the reservoir-step requantize uses a per-row multiplier. `W_res`

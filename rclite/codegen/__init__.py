@@ -3,6 +3,7 @@
 Compiles a trained `ReservoirComputer` into native machine code so inference
 runs without the Python interpreter or numpy in the loop.
 """
+
 try:
     import llvmlite  # noqa: F401
 except ImportError as e:
@@ -11,13 +12,20 @@ except ImportError as e:
     ) from e
 
 from .llvm import (
-    compile_rc, CompiledRC, emit_module,
-    cross_compile_rc, CrossCompiledRC,
+    compile_rc,
+    CompiledRC,
+    emit_module,
+    cross_compile_rc,
+    CrossCompiledRC,
 )
 from .mlir import MLIRBackend, emit_mlir
 
 __all__ = [
-    "compile_rc", "CompiledRC", "emit_module",
-    "cross_compile_rc", "CrossCompiledRC",
-    "MLIRBackend", "emit_mlir",
+    "compile_rc",
+    "CompiledRC",
+    "emit_module",
+    "cross_compile_rc",
+    "CrossCompiledRC",
+    "MLIRBackend",
+    "emit_mlir",
 ]

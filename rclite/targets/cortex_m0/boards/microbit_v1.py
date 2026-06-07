@@ -1,4 +1,5 @@
 """Board descriptors for Cortex-M0 targets."""
+
 from __future__ import annotations
 from dataclasses import dataclass
 
@@ -6,6 +7,7 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class CortexM0Board:
     """Describes a Cortex-M0 board: SoC, memory layout, linker, QEMU machine."""
+
     name: str
     soc: str
     flash_kb: int
@@ -17,6 +19,7 @@ class CortexM0Board:
 @dataclass(frozen=True)
 class MicrobitV1(CortexM0Board):
     """BBC micro:bit v1 (nRF51822: 256 KB flash, 16 KB SRAM, Cortex-M0)."""
+
     name: str = "microbit-v1"
     soc: str = "nRF51822"
     flash_kb: int = 256

@@ -5,6 +5,7 @@ Emits a shared library (.so) plus C header for in-process use from Python
 engine alive so the same target instance can also be used for in-process
 inference via `artifact.metadata['jit']`.
 """
+
 from __future__ import annotations
 import pathlib
 
@@ -20,12 +21,17 @@ class HostTarget(Target):
     def __init__(self, dtype: str = "f64"):
         self.dtype = dtype
 
-    def compile(self, rc, exe, *,
-                output_dir,
-                lib_name: str = "rc",
-                emit_shared_library: bool = True,
-                emit_header: bool = True,
-                **_) -> CompiledArtifact:
+    def compile(
+        self,
+        rc,
+        exe,
+        *,
+        output_dir,
+        lib_name: str = "rc",
+        emit_shared_library: bool = True,
+        emit_header: bool = True,
+        **_,
+    ) -> CompiledArtifact:
         out = pathlib.Path(output_dir)
         out.mkdir(parents=True, exist_ok=True)
 

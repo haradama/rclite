@@ -2,11 +2,13 @@
 
 Enumerations corresponding to the SysML v2 enum defs and stereotype tags.
 """
+
 from enum import Enum
 
 
 class Distribution(Enum):
     """SysML2: enum def Distribution"""
+
     UNIFORM = "uniform"
     NORMAL = "normal"
     BERNOULLI = "bernoulli"
@@ -14,6 +16,7 @@ class Distribution(Enum):
 
 class Activation(Enum):
     """SysML2: enum def Activation"""
+
     TANH = "tanh"
     SIGMOID = "sigmoid"
     RELU = "relu"
@@ -30,18 +33,20 @@ class Topology(Enum):
     Rodan & Tino (2011) "Minimum complexity echo state network" — fully
     deterministic and competitive with random reservoirs.
     """
+
     RANDOM = "random"
     SMALL_WORLD = "smallWorld"
     SCALE_FREE = "scaleFree"
     RING = "ring"
     ESN_STANDARD = "ESNStandard"
-    DLR = "DLR"      # Delay Line Reservoir (Rodan-Tino 2011)
-    DLRB = "DLRB"    # Delay Line with Backward connections
-    SCR = "SCR"      # Simple Cycle Reservoir
+    DLR = "DLR"  # Delay Line Reservoir (Rodan-Tino 2011)
+    DLRB = "DLRB"  # Delay Line with Backward connections
+    SCR = "SCR"  # Simple Cycle Reservoir
 
 
 class Trainer(Enum):
     """SysML2: enum def Trainer"""
+
     RIDGE = "ridge"
     PINV = "pinv"
     FORCE = "FORCE"
@@ -59,6 +64,7 @@ class Task(Enum):
                      squares (RIDGE / PINV); class id = argmax of the linear
                      scores, class probabilities = softmax of the scores.
     """
+
     REGRESSION = "regression"
     CLASSIFICATION = "classification"
 
@@ -71,13 +77,15 @@ class Aggregation(Enum):
     sequence to one feature vector (sequence-to-label classification, or
     sequence-to-scalar regression).
     """
-    NONE = "none"   # per-step readout (default; existing behavior)
-    MEAN = "mean"   # mean of post-washout states -> one label per sequence
-    LAST = "last"   # final state -> one label per sequence
+
+    NONE = "none"  # per-step readout (default; existing behavior)
+    MEAN = "mean"  # mean of post-washout states -> one label per sequence
+    LAST = "last"  # final state -> one label per sequence
 
 
 class DType(Enum):
     """SysML2: enum def DType"""
+
     FLOAT16 = "float16"
     FLOAT32 = "float32"
     FLOAT64 = "float64"

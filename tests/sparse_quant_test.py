@@ -11,6 +11,7 @@ uses the preserved row_sum_W_res). Covers:
   - strategies: unroll / csr / auto
   - structured topology no-op
 """
+
 from __future__ import annotations
 import pathlib
 import sys
@@ -21,12 +22,19 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import numpy as np
 
 from rclite import (
-    InputNode, ReservoirNode, ReadoutNode, ReservoirComputer,
-    Activation, Topology, Trainer,
+    InputNode,
+    ReservoirNode,
+    ReadoutNode,
+    ReservoirComputer,
+    Topology,
+    Trainer,
 )
 from rclite.runtime import RCExecutor
 from rclite.quant import (
-    QuantConfig, TanhLUTSpec, I8Symmetric, quantize_model,
+    QuantConfig,
+    TanhLUTSpec,
+    I8Symmetric,
+    quantize_model,
 )
 from rclite.quant.affine import calibrate_from_data, quantize_model_affine
 from rclite.codegen.llvm import CompiledQuantizedRC, CompiledAffineRC
@@ -42,12 +50,24 @@ STRATEGIES = ("unroll", "csr", "auto")
 def _model(topology=Topology.ESN_STANDARD, units=48, density=0.15, seed=7):
     rc = ReservoirComputer(
         input=InputNode(units=1, name="in"),
-        reservoir=ReservoirNode(units=units, topology=topology, leak_rate=0.3,
-                                density=density, seed=seed, chain_weight=0.9,
-                                name="res"),
-        readout=ReadoutNode(units=1, trainer=Trainer.RIDGE,
-                            regularization=1e-6, washout=60,
-                            include_bias=True, include_input=True, name="out"),
+        reservoir=ReservoirNode(
+            units=units,
+            topology=topology,
+            leak_rate=0.3,
+            density=density,
+            seed=seed,
+            chain_weight=0.9,
+            name="res",
+        ),
+        readout=ReadoutNode(
+            units=1,
+            trainer=Trainer.RIDGE,
+            regularization=1e-6,
+            washout=60,
+            include_bias=True,
+            include_input=True,
+            name="out",
+        ),
     )
     exe = RCExecutor(rc)
     X = np.random.default_rng(seed).standard_normal((400, 1)) * 0.15
@@ -74,22 +94,31 @@ def _check(label, dense, sparse_fn):
 
 # ---------------------------------------------------------------------------
 
+
 def test_symmetric_i32():
     rc, exe, _, Xt = _model()
     qm = _sym_qmodel(rc, exe)
     dense = CompiledQuantizedRC(qm).predict(Xt)
-    _check("symmetric i32", dense,
-           lambda s: CompiledQuantizedRC(
-               qm, passes=[SparsifyReservoir(strategy=s)]).predict(Xt))
+    _check(
+        "symmetric i32",
+        dense,
+        lambda s: CompiledQuantizedRC(
+            qm, passes=[SparsifyReservoir(strategy=s)]
+        ).predict(Xt),
+    )
 
 
 def test_symmetric_i8():
     rc, exe, _, Xt = _model(units=40)
     qm = _sym_qmodel(rc, exe, target=I8Symmetric())
     dense = CompiledQuantizedRC(qm).predict(Xt)
-    _check("symmetric i8", dense,
-           lambda s: CompiledQuantizedRC(
-               qm, passes=[SparsifyReservoir(strategy=s)]).predict(Xt))
+    _check(
+        "symmetric i8",
+        dense,
+        lambda s: CompiledQuantizedRC(
+            qm, passes=[SparsifyReservoir(strategy=s)]
+        ).predict(Xt),
+    )
 
 
 def _affine_check(storage_bits):
@@ -97,9 +126,13 @@ def _affine_check(storage_bits):
     cfg = calibrate_from_data(rc, exe, Xtrain[:340], storage_bits=storage_bits)
     qm = quantize_model_affine(rc, exe, cfg)
     dense = CompiledAffineRC(qm).predict(Xt)
-    _check(f"affine i{storage_bits}", dense,
-           lambda s: CompiledAffineRC(
-               qm, passes=[SparsifyReservoir(strategy=s)]).predict(Xt))
+    _check(
+        f"affine i{storage_bits}",
+        dense,
+        lambda s: CompiledAffineRC(
+            qm, passes=[SparsifyReservoir(strategy=s)]
+        ).predict(Xt),
+    )
 
 
 def test_affine_i8():
@@ -115,8 +148,7 @@ def test_structured_noop_quant():
     rc, exe, _, Xt = _model(topology=Topology.DLR, units=40)
     qm = _sym_qmodel(rc, exe)
     dense = CompiledQuantizedRC(qm).predict(Xt)
-    sp = CompiledQuantizedRC(
-        qm, passes=[SparsifyReservoir()]).predict(Xt)
+    sp = CompiledQuantizedRC(qm, passes=[SparsifyReservoir()]).predict(Xt)
     d = int(np.max(np.abs(dense.astype(np.int64) - sp.astype(np.int64))))
     assert d == 0, f"structured quant changed: {d}"
     print("  DLR (symmetric): SparsifyReservoir no-op, bit-exact")

@@ -1,4 +1,5 @@
 """SysML v2: package RC::Composite"""
+
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -15,6 +16,7 @@ class ReservoirComputer:
     Holds the three layer parts and the four named Synapse connections
     (W_in, W_res, W_out, optional W_fb).
     """
+
     input: InputNode
     reservoir: ReservoirNode
     readout: ReadoutNode
@@ -62,4 +64,8 @@ class ReservoirComputer:
         return out
 
     def parts(self):
-        return {"input": self.input, "reservoir": self.reservoir, "readout": self.readout}
+        return {
+            "input": self.input,
+            "reservoir": self.reservoir,
+            "readout": self.readout,
+        }

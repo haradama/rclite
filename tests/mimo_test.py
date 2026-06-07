@@ -12,6 +12,7 @@ whole stack for a genuine MIMO model (K > 1 *and* M > 1):
 
 The C-export checks are skipped when gcc is unavailable.
 """
+
 from __future__ import annotations
 import pathlib
 import shutil
@@ -25,14 +26,25 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import numpy as np
 
 from rclite import (
-    InputNode, ReservoirNode, ReadoutNode, ReservoirComputer,
-    Distribution, Topology, Trainer,
+    InputNode,
+    ReservoirNode,
+    ReadoutNode,
+    ReservoirComputer,
+    Distribution,
+    Topology,
+    Trainer,
 )
 from rclite.runtime import RCExecutor
 from rclite.codegen import compile_rc
 from rclite.quant import (
-    QuantConfig, TanhLUTSpec, I16FixedPoint, quantize_model, QuantizedExecutor,
-    calibrate_from_data, quantize_model_affine, AffineQuantizedExecutor,
+    QuantConfig,
+    TanhLUTSpec,
+    I16FixedPoint,
+    quantize_model,
+    QuantizedExecutor,
+    calibrate_from_data,
+    quantize_model_affine,
+    AffineQuantizedExecutor,
 )
 from rclite.export import export_bundle, emit_symmetric_kernel_c
 
@@ -47,15 +59,32 @@ K, N, M = 3, 48, 2  # 3 inputs, 2 outputs
 
 def _build_and_train(*, topology=Topology.SCR, include_input=True):
     rc = ReservoirComputer(
-        input=InputNode(units=K, input_scaling=0.5,
-                        input_distribution=Distribution.BERNOULLI, name="in"),
-        reservoir=ReservoirNode(units=N, topology=topology, chain_weight=0.9,
-                                chain_feedback=0.1, leak_rate=0.3,
-                                spectral_radius=0.9, density=0.3, seed=42,
-                                name="res"),
-        readout=ReadoutNode(units=M, trainer=Trainer.RIDGE, regularization=1e-6,
-                            washout=40, include_bias=True,
-                            include_input=include_input, name="out"),
+        input=InputNode(
+            units=K,
+            input_scaling=0.5,
+            input_distribution=Distribution.BERNOULLI,
+            name="in",
+        ),
+        reservoir=ReservoirNode(
+            units=N,
+            topology=topology,
+            chain_weight=0.9,
+            chain_feedback=0.1,
+            leak_rate=0.3,
+            spectral_radius=0.9,
+            density=0.3,
+            seed=42,
+            name="res",
+        ),
+        readout=ReadoutNode(
+            units=M,
+            trainer=Trainer.RIDGE,
+            regularization=1e-6,
+            washout=40,
+            include_bias=True,
+            include_input=include_input,
+            name="out",
+        ),
     )
     exe = RCExecutor(rc)
     rng = np.random.default_rng(0)
@@ -81,8 +110,9 @@ def _assert_close(a, b, atol=1e-9):
 
 def _quantize_i16(rc, exe, X):
     cfg = QuantConfig(state_frac=10, input_frac=8, weight_frac=8)
-    return quantize_model(rc, exe, cfg, target=I16FixedPoint(),
-                          lut=TanhLUTSpec(n=256)), cfg
+    return quantize_model(
+        rc, exe, cfg, target=I16FixedPoint(), lut=TanhLUTSpec(n=256)
+    ), cfg
 
 
 def _sym_python_qy(qm, cfg, X):
@@ -98,33 +128,50 @@ def _sym_python_qy(qm, cfg, X):
 
 
 def _sym_q_x(qm, cfg, X):
-    return np.array([qm.target.quantize_input_array(X[t], cfg)
-                     for t in range(X.shape[0])], dtype=np.int64)
+    return np.array(
+        [qm.target.quantize_input_array(X[t], cfg) for t in range(X.shape[0])],
+        dtype=np.int64,
+    )
 
 
 def _host_c_qy(kernel_src, ctype, q_x_flat, T, K, M, tmp):
     (tmp / "kernel.c").write_text(kernel_src)
     body = ", ".join(str(int(v)) for v in q_x_flat)
-    main = "\n".join([
-        "#include <stdint.h>", "#include <stdio.h>",
-        f'extern void rc_predict(int32_t, const {ctype}*, {ctype}*);',
-        "int main(void){",
-        f"  {ctype} X[{T * K}] = {{ {body} }};",
-        f"  {ctype} Y[{T * M}];",
-        f"  rc_predict({T}, X, Y);",
-        f"  for (int i=0;i<{T * M};i++) printf(\"%d\\n\",(int)Y[i]);",
-        "  return 0; }",
-    ])
+    main = "\n".join(
+        [
+            "#include <stdint.h>",
+            "#include <stdio.h>",
+            f"extern void rc_predict(int32_t, const {ctype}*, {ctype}*);",
+            "int main(void){",
+            f"  {ctype} X[{T * K}] = {{ {body} }};",
+            f"  {ctype} Y[{T * M}];",
+            f"  rc_predict({T}, X, Y);",
+            f'  for (int i=0;i<{T * M};i++) printf("%d\\n",(int)Y[i]);',
+            "  return 0; }",
+        ]
+    )
     (tmp / "main.c").write_text(main)
-    r = subprocess.run(["gcc", "-O2", "-std=c99", "-o", str(tmp / "a.out"),
-                        str(tmp / "main.c"), str(tmp / "kernel.c")],
-                       capture_output=True, text=True)
+    r = subprocess.run(
+        [
+            "gcc",
+            "-O2",
+            "-std=c99",
+            "-o",
+            str(tmp / "a.out"),
+            str(tmp / "main.c"),
+            str(tmp / "kernel.c"),
+        ],
+        capture_output=True,
+        text=True,
+    )
     if r.returncode != 0:
         raise RuntimeError("gcc failed:\n" + r.stderr)
-    out = subprocess.run([str(tmp / "a.out")], capture_output=True,
-                         text=True).stdout
-    return np.array([int(v) for v in out.strip().split("\n")],
-                    dtype=np.int64).reshape(T, M)
+    out = subprocess.run(
+        [str(tmp / "a.out")], capture_output=True, text=True
+    ).stdout
+    return np.array(
+        [int(v) for v in out.strip().split("\n")], dtype=np.int64
+    ).reshape(T, M)
 
 
 # ----------------------------------------------------------------- tests
@@ -173,8 +220,15 @@ def test_quant_c_export_bit_exact():
     a = _sym_python_qy(qm, cfg, X)
     q_x = _sym_q_x(qm, cfg, X).reshape(-1)
     with tempfile.TemporaryDirectory() as td:
-        b = _host_c_qy(emit_symmetric_kernel_c(qm), "int16_t", q_x,
-                       X.shape[0], qm.K, qm.M, pathlib.Path(td))
+        b = _host_c_qy(
+            emit_symmetric_kernel_c(qm),
+            "int16_t",
+            q_x,
+            X.shape[0],
+            qm.K,
+            qm.M,
+            pathlib.Path(td),
+        )
     diff = int(np.max(np.abs(a - b)))
     assert diff == 0, f"C kernel vs quantized executor diff = {diff}"
 
@@ -186,17 +240,27 @@ def test_bundle_writes_all_files_mimo():
     with tempfile.TemporaryDirectory() as td:
         out = pathlib.Path(td) / "crate"
         export_bundle(qm, out, name="rc_model")
-        for f in ("rc_kernel.c", "rc_model.h", "Cargo.toml", "build.rs",
-                  "src/lib.rs", "README.md"):
+        for f in (
+            "rc_kernel.c",
+            "rc_model.h",
+            "Cargo.toml",
+            "build.rs",
+            "src/lib.rs",
+            "README.md",
+        ):
             assert (out / f).exists(), f"missing {f}"
         hdr = (out / "rc_model.h").read_text()
-        dims = {ln.split()[1]: ln.split()[2]
-                for ln in hdr.splitlines()
-                if ln.startswith("#define RC_") and len(ln.split()) >= 3}
-        assert dims.get("RC_INPUT_DIM") == str(K), \
+        dims = {
+            ln.split()[1]: ln.split()[2]
+            for ln in hdr.splitlines()
+            if ln.startswith("#define RC_") and len(ln.split()) >= 3
+        }
+        assert dims.get("RC_INPUT_DIM") == str(K), (
             f"header RC_INPUT_DIM = {dims.get('RC_INPUT_DIM')}, want {K}"
-        assert dims.get("RC_OUTPUT_DIM") == str(M), \
+        )
+        assert dims.get("RC_OUTPUT_DIM") == str(M), (
             f"header RC_OUTPUT_DIM = {dims.get('RC_OUTPUT_DIM')}, want {M}"
+        )
 
 
 def test_affine_quant_executor_mimo():
@@ -221,6 +285,7 @@ def test_affine_c_kernel_bit_exact():
         print("  (skipped: gcc not on PATH)")
         return
     from rclite.targets.arduino import emit_affine_kernel_c
+
     rc, exe, X = _build_and_train()
     Xe = X[:80]
     cfg = calibrate_from_data(rc, exe, X[:200], storage_bits=16)
@@ -236,8 +301,15 @@ def test_affine_c_kernel_bit_exact():
 
     q_x = cfg.input.quantize_array(Xe).astype(np.int64).reshape(-1)
     with tempfile.TemporaryDirectory() as td:
-        b = _host_c_qy(emit_affine_kernel_c(qm), "int16_t", q_x,
-                       Xe.shape[0], qm.K, qm.M, pathlib.Path(td))
+        b = _host_c_qy(
+            emit_affine_kernel_c(qm),
+            "int16_t",
+            q_x,
+            Xe.shape[0],
+            qm.K,
+            qm.M,
+            pathlib.Path(td),
+        )
     diff = int(np.max(np.abs(a - b)))
     assert diff == 0, f"affine C kernel vs executor diff = {diff}"
 
@@ -245,21 +317,30 @@ def test_affine_c_kernel_bit_exact():
 def test_gba_symmetric_multi_input_guarded():
     """GBA symmetric i8/i16 must reject K>1 (thumbv4t miscompile) clearly."""
     from rclite.targets.gba import GbaTarget
+
     rc, exe, X = _build_and_train()
     qm, _ = _quantize_i16(rc, exe, X)
     assert qm.K > 1
     try:
         GbaTarget().compile_quantized(
-            qm, output_dir=tempfile.mkdtemp(), test_inputs=X[:5])
+            qm, output_dir=tempfile.mkdtemp(), test_inputs=X[:5]
+        )
     except NotImplementedError:
         return
     except Exception as e:  # missing toolchain etc. — guard runs before that
-        raise AssertionError(f"expected NotImplementedError, got {type(e).__name__}: {e}")
-    raise AssertionError("expected NotImplementedError for GBA symmetric i16 K>1")
+        raise AssertionError(
+            f"expected NotImplementedError, got {type(e).__name__}: {e}"
+        )
+    raise AssertionError(
+        "expected NotImplementedError for GBA symmetric i16 K>1"
+    )
 
 
-TESTS = [v for k, v in list(globals().items())
-         if k.startswith("test_") and callable(v)]
+TESTS = [
+    v
+    for k, v in list(globals().items())
+    if k.startswith("test_") and callable(v)
+]
 
 
 def main() -> int:

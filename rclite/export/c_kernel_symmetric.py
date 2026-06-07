@@ -17,6 +17,7 @@ Weights/LUT live in Flash via PROGMEM on AVR. The truncation/wrap uses
 unsigned arithmetic so it is well-defined C (no signed-overflow UB) while
 reproducing numpy's `trunc_i32` / `astype` wrap behaviour.
 """
+
 from __future__ import annotations
 from typing import List
 
@@ -40,9 +41,13 @@ def _sat_storage(v: int, sb: int) -> int:
     return max(lo, min(hi, int(v)))
 
 
-def emit_symmetric_kernel_c(qmodel: QuantizedModel,
-                             fn_name: str = "rc_predict",
-                             *, head: str = None, sparse=None) -> str:
+def emit_symmetric_kernel_c(
+    qmodel: QuantizedModel,
+    fn_name: str = "rc_predict",
+    *,
+    head: str = None,
+    sparse=None,
+) -> str:
     if head not in (None, "logits", "classify", "proba"):
         raise NotImplementedError(
             f"symmetric C kernel supports head in (None, 'logits', "
@@ -66,7 +71,8 @@ def emit_symmetric_kernel_c(qmodel: QuantizedModel,
     if shift_in < 0:
         raise NotImplementedError(
             f"symmetric C emit needs weight_frac+input_frac >= state_frac "
-            f"(shift_in={shift_in})")
+            f"(shift_in={shift_in})"
+        )
     shift_res = weight_frac
     state_scale = 1 << state_frac
     input_scale = 1 << input_frac
@@ -87,7 +93,10 @@ def emit_symmetric_kernel_c(qmodel: QuantizedModel,
     scaling_q = int(round(float(rc.input.input_scaling) * weight_scale))
 
     is_structured = rc.reservoir.topology in (
-        Topology.DLR, Topology.DLRB, Topology.SCR)
+        Topology.DLR,
+        Topology.DLRB,
+        Topology.SCR,
+    )
     topo = rc.reservoir.topology.name
 
     # Chain weights are read straight from the quantized dense W_res so they
@@ -107,6 +116,7 @@ def emit_symmetric_kernel_c(qmodel: QuantizedModel,
     rd_col = None
     if use_sparse:
         from rclite.ir.passes.sparsify import build_csr
+
         _wres_val, _wres_col, _wres_rowptr = build_csr(Wr)
         col_t = "int16_t" if N <= 32767 else "int32_t"
         rd_col = "RC_RD16" if N <= 32767 else "RC_RD32"
@@ -147,10 +157,16 @@ def emit_symmetric_kernel_c(qmodel: QuantizedModel,
             a(_arr("rc_W_res", storage_t, qmodel.W_res_q))
     if proba:
         from rclite.quant.softmax_lut import (
-            SoftmaxLUTSpec, build_params as _build_sm,
+            SoftmaxLUTSpec,
+            build_params as _build_sm,
         )
-        sm = _build_sm(SoftmaxLUTSpec(), 1.0 / cfg.state_scale, sb,
-                       qmodel.target.storage_dtype)
+
+        sm = _build_sm(
+            SoftmaxLUTSpec(),
+            1.0 / cfg.state_scale,
+            sb,
+            qmodel.target.storage_dtype,
+        )
         a(_arr("rc_sm_lut", storage_t, sm.lut_q))
         a(f"#define RC_SM_N {sm.n}")
         a(f"#define RC_SM_DMIN ({sm.dmin_q})")
@@ -167,8 +183,9 @@ def emit_symmetric_kernel_c(qmodel: QuantizedModel,
     a("")
 
     # tanh LUT (linear interp), mirage tanh_lut_q
-    _emit_tanh_lut(a, xmin_q=xmin_q, xmax_q=xmax_q, denom=denom,
-                   lut_n=lut_n, rd=rd)
+    _emit_tanh_lut(
+        a, xmin_q=xmin_q, xmax_q=xmax_q, denom=denom, lut_n=lut_n, rd=rd
+    )
     a("")
 
     # kernel
@@ -186,24 +203,40 @@ def emit_symmetric_kernel_c(qmodel: QuantizedModel,
     # preprocess: u_pre[k] = wrap_s( ((X - offset_q) * scaling_q) >> weight_frac )
     a("        for (k = 0; k < RC_K; k++) {")
     a(f"            int64_t d = (int64_t)X[t*RC_K + k] - ({offset_q});")
-    a(f"            rc_u[k] = rc_ws(rc_w32((d * ({scaling_q})) >> {weight_frac}));")
+    a(
+        f"            rc_u[k] = rc_ws(rc_w32((d * ({scaling_q})) >> {weight_frac}));"
+    )
     a("        }")
     # pre-activation
     a("        for (i = 0; i < RC_N; i++) {")
     a(f"            int32_t acc = {bias_q};")
     a("            for (k = 0; k < RC_K; k++)")
-    a(f"                acc = rc_w32((int64_t)acc + rc_fmul({rd}(&rc_W_in[i*RC_K + k]), rc_u[k], RC_SHIFT_IN));")
-    _emit_wres_accum(a, ind=12, is_structured=is_structured,
-                     use_sparse=use_sparse, topo=topo, N=N,
-                     chain_weight_q=chain_weight_q,
-                     chain_feedback_q=chain_feedback_q, rd=rd, rd_col=rd_col)
+    a(
+        f"                acc = rc_w32((int64_t)acc + rc_fmul({rd}(&rc_W_in[i*RC_K + k]), rc_u[k], RC_SHIFT_IN));"
+    )
+    _emit_wres_accum(
+        a,
+        ind=12,
+        is_structured=is_structured,
+        use_sparse=use_sparse,
+        topo=topo,
+        N=N,
+        chain_weight_q=chain_weight_q,
+        chain_feedback_q=chain_feedback_q,
+        rd=rd,
+        rd_col=rd_col,
+    )
     a("            rc_pre[i] = rc_ws(acc);")
     a("        }")
     # activation + leaky integration
     a("        for (i = 0; i < RC_N; i++) {")
     a("            rc_storage_t act = rc_tanh((int32_t)rc_pre[i]);")
-    a(f"            rc_storage_t t1 = rc_ws(rc_fmul(rc_h[i], {one_minus_leak_q}, RC_STATE_FRAC));")
-    a(f"            rc_storage_t t2 = rc_ws(rc_fmul(act, {leak_q}, RC_STATE_FRAC));")
+    a(
+        f"            rc_storage_t t1 = rc_ws(rc_fmul(rc_h[i], {one_minus_leak_q}, RC_STATE_FRAC));"
+    )
+    a(
+        f"            rc_storage_t t2 = rc_ws(rc_fmul(act, {leak_q}, RC_STATE_FRAC));"
+    )
     a("            rc_h[i] = rc_ws((int32_t)t1 + (int32_t)t2);")
     a("        }")
     # readout (mirage mixed-scale, i64 accumulate)
@@ -212,19 +245,27 @@ def emit_symmetric_kernel_c(qmodel: QuantizedModel,
     a("        for (m = 0; m < RC_M; m++) {")
     a("            int64_t out = 0;")
     if rc.readout.include_bias:
-        a(f"            out += ((int64_t)1 << RC_STATE_FRAC) * (int64_t){rd}(&rc_W_out[m*RC_F + {off_bias}]);")
+        a(
+            f"            out += ((int64_t)1 << RC_STATE_FRAC) * (int64_t){rd}(&rc_W_out[m*RC_F + {off_bias}]);"
+        )
     if rc.readout.include_input:
         a("            for (k = 0; k < RC_K; k++)")
-        a(f"                out += (int64_t){rd}(&rc_W_out[m*RC_F + {off_input} + k]) * (int64_t)X[t*RC_K + k];")
+        a(
+            f"                out += (int64_t){rd}(&rc_W_out[m*RC_F + {off_input} + k]) * (int64_t)X[t*RC_K + k];"
+        )
     a("            for (j = 0; j < RC_N; j++)")
-    a(f"                out += (int64_t){rd}(&rc_W_out[m*RC_F + {off_state} + j]) * (int64_t)rc_h[j];")
+    a(
+        f"                out += (int64_t){rd}(&rc_W_out[m*RC_F + {off_state} + j]) * (int64_t)rc_h[j];"
+    )
     a("            int64_t sh = out >> RC_STATE_FRAC;")
     a("            if (sh < RC_QMIN) sh = RC_QMIN;")
     a("            if (sh > RC_QMAX) sh = RC_QMAX;")
     if classify:
         # argmax over the (saturated) quantized scores — monotone, so the
         # class id matches the float readout's argmax.
-        a("            if (m == 0 || sh > best_v) { best_v = sh; best_m = m; }")
+        a(
+            "            if (m == 0 || sh > best_v) { best_v = sh; best_m = m; }"
+        )
     elif proba:
         a("            rc_lg[m] = (rc_storage_t)sh;")
     else:
@@ -235,17 +276,27 @@ def emit_symmetric_kernel_c(qmodel: QuantizedModel,
     elif proba:
         # fixed-point softmax over rc_lg[] (exp LUT), bit-exact with softmax_q
         a("        sm_max = rc_lg[0];")
-        a("        for (m = 1; m < RC_M; m++) if (rc_lg[m] > sm_max) sm_max = rc_lg[m];")
+        a(
+            "        for (m = 1; m < RC_M; m++) if (rc_lg[m] > sm_max) sm_max = rc_lg[m];"
+        )
         a("        sm_sum = 0;")
         a("        for (m = 0; m < RC_M; m++) {")
         a("            int32_t d = (int32_t)rc_lg[m] - sm_max;")
         a("            if (d < RC_SM_DMIN) d = RC_SM_DMIN;")
-        a("            int64_t pos = ((int64_t)(d - (RC_SM_DMIN)) * (RC_SM_N - 1) << RC_SM_IDXF) / (-(RC_SM_DMIN));")
+        a(
+            "            int64_t pos = ((int64_t)(d - (RC_SM_DMIN)) * (RC_SM_N - 1) << RC_SM_IDXF) / (-(RC_SM_DMIN));"
+        )
         a("            int32_t i0 = (int32_t)(pos >> RC_SM_IDXF);")
-        a("            if (i0 < 0) i0 = 0; if (i0 > RC_SM_N - 2) i0 = RC_SM_N - 2;")
+        a(
+            "            if (i0 < 0) i0 = 0; if (i0 > RC_SM_N - 2) i0 = RC_SM_N - 2;"
+        )
         a("            int64_t frac = pos - ((int64_t)i0 << RC_SM_IDXF);")
-        a(f"            int32_t y0 = {rd}(&rc_sm_lut[i0]); int32_t y1 = {rd}(&rc_sm_lut[i0 + 1]);")
-        a("            int64_t ev = (int64_t)y0 + (((int64_t)(y1 - y0) * frac) >> RC_SM_IDXF);")
+        a(
+            f"            int32_t y0 = {rd}(&rc_sm_lut[i0]); int32_t y1 = {rd}(&rc_sm_lut[i0 + 1]);"
+        )
+        a(
+            "            int64_t ev = (int64_t)y0 + (((int64_t)(y1 - y0) * frac) >> RC_SM_IDXF);"
+        )
         a("            rc_eq[m] = (int32_t)ev; sm_sum += ev;")
         a("        }")
         a("        for (m = 0; m < RC_M; m++) {")
@@ -267,6 +318,7 @@ def emit_symmetric_kernel_c(qmodel: QuantizedModel,
 # emitters bit-exact with each other (and with the executor) by construction.
 # --------------------------------------------------------------------------
 
+
 def _emit_progmem_prologue(a) -> None:
     """`#include`s and the AVR-vs-hosted PROGMEM / table-read macros."""
     a("#include <stdint.h>")
@@ -286,7 +338,9 @@ def _emit_progmem_prologue(a) -> None:
 
 def _emit_fixed_helpers(a, storage_t: str) -> None:
     """Two's-complement i32 wrap (`rc_w32`/`rc_ws`) and `(a*b)>>s` (`rc_fmul`)."""
-    a("static int32_t rc_w32(int64_t v){ return (int32_t)(uint32_t)(uint64_t)v; }")
+    a(
+        "static int32_t rc_w32(int64_t v){ return (int32_t)(uint32_t)(uint64_t)v; }"
+    )
     a(f"static rc_storage_t rc_ws(int32_t v){{ return ({storage_t})v; }}")
     a("static int32_t rc_fmul(int32_t a, int32_t b, int s){")
     a("    return rc_w32(((int64_t)a * (int64_t)b) >> s);")
@@ -306,13 +360,26 @@ def _emit_tanh_lut(a, *, xmin_q, xmax_q, denom, lut_n, rd) -> None:
     a("    int32_t frac = pos - rc_w32((int64_t)i0 << RC_STATE_FRAC);")
     a(f"    int32_t y0 = {rd}(&rc_lut[i0]);")
     a(f"    int32_t y1 = {rd}(&rc_lut[i0 + 1]);")
-    a("    int32_t interp = rc_w32((int64_t)y0 + (((int64_t)(y1 - y0) * frac) >> RC_STATE_FRAC));")
+    a(
+        "    int32_t interp = rc_w32((int64_t)y0 + (((int64_t)(y1 - y0) * frac) >> RC_STATE_FRAC));"
+    )
     a("    return rc_ws(interp);")
     a("}")
 
 
-def _emit_wres_accum(a, *, ind, is_structured, use_sparse, topo, N,
-                     chain_weight_q, chain_feedback_q, rd, rd_col=None) -> None:
+def _emit_wres_accum(
+    a,
+    *,
+    ind,
+    is_structured,
+    use_sparse,
+    topo,
+    N,
+    chain_weight_q,
+    chain_feedback_q,
+    rd,
+    rd_col=None,
+) -> None:
     """Emit the W_res contribution into `acc`, indentation-parametrized.
 
     `ind` is the base indent (spaces) of the statement: the inference kernel
@@ -321,38 +388,54 @@ def _emit_wres_accum(a, *, ind, is_structured, use_sparse, topo, N,
     paths (structured chain / CSR sparse / dense matvec) match the executor's
     sparse-over-dense matmul and are bit-exact across both callers.
     """
-    b = " " * ind          # statement: for / if / opening brace
-    c = " " * (ind + 2)    # continuation + nested for/if
-    d = " " * (ind + 4)    # innermost MAC body
+    b = " " * ind  # statement: for / if / opening brace
+    c = " " * (ind + 2)  # continuation + nested for/if
+    d = " " * (ind + 4)  # innermost MAC body
     if is_structured:
         if topo == "SCR":
             a(f"{b}{{ int32_t ip = (i == 0) ? {N - 1} : (i - 1);")
-            a(f"{c}acc = rc_w32((int64_t)acc + rc_fmul({chain_weight_q}, rc_h[ip], RC_SHIFT_RES)); }}")
+            a(
+                f"{c}acc = rc_w32((int64_t)acc + rc_fmul({chain_weight_q}, rc_h[ip], RC_SHIFT_RES)); }}"
+            )
         elif topo == "DLR":
             a(f"{b}if (i > 0)")
-            a(f"{d}acc = rc_w32((int64_t)acc + rc_fmul({chain_weight_q}, rc_h[i-1], RC_SHIFT_RES));")
+            a(
+                f"{d}acc = rc_w32((int64_t)acc + rc_fmul({chain_weight_q}, rc_h[i-1], RC_SHIFT_RES));"
+            )
         elif topo == "DLRB":
             a(f"{b}if (i > 0)")
-            a(f"{d}acc = rc_w32((int64_t)acc + rc_fmul({chain_weight_q}, rc_h[i-1], RC_SHIFT_RES));")
+            a(
+                f"{d}acc = rc_w32((int64_t)acc + rc_fmul({chain_weight_q}, rc_h[i-1], RC_SHIFT_RES));"
+            )
             a(f"{b}if (i < RC_N - 1)")
-            a(f"{d}acc = rc_w32((int64_t)acc + rc_fmul({chain_feedback_q}, rc_h[i+1], RC_SHIFT_RES));")
+            a(
+                f"{d}acc = rc_w32((int64_t)acc + rc_fmul({chain_feedback_q}, rc_h[i+1], RC_SHIFT_RES));"
+            )
         else:
             raise ValueError(f"_emit_wres_accum: unexpected topology {topo}")
     elif use_sparse:
         a(f"{b}{{ int32_t rp = RC_RD32(&rc_W_res_rowptr[i]);")
         a(f"{c}int32_t rpe = RC_RD32(&rc_W_res_rowptr[i+1]);")
         a(f"{c}for (j = rp; j < rpe; j++)")
-        a(f"{d}acc = rc_w32((int64_t)acc + rc_fmul({rd}(&rc_W_res_val[j]), "
-          f"rc_h[{rd_col}(&rc_W_res_col[j])], RC_SHIFT_RES)); }}")
+        a(
+            f"{d}acc = rc_w32((int64_t)acc + rc_fmul({rd}(&rc_W_res_val[j]), "
+            f"rc_h[{rd_col}(&rc_W_res_col[j])], RC_SHIFT_RES)); }}"
+        )
     else:
         a(f"{b}for (j = 0; j < RC_N; j++)")
-        a(f"{d}acc = rc_w32((int64_t)acc + rc_fmul({rd}(&rc_W_res[i*RC_N + j]), rc_h[j], RC_SHIFT_RES));")
+        a(
+            f"{d}acc = rc_w32((int64_t)acc + rc_fmul({rd}(&rc_W_res[i*RC_N + j]), rc_h[j], RC_SHIFT_RES));"
+        )
 
 
-def emit_symmetric_online_kernel_c(qmodel: QuantizedModel,
-                                    learning_rate: float,
-                                    *, normalized: bool = False,
-                                    delta: float = 1.0, sparse=None) -> str:
+def emit_symmetric_online_kernel_c(
+    qmodel: QuantizedModel,
+    learning_rate: float,
+    *,
+    normalized: bool = False,
+    delta: float = 1.0,
+    sparse=None,
+) -> str:
     """Portable-C emitter for **on-device integer LMS / NLMS** readout training.
 
     Bit-exact with `rclite.quant.online.IntegerLMSLearner` (the Python
@@ -402,7 +485,8 @@ def emit_symmetric_online_kernel_c(qmodel: QuantizedModel,
     if shift_in < 0:
         raise NotImplementedError(
             f"symmetric online C emit needs weight_frac+input_frac >= "
-            f"state_frac (shift_in={shift_in})")
+            f"state_frac (shift_in={shift_in})"
+        )
     state_scale = 1 << state_frac
     input_scale = 1 << input_frac
     weight_scale = 1 << weight_frac
@@ -423,11 +507,15 @@ def emit_symmetric_online_kernel_c(qmodel: QuantizedModel,
     if normalized and shift_u < 0:
         raise NotImplementedError(
             "NLMS needs 2*input_frac >= state_frac for the squared-norm fixed "
-            f"point (input_frac={input_frac}, state_frac={state_frac})")
+            f"point (input_frac={input_frac}, state_frac={state_frac})"
+        )
     delta_q = int(float(delta) * state_scale)
 
     is_structured = rc.reservoir.topology in (
-        Topology.DLR, Topology.DLRB, Topology.SCR)
+        Topology.DLR,
+        Topology.DLRB,
+        Topology.SCR,
+    )
     topo = rc.reservoir.topology.name
     Wr = np.asarray(qmodel.W_res_q)
     chain_weight_q = int(Wr[1, 0]) if (is_structured and N > 1) else 0
@@ -437,6 +525,7 @@ def emit_symmetric_online_kernel_c(qmodel: QuantizedModel,
     rd_col = None
     if use_sparse:
         from rclite.ir.passes.sparsify import build_csr
+
         _wres_val, _wres_col, _wres_rowptr = build_csr(Wr)
         col_t = "int16_t" if N <= 32767 else "int32_t"
         rd_col = "RC_RD16" if N <= 32767 else "RC_RD32"
@@ -450,9 +539,15 @@ def emit_symmetric_online_kernel_c(qmodel: QuantizedModel,
     L: List[str] = []
     a = L.append
 
-    a("/* Auto-generated by rclite — symmetric Q-format ONLINE (integer LMS) kernel. */")
-    a("/* Portable C99. Bit-exact with rclite.quant.online.IntegerLMSLearner. */")
-    a("/* rc_W_out lives in RAM (mutated by rc_train_step); other tables are const. */")
+    a(
+        "/* Auto-generated by rclite — symmetric Q-format ONLINE (integer LMS) kernel. */"
+    )
+    a(
+        "/* Portable C99. Bit-exact with rclite.quant.online.IntegerLMSLearner. */"
+    )
+    a(
+        "/* rc_W_out lives in RAM (mutated by rc_train_step); other tables are const. */"
+    )
     _emit_progmem_prologue(a)
     a("")
     a(f"#define RC_N {N}")
@@ -483,7 +578,9 @@ def emit_symmetric_online_kernel_c(qmodel: QuantizedModel,
             a(_arr("rc_W_res_rowptr", "int32_t", _wres_rowptr))
         else:
             a(_arr("rc_W_res", storage_t, qmodel.W_res_q))
-    wout_body = ", ".join(str(int(v)) for v in np.asarray(qmodel.W_out_q).reshape(-1))
+    wout_body = ", ".join(
+        str(int(v)) for v in np.asarray(qmodel.W_out_q).reshape(-1)
+    )
     a(f"static rc_storage_t rc_W_out[] = {{ {wout_body} }};")
     a("")
     a("static rc_storage_t rc_h[RC_N];")
@@ -505,40 +602,63 @@ def emit_symmetric_online_kernel_c(qmodel: QuantizedModel,
     a("")
 
     # tanh LUT (linear interp), identical to the inference kernel
-    _emit_tanh_lut(a, xmin_q=xmin_q, xmax_q=xmax_q, denom=denom,
-                   lut_n=lut_n, rd=rd)
+    _emit_tanh_lut(
+        a, xmin_q=xmin_q, xmax_q=xmax_q, denom=denom, lut_n=lut_n, rd=rd
+    )
     a("")
 
     # forward one step (advance rc_h) + readout into y_pred_q (state scale).
     # The readout mirrors predict_one_q fed `u_q`.
-    a("static void rc_forward_predict(const rc_storage_t *u_q, int32_t *y_pred_q){")
+    a(
+        "static void rc_forward_predict(const rc_storage_t *u_q, int32_t *y_pred_q){"
+    )
     a("    int32_t i, j, k, m;")
     a("    for (i = 0; i < RC_N; i++) {")
     a(f"        int32_t acc = {bias_q};")
     a("        for (k = 0; k < RC_K; k++)")
-    a(f"            acc = rc_w32((int64_t)acc + rc_fmul({rd}(&rc_W_in[i*RC_K + k]), u_q[k], RC_SHIFT_IN));")
+    a(
+        f"            acc = rc_w32((int64_t)acc + rc_fmul({rd}(&rc_W_in[i*RC_K + k]), u_q[k], RC_SHIFT_IN));"
+    )
     # W_res accumulation (shared with the inference kernel; 8-space indent here)
-    _emit_wres_accum(a, ind=8, is_structured=is_structured,
-                     use_sparse=use_sparse, topo=topo, N=N,
-                     chain_weight_q=chain_weight_q,
-                     chain_feedback_q=chain_feedback_q, rd=rd, rd_col=rd_col)
+    _emit_wres_accum(
+        a,
+        ind=8,
+        is_structured=is_structured,
+        use_sparse=use_sparse,
+        topo=topo,
+        N=N,
+        chain_weight_q=chain_weight_q,
+        chain_feedback_q=chain_feedback_q,
+        rd=rd,
+        rd_col=rd_col,
+    )
     a("        rc_pre[i] = rc_ws(acc);")
     a("    }")
     a("    for (i = 0; i < RC_N; i++) {")
     a("        rc_storage_t act = rc_tanh((int32_t)rc_pre[i]);")
-    a(f"        rc_storage_t t1 = rc_ws(rc_fmul(rc_h[i], {one_minus_leak_q}, RC_STATE_FRAC));")
-    a(f"        rc_storage_t t2 = rc_ws(rc_fmul(act, {leak_q}, RC_STATE_FRAC));")
+    a(
+        f"        rc_storage_t t1 = rc_ws(rc_fmul(rc_h[i], {one_minus_leak_q}, RC_STATE_FRAC));"
+    )
+    a(
+        f"        rc_storage_t t2 = rc_ws(rc_fmul(act, {leak_q}, RC_STATE_FRAC));"
+    )
     a("        rc_h[i] = rc_ws((int32_t)t1 + (int32_t)t2);")
     a("    }")
     a("    for (m = 0; m < RC_M; m++) {")
     a("        int64_t out = 0;")
     if include_bias:
-        a(f"        out += ((int64_t)1 << RC_STATE_FRAC) * (int64_t)rc_W_out[m*RC_F + {off_bias}];")
+        a(
+            f"        out += ((int64_t)1 << RC_STATE_FRAC) * (int64_t)rc_W_out[m*RC_F + {off_bias}];"
+        )
     if include_input:
         a("        for (k = 0; k < RC_K; k++)")
-        a(f"            out += (int64_t)rc_W_out[m*RC_F + {off_input} + k] * (int64_t)u_q[k];")
+        a(
+            f"            out += (int64_t)rc_W_out[m*RC_F + {off_input} + k] * (int64_t)u_q[k];"
+        )
     a("        for (j = 0; j < RC_N; j++)")
-    a(f"            out += (int64_t)rc_W_out[m*RC_F + {off_state} + j] * (int64_t)rc_h[j];")
+    a(
+        f"            out += (int64_t)rc_W_out[m*RC_F + {off_state} + j] * (int64_t)rc_h[j];"
+    )
     a("        int64_t sh = out >> RC_STATE_FRAC;")
     a("        if (sh < RC_QMIN) sh = RC_QMIN;")
     a("        if (sh > RC_QMAX) sh = RC_QMAX;")
@@ -547,7 +667,9 @@ def emit_symmetric_online_kernel_c(qmodel: QuantizedModel,
     a("}")
     a("")
 
-    a("void rc_train_reset(void){ int32_t i; for (i = 0; i < RC_N; i++) rc_h[i] = 0; }")
+    a(
+        "void rc_train_reset(void){ int32_t i; for (i = 0; i < RC_N; i++) rc_h[i] = 0; }"
+    )
     a("")
     a("void rc_infer_step(const rc_storage_t *u_q, int32_t *y_pred_q){")
     a("    rc_forward_predict(u_q, y_pred_q);")
@@ -580,35 +702,49 @@ def emit_symmetric_online_kernel_c(qmodel: QuantizedModel,
             a("    norm += ((int64_t)1 << RC_STATE_FRAC);")
         if include_input:
             a("    for (k = 0; k < RC_K; k++)")
-            a("        norm += ((int64_t)u_q[k] * (int64_t)u_q[k]) >> RC_SHIFT_U;")
+            a(
+                "        norm += ((int64_t)u_q[k] * (int64_t)u_q[k]) >> RC_SHIFT_U;"
+            )
         a("    for (j = 0; j < RC_N; j++)")
-        a("        norm += ((int64_t)rc_h[j] * (int64_t)rc_h[j]) >> RC_STATE_FRAC;")
+        a(
+            "        norm += ((int64_t)rc_h[j] * (int64_t)rc_h[j]) >> RC_STATE_FRAC;"
+        )
         a("    if (norm < 1) norm = 1;")
     a("    for (m = 0; m < RC_M; m++) {")
     a("        int64_t err = (int64_t)y_target_q[m] - (int64_t)y_pred_q[m];")
     if include_bias:
         a(f"        {{ int64_t dw = {bias_dw};")
-        a(f"          rc_W_out[m*RC_F + {off_bias}] = "
-          f"rc_sadd_sat(rc_W_out[m*RC_F + {off_bias}], dw); }}")
+        a(
+            f"          rc_W_out[m*RC_F + {off_bias}] = "
+            f"rc_sadd_sat(rc_W_out[m*RC_F + {off_bias}], dw); }}"
+        )
     if include_input:
         a("        for (k = 0; k < RC_K; k++) {")
-        a("            int64_t prod = (int64_t)RC_LR_Q * err * (int64_t)u_q[k];")
+        a(
+            "            int64_t prod = (int64_t)RC_LR_Q * err * (int64_t)u_q[k];"
+        )
         a(f"            int64_t dw = {input_dw};")
-        a(f"            rc_W_out[m*RC_F + {off_input} + k] = "
-          f"rc_sadd_sat(rc_W_out[m*RC_F + {off_input} + k], dw);")
+        a(
+            f"            rc_W_out[m*RC_F + {off_input} + k] = "
+            f"rc_sadd_sat(rc_W_out[m*RC_F + {off_input} + k], dw);"
+        )
         a("        }")
     a("        for (j = 0; j < RC_N; j++) {")
     a("            int64_t prod = (int64_t)RC_LR_Q * err * (int64_t)rc_h[j];")
     a(f"            int64_t dw = {state_dw};")
-    a(f"            rc_W_out[m*RC_F + {off_state} + j] = "
-      f"rc_sadd_sat(rc_W_out[m*RC_F + {off_state} + j], dw);")
+    a(
+        f"            rc_W_out[m*RC_F + {off_state} + j] = "
+        f"rc_sadd_sat(rc_W_out[m*RC_F + {off_state} + j], dw);"
+    )
     a("        }")
     a("    }")
     a("}")
     a("")
     # checkpoint accessor: copy the (possibly learned) readout out as int32.
     a("void rc_export_W_out(int32_t *dst){")
-    a("    int32_t i; for (i = 0; i < RC_M * RC_F; i++) dst[i] = (int32_t)rc_W_out[i];")
+    a(
+        "    int32_t i; for (i = 0; i < RC_M * RC_F; i++) dst[i] = (int32_t)rc_W_out[i];"
+    )
     a("}")
     a("")
     return "\n".join(L)

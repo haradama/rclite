@@ -18,6 +18,7 @@ Feature parity with `_AffineLowerer`:
 Toolchain note: link with `gcc` (the `clang` that may be on PATH is the
 llvm-mos cross compiler and cannot link host objects).
 """
+
 from __future__ import annotations
 import ctypes
 import shutil
@@ -54,13 +55,18 @@ def _flat_i(arr, bits) -> str:
 
 def _global(name, arr, bits) -> str:
     n = int(np.asarray(arr).size)
-    return (f'memref.global "private" constant @{name} : memref<{n}xi{bits}> '
-            f"= dense<[{_flat_i(arr, bits)}]>")
+    return (
+        f'memref.global "private" constant @{name} : memref<{n}xi{bits}> '
+        f"= dense<[{_flat_i(arr, bits)}]>"
+    )
 
 
-def emit_affine_mlir(qmodel: AffineQuantizedModel, *,
-                     head: Optional[str] = None,
-                     sparse: Optional[str] = None) -> str:
+def emit_affine_mlir(
+    qmodel: AffineQuantizedModel,
+    *,
+    head: Optional[str] = None,
+    sparse: Optional[str] = None,
+) -> str:
     """Emit textual MLIR for an affine quantized reservoir (full feature set)."""
     if head not in _HEADS:
         raise ValueError(f"head must be one of {_HEADS}, got {head!r}")
@@ -70,7 +76,10 @@ def emit_affine_mlir(qmodel: AffineQuantizedModel, *,
     strat = qmodel.lut_strategy
     topo = rc.reservoir.topology
     structured = topo in _STRUCTURED
-    if qmodel.M_res_M0_arr is not None or qmodel.M_out_state_M0_arr is not None:
+    if (
+        qmodel.M_res_M0_arr is not None
+        or qmodel.M_out_state_M0_arr is not None
+    ):
         raise NotImplementedError("MLIR affine: per-channel not yet supported")
     use_sparse = bool(sparse) and not structured
 
@@ -108,6 +117,7 @@ def emit_affine_mlir(qmodel: AffineQuantizedModel, *,
     if not structured:
         if use_sparse:
             from rclite.ir.passes.sparsify import build_csr
+
             val, col, rptr = build_csr(np.asarray(qmodel.W_res_q))
             a(_global("Wres_val", val, sb))
             a(_global("Wres_col", col, 32))
@@ -119,16 +129,28 @@ def emit_affine_mlir(qmodel: AffineQuantizedModel, *,
         a(_global("lut", qmodel.lut_q, sb))
     if proba:
         from rclite.quant.softmax_lut import SoftmaxLUTSpec, build_params
-        sm = build_params(SoftmaxLUTSpec(), s_diff=cfg.output.scale,
-                          storage_bits=sb, storage_dtype=np.dtype(f"int{sb}"))
+
+        sm = build_params(
+            SoftmaxLUTSpec(),
+            s_diff=cfg.output.scale,
+            storage_bits=sb,
+            storage_dtype=np.dtype(f"int{sb}"),
+        )
         a(_global("sm_lut", sm.lut_q, sb))
-        sm_n, sm_dmin, sm_idxf, sm_pf = sm.n, sm.dmin_q, sm.idx_frac, sm.prob_frac
+        sm_n, sm_dmin, sm_idxf, sm_pf = (
+            sm.n,
+            sm.dmin_q,
+            sm.idx_frac,
+            sm.prob_frac,
+        )
         sm_size = int(np.asarray(sm.lut_q).size)
 
     # chain weights (structured), quantized at W_res scale like ir_builder
     if structured:
+
         def _qchain(v):
             return max(qmin, min(qmax, int(round(float(v) / cfg.W_res.scale))))
+
         cw_q = _qchain(rc.reservoir.chain_weight)
         cf_q = _qchain(rc.reservoir.chain_feedback)
 
@@ -136,7 +158,9 @@ def emit_affine_mlir(qmodel: AffineQuantizedModel, *,
     def rq_fn(name, M0, n):
         a(f"func.func private @{name}(%x: i32) -> i32 {{")
         if M0 == 0:
-            a("  %z = arith.constant 0 : i32"); a("  return %z : i32"); a("}")
+            a("  %z = arith.constant 0 : i32")
+            a("  return %z : i32")
+            a("}")
             return
         a("  %x64 = arith.extsi %x : i32 to i64")
         a(f"  %m0 = arith.constant {M0} : i64")
@@ -268,8 +292,10 @@ def emit_affine_mlir(qmodel: AffineQuantizedModel, *,
     a("}")
 
     # ---- main ----
-    a(f"func.func @rc_predict(%T: i64, %X: memref<?xi{sb}>, "
-      f"%Y: memref<?xi{out_bits}>) attributes {{llvm.emit_c_interface}} {{")
+    a(
+        f"func.func @rc_predict(%T: i64, %X: memref<?xi{sb}>, "
+        f"%Y: memref<?xi{out_bits}>) attributes {{llvm.emit_c_interface}} {{"
+    )
     a("  %c0 = arith.constant 0 : index")
     a("  %c1 = arith.constant 1 : index")
     a(f"  %cN = arith.constant {N} : index")
@@ -279,8 +305,8 @@ def emit_affine_mlir(qmodel: AffineQuantizedModel, *,
     a(f"  %zps32 = arith.constant {zp_state} : i32")
     a(f"  %zps = arith.constant {zp_state} : i{sb}")
     a("  %Ti = arith.index_cast %T : i64 to index")
-    a(f"  %Win = memref.get_global @W_in : memref<{N*K}xi{sb}>")
-    a(f"  %Wout = memref.get_global @W_out : memref<{M*F}xi{wob}>")
+    a(f"  %Win = memref.get_global @W_in : memref<{N * K}xi{sb}>")
+    a(f"  %Wout = memref.get_global @W_out : memref<{M * F}xi{wob}>")
     a(f"  %rsIn = memref.get_global @rs_in : memref<{N}xi32>")
     a(f"  %rsOS = memref.get_global @rs_out_s : memref<{M}xi32>")
     if inc_i:
@@ -288,11 +314,15 @@ def emit_affine_mlir(qmodel: AffineQuantizedModel, *,
     if not structured:
         a(f"  %rsRes = memref.get_global @rs_res : memref<{N}xi32>")
         if use_sparse:
-            a(f"  %WrV = memref.get_global @Wres_val : memref<{val.size}xi{sb}>")
+            a(
+                f"  %WrV = memref.get_global @Wres_val : memref<{val.size}xi{sb}>"
+            )
             a(f"  %WrC = memref.get_global @Wres_col : memref<{col.size}xi32>")
-            a(f"  %WrP = memref.get_global @Wres_rptr : memref<{rptr.size}xi32>")
+            a(
+                f"  %WrP = memref.get_global @Wres_rptr : memref<{rptr.size}xi32>"
+            )
         else:
-            a(f"  %Wres = memref.get_global @W_res : memref<{N*N}xi{sb}>")
+            a(f"  %Wres = memref.get_global @W_res : memref<{N * N}xi{sb}>")
     a(f"  %h = memref.alloca() : memref<{N}xi{sb}>")
     a(f"  %pre = memref.alloca() : memref<{N}xi{sb}>")
     if int_pre:
@@ -328,11 +358,13 @@ def emit_affine_mlir(qmodel: AffineQuantizedModel, *,
     # --- pre-activation: for i in 0..N ---
     a("    scf.for %i = %c0 to %cN step %c1 {")
     # acc_in
-    a("      %accin = scf.for %k = %c0 to %cK step %c1 "
-      "iter_args(%ai = %z64) -> (i64) {")
+    a(
+        "      %accin = scf.for %k = %c0 to %cK step %c1 "
+        "iter_args(%ai = %z64) -> (i64) {"
+    )
     a("        %iKin = arith.muli %i, %cK : index")
     a("        %widx = arith.addi %iKin, %k : index")
-    a(f"        %w = memref.load %Win[%widx] : memref<{N*K}xi{sb}>")
+    a(f"        %w = memref.load %Win[%widx] : memref<{N * K}xi{sb}>")
     if int_pre:
         a(f"        %x = memref.load %upre[%k] : memref<{K}xi{sb}>")
     else:
@@ -401,13 +433,21 @@ def emit_affine_mlir(qmodel: AffineQuantizedModel, *,
         a("      %rqres = func.call @rq_res(%accres) : (i32) -> i32")
     else:
         if use_sparse:
-            a("      %rp0 = memref.load %WrP[%i] : memref<" + f"{rptr.size}xi32>")
+            a(
+                "      %rp0 = memref.load %WrP[%i] : memref<"
+                + f"{rptr.size}xi32>"
+            )
             a("      %ip1 = arith.addi %i, %c1 : index")
-            a("      %rp1 = memref.load %WrP[%ip1] : memref<" + f"{rptr.size}xi32>")
+            a(
+                "      %rp1 = memref.load %WrP[%ip1] : memref<"
+                + f"{rptr.size}xi32>"
+            )
             a("      %rp0i = arith.index_cast %rp0 : i32 to index")
             a("      %rp1i = arith.index_cast %rp1 : i32 to index")
-            a("      %accr = scf.for %p = %rp0i to %rp1i step %c1 "
-              "iter_args(%ar = %z64) -> (i64) {")
+            a(
+                "      %accr = scf.for %p = %rp0i to %rp1i step %c1 "
+                "iter_args(%ar = %z64) -> (i64) {"
+            )
             a(f"        %w = memref.load %WrV[%p] : memref<{val.size}xi{sb}>")
             a(f"        %cj = memref.load %WrC[%p] : memref<{col.size}xi32>")
             a("        %cji = arith.index_cast %cj : i32 to index")
@@ -420,10 +460,12 @@ def emit_affine_mlir(qmodel: AffineQuantizedModel, *,
             a("      }")
         else:
             a("      %iN = arith.muli %i, %cN : index")
-            a("      %accr = scf.for %j = %c0 to %cN step %c1 "
-              "iter_args(%ar = %z64) -> (i64) {")
+            a(
+                "      %accr = scf.for %j = %c0 to %cN step %c1 "
+                "iter_args(%ar = %z64) -> (i64) {"
+            )
             a("        %widx = arith.addi %iN, %j : index")
-            a(f"        %w = memref.load %Wres[%widx] : memref<{N*N}xi{sb}>")
+            a(f"        %w = memref.load %Wres[%widx] : memref<{N * N}xi{sb}>")
             a(f"        %hv = memref.load %h[%j] : memref<{N}xi{sb}>")
             a(f"        %w64 = arith.extsi %w : i{sb} to i64")
             a(f"        %h64 = arith.extsi %hv : i{sb} to i64")
@@ -449,7 +491,12 @@ def emit_affine_mlir(qmodel: AffineQuantizedModel, *,
     # --- activation + leaky integration ---
     a("    scf.for %i = %c0 to %cN step %c1 {")
     a(f"      %p = memref.load %pre[%i] : memref<{N}xi{sb}>")
-    a("      %act = func.call @activate(%p) : (i" + str(sb) + ") -> i" + str(sb))
+    a(
+        "      %act = func.call @activate(%p) : (i"
+        + str(sb)
+        + ") -> i"
+        + str(sb)
+    )
     a("      %act32 = arith.extsi %act : i" + str(sb) + " to i32")
     a(f"      %hold = memref.load %h[%i] : memref<{N}xi{sb}>")
     a("      %hold32 = arith.extsi %hold : i" + str(sb) + " to i32")
@@ -471,7 +518,7 @@ def emit_affine_mlir(qmodel: AffineQuantizedModel, *,
     if inc_b:
         a(f"      %obcol = arith.constant {off_b} : index")
         a("      %obidx = arith.addi %mF, %obcol : index")
-        a(f"      %w0 = memref.load %Wout[%obidx] : memref<{M*F}xi{wob}>")
+        a(f"      %w0 = memref.load %Wout[%obidx] : memref<{M * F}xi{wob}>")
         a(f"      %w064 = arith.extsi %w0 : i{wob} to i64")
         a("      %cb = func.call @clip32(%w064) : (i64) -> i32")
         a("      %rqb = func.call @rq_ob(%cb) : (i32) -> i32")
@@ -479,11 +526,13 @@ def emit_affine_mlir(qmodel: AffineQuantizedModel, *,
     yb = "%yb" if inc_b else "%zpo"
     if inc_i:
         a(f"      %ci = arith.constant {off_i} : index")
-        a("      %accoi = scf.for %k = %c0 to %cK step %c1 "
-          "iter_args(%ao = %z64) -> (i64) {")
+        a(
+            "      %accoi = scf.for %k = %c0 to %cK step %c1 "
+            "iter_args(%ao = %z64) -> (i64) {"
+        )
         a("        %coff = arith.addi %ci, %k : index")
         a("        %widx = arith.addi %mF, %coff : index")
-        a(f"        %w = memref.load %Wout[%widx] : memref<{M*F}xi{wob}>")
+        a(f"        %w = memref.load %Wout[%widx] : memref<{M * F}xi{wob}>")
         a("        %xidx = arith.addi %tK, %k : index")
         a(f"        %x = memref.load %X[%xidx] : memref<?xi{sb}>")
         a(f"        %w64 = arith.extsi %w : i{wob} to i64")
@@ -502,11 +551,13 @@ def emit_affine_mlir(qmodel: AffineQuantizedModel, *,
         a(f"      %yi = arith.addi {yb}, %rqoi : i32")
     yi = "%yi" if inc_i else yb
     a(f"      %cs = arith.constant {off_s} : index")
-    a("      %accos = scf.for %j = %c0 to %cN step %c1 "
-      "iter_args(%ao = %z64) -> (i64) {")
+    a(
+        "      %accos = scf.for %j = %c0 to %cN step %c1 "
+        "iter_args(%ao = %z64) -> (i64) {"
+    )
     a("        %coff = arith.addi %cs, %j : index")
     a("        %widx = arith.addi %mF, %coff : index")
-    a(f"        %w = memref.load %Wout[%widx] : memref<{M*F}xi{wob}>")
+    a(f"        %w = memref.load %Wout[%widx] : memref<{M * F}xi{wob}>")
     a(f"        %hv = memref.load %h[%j] : memref<{N}xi{sb}>")
     a(f"        %w64 = arith.extsi %w : i{wob} to i64")
     a(f"        %h64 = arith.extsi %hv : i{sb} to i64")
@@ -533,8 +584,10 @@ def emit_affine_mlir(qmodel: AffineQuantizedModel, *,
     # --- head ---
     if classify:
         a(f"      %bv0 = memref.load %logits[%c0] : memref<{M}xi{sb}>")
-        a("      %best:2 = scf.for %m = %c1 to %cM step %c1 "
-          f"iter_args(%bv = %bv0, %bi = %c0) -> (i{sb}, index) {{")
+        a(
+            "      %best:2 = scf.for %m = %c1 to %cM step %c1 "
+            f"iter_args(%bv = %bv0, %bi = %c0) -> (i{sb}, index) {{"
+        )
         a(f"        %v = memref.load %logits[%m] : memref<{M}xi{sb}>")
         a(f"        %gt = arith.cmpi sgt, %v, %bv : i{sb}")
         a(f"        %nv = arith.select %gt, %v, %bv : i{sb}")
@@ -547,8 +600,10 @@ def emit_affine_mlir(qmodel: AffineQuantizedModel, *,
         # max over logits (i32)
         a(f"      %mx0 = memref.load %logits[%c0] : memref<{M}xi{sb}>")
         a(f"      %mx032 = arith.extsi %mx0 : i{sb} to i32")
-        a("      %mx = scf.for %m = %c1 to %cM step %c1 "
-          "iter_args(%mxa = %mx032) -> (i32) {")
+        a(
+            "      %mx = scf.for %m = %c1 to %cM step %c1 "
+            "iter_args(%mxa = %mx032) -> (i32) {"
+        )
         a(f"        %v = memref.load %logits[%m] : memref<{M}xi{sb}>")
         a(f"        %v32 = arith.extsi %v : i{sb} to i32")
         a("        %gt = arith.cmpi sgt, %v32, %mxa : i32")
@@ -560,8 +615,10 @@ def emit_affine_mlir(qmodel: AffineQuantizedModel, *,
         a(f"      %nm1c = arith.constant {sm_n - 1} : i64")
         a(f"      %idxf64 = arith.constant {sm_idxf} : i64")
         a(f"      %nm2i = arith.constant {sm_n - 2} : i64")
-        a("      %sum = scf.for %m = %c0 to %cM step %c1 "
-          "iter_args(%sa = %z64) -> (i64) {")
+        a(
+            "      %sum = scf.for %m = %c0 to %cM step %c1 "
+            "iter_args(%sa = %z64) -> (i64) {"
+        )
         a(f"        %v = memref.load %logits[%m] : memref<{M}xi{sb}>")
         a(f"        %v32 = arith.extsi %v : i{sb} to i32")
         a("        %d0 = arith.subi %v32, %mx : i32")
@@ -614,15 +671,21 @@ def emit_affine_mlir(qmodel: AffineQuantizedModel, *,
         out = out.replace(
             "  %Ti = arith.index_cast %T : i64 to index",
             f"  %SM = memref.get_global @sm_lut : memref<{sm_size}xi{sb}>\n"
-            "  %Ti = arith.index_cast %T : i64 to index", 1)
+            "  %Ti = arith.index_cast %T : i64 to index",
+            1,
+        )
     return out
 
 
 # ---------------------------------------------------------------------------
 # Toolchain driver
 
+
 def tools_available() -> bool:
-    return all(shutil.which(t) for t in _TOOLS) and shutil.which("gcc") is not None
+    return (
+        all(shutil.which(t) for t in _TOOLS)
+        and shutil.which("gcc") is not None
+    )
 
 
 def build_shared_lib(mlir_text: str, out_dir: pathlib.Path) -> pathlib.Path:
@@ -640,18 +703,29 @@ def build_shared_lib(mlir_text: str, out_dir: pathlib.Path) -> pathlib.Path:
 
     lowered = run(["mlir-opt", str(out_dir / "rc.mlir"), *_LOWER_PASSES])
     (out_dir / "rc.llvm.mlir").write_text(lowered)
-    llvm_ir = run(["mlir-translate", "--mlir-to-llvmir",
-                   str(out_dir / "rc.llvm.mlir")])
+    llvm_ir = run(
+        ["mlir-translate", "--mlir-to-llvmir", str(out_dir / "rc.llvm.mlir")]
+    )
     (out_dir / "rc.ll").write_text(llvm_ir)
-    run(["llc", "-O3", "-relocation-model=pic", "-filetype=obj",
-         str(out_dir / "rc.ll"), "-o", str(out_dir / "rc.o")])
+    run(
+        [
+            "llc",
+            "-O3",
+            "-relocation-model=pic",
+            "-filetype=obj",
+            str(out_dir / "rc.ll"),
+            "-o",
+            str(out_dir / "rc.o"),
+        ]
+    )
     so = out_dir / "rc.so"
     run(["gcc", "-shared", "-o", str(so), str(out_dir / "rc.o")])
     return so
 
 
-def cross_compile_object(mlir_text: str, *, triple: str, cpu: str = "",
-                         features: str = "") -> bytes:
+def cross_compile_object(
+    mlir_text: str, *, triple: str, cpu: str = "", features: str = ""
+) -> bytes:
     """Cross-compile MLIR to a target object for `triple` (no host link).
 
     Connects the MLIR path to the embedded targets — emits a relocatable
@@ -680,11 +754,20 @@ def cross_compile_object(mlir_text: str, *, triple: str, cpu: str = "",
             return r.stdout
 
         (td / "rc.ll.mlir").write_text(
-            run(["mlir-opt", str(td / "rc.mlir"), *_LOWER_PASSES]))
+            run(["mlir-opt", str(td / "rc.mlir"), *_LOWER_PASSES])
+        )
         (td / "rc.ll").write_text(
-            run(["mlir-translate", "--mlir-to-llvmir", str(td / "rc.ll.mlir")]))
-        llc = ["llc", "-O2", f"-mtriple={triple}", "-filetype=obj",
-               str(td / "rc.ll"), "-o", str(td / "rc.o")]
+            run(["mlir-translate", "--mlir-to-llvmir", str(td / "rc.ll.mlir")])
+        )
+        llc = [
+            "llc",
+            "-O2",
+            f"-mtriple={triple}",
+            "-filetype=obj",
+            str(td / "rc.ll"),
+            "-o",
+            str(td / "rc.o"),
+        ]
         if cpu:
             llc.append(f"-mcpu={cpu}")
         if features:
@@ -694,9 +777,13 @@ def cross_compile_object(mlir_text: str, *, triple: str, cpu: str = "",
 
 
 class _MemRef1D(ctypes.Structure):
-    _fields_ = [("alloc", ctypes.c_void_p), ("align", ctypes.c_void_p),
-                ("offset", ctypes.c_int64),
-                ("size", ctypes.c_int64), ("stride", ctypes.c_int64)]
+    _fields_ = [
+        ("alloc", ctypes.c_void_p),
+        ("align", ctypes.c_void_p),
+        ("offset", ctypes.c_int64),
+        ("size", ctypes.c_int64),
+        ("stride", ctypes.c_int64),
+    ]
 
 
 def _desc(arr: np.ndarray) -> _MemRef1D:
@@ -707,8 +794,13 @@ def _desc(arr: np.ndarray) -> _MemRef1D:
 class CompiledAffineMLIR:
     """Compile a (constrained) affine qmodel via MLIR and run it via ctypes."""
 
-    def __init__(self, qmodel: AffineQuantizedModel, *,
-                 head: Optional[str] = None, sparse: Optional[str] = None):
+    def __init__(
+        self,
+        qmodel: AffineQuantizedModel,
+        *,
+        head: Optional[str] = None,
+        sparse: Optional[str] = None,
+    ):
         self.qmodel = qmodel
         self.head = head
         self.sb = qmodel.storage_bits
@@ -718,11 +810,15 @@ class CompiledAffineMLIR:
         self._tmp = tempfile.TemporaryDirectory(prefix="rc_mlir_")
         so = build_shared_lib(
             emit_affine_mlir(qmodel, head=head, sparse=sparse),
-            pathlib.Path(self._tmp.name))
+            pathlib.Path(self._tmp.name),
+        )
         self._lib = ctypes.CDLL(str(so))
         self._fn = self._lib._mlir_ciface_rc_predict
-        self._fn.argtypes = [ctypes.c_int64,
-                             ctypes.POINTER(_MemRef1D), ctypes.POINTER(_MemRef1D)]
+        self._fn.argtypes = [
+            ctypes.c_int64,
+            ctypes.POINTER(_MemRef1D),
+            ctypes.POINTER(_MemRef1D),
+        ]
         self._fn.restype = None
 
     def predict_q(self, X_q: np.ndarray) -> np.ndarray:

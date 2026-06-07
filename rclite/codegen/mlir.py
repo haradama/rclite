@@ -22,11 +22,10 @@ Reference pipeline:
         | mlir-translate --mlir-to-llvmir \\
         | llc -O3 -filetype=obj -o input.o
 """
+
 from __future__ import annotations
 import shutil
-import subprocess
 from dataclasses import dataclass
-from typing import Optional
 
 from rclite.core.composite import ReservoirComputer
 from rclite.core.profile import Activation, Topology
@@ -60,14 +59,20 @@ def emit_mlir(rc: ReservoirComputer, exe: RCExecutor) -> str:
         flat = arr.reshape(-1).tolist()
         body = ", ".join(f"{float(v):.17g}" for v in flat)
         shape_s = "x".join(str(d) for d in shape)
-        return (f"  memref.global \"private\" constant @{name} : "
-                f"memref<{shape_s}xf64> = dense<[{body}]>")
+        return (
+            f'  memref.global "private" constant @{name} : '
+            f"memref<{shape_s}xf64> = dense<[{body}]>"
+        )
 
     globals_ir = [
         _arr("rc_W_in", exe.W_in, (N, K)),
         _arr("rc_W_out", exe.W_out, (M, F)),
     ]
-    if rc.reservoir.topology not in (Topology.DLR, Topology.DLRB, Topology.SCR):
+    if rc.reservoir.topology not in (
+        Topology.DLR,
+        Topology.DLRB,
+        Topology.SCR,
+    ):
         globals_ir.append(_arr("rc_W_res", exe.W_res, (N, N)))
 
     header = (
@@ -97,6 +102,7 @@ class MLIRBackend:
     on PATH. If any are missing it raises a `RuntimeError` describing
     what's needed.
     """
+
     name: str = "mlir"
 
     def __post_init__(self):

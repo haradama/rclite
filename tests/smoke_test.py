@@ -1,4 +1,5 @@
 """Stdlib-only smoke tests for the rclite package."""
+
 from __future__ import annotations
 import sys
 import pathlib
@@ -7,14 +8,24 @@ import traceback
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from rclite import (
-    InputNode, ReservoirNode, ReadoutNode,
+    InputNode,
+    ReservoirNode,
+    ReadoutNode,
     ReservoirComputer,
-    WellPosedReservoir, ConstraintViolation,
+    WellPosedReservoir,
+    ConstraintViolation,
     echo_state_property,
-    Activation, Distribution, Topology, Trainer,
-    Direction, SignalIn, SignalOut, Synapse, WeightMatrix,
-    Tensor, TimeSeries, DType,
-    Mode, RCMode,
+    Activation,
+    Distribution,
+    Topology,
+    SignalIn,
+    SignalOut,
+    Synapse,
+    WeightMatrix,
+    Tensor,
+    TimeSeries,
+    Mode,
+    RCMode,
 )
 
 
@@ -38,10 +49,16 @@ def test_valid_esn_construction():
     esn = ReservoirComputer(
         input=InputNode(units=1, activation=Activation.IDENTITY, name="input"),
         reservoir=ReservoirNode(
-            units=100, spectral_radius=0.9, leak_rate=0.3,
-            density=0.1, seed=42, name="reservoir",
+            units=100,
+            spectral_radius=0.9,
+            leak_rate=0.3,
+            density=0.1,
+            seed=42,
+            name="reservoir",
         ),
-        readout=ReadoutNode(units=1, activation=Activation.IDENTITY, name="readout"),
+        readout=ReadoutNode(
+            units=1, activation=Activation.IDENTITY, name="readout"
+        ),
     )
     assert len(esn.synapses()) == 3
     assert esn.W_in.source is esn.input.out_
@@ -69,13 +86,17 @@ def test_feedback_synapse_is_created_when_requested():
 
 
 def test_well_posed_reservoir_passes():
-    r = ReservoirNode(units=10, spectral_radius=0.95, leak_rate=0.3, density=0.1)
+    r = ReservoirNode(
+        units=10, spectral_radius=0.95, leak_rate=0.3, density=0.1
+    )
     WellPosedReservoir(r).check()
     assert WellPosedReservoir(r).satisfied()
 
 
 def test_well_posed_reservoir_detects_spectral_radius_violation():
-    r = ReservoirNode(units=10, spectral_radius=1.5, leak_rate=0.3, density=0.1)
+    r = ReservoirNode(
+        units=10, spectral_radius=1.5, leak_rate=0.3, density=0.1
+    )
     req = WellPosedReservoir(r)
     assert not req.satisfied()
     violations = req.violations()
@@ -86,28 +107,36 @@ def test_well_posed_reservoir_detects_spectral_radius_violation():
 class _StubEmpirical:
     def __init__(self, violations_list):
         self._v = violations_list
+
     def violations(self):
         return list(self._v)
 
 
 def test_well_posed_reservoir_empirical_check_overrides_structural():
-    r = ReservoirNode(units=10, spectral_radius=1.5, leak_rate=0.3, density=0.1)
+    r = ReservoirNode(
+        units=10, spectral_radius=1.5, leak_rate=0.3, density=0.1
+    )
     req = WellPosedReservoir(r, empirical_check=_StubEmpirical([]))
     assert req.satisfied(), req.violations()
     assert any("conservative structural" in w for w in req.warnings())
 
 
 def test_well_posed_reservoir_empirical_check_can_fail():
-    r = ReservoirNode(units=10, spectral_radius=0.9, leak_rate=0.3, density=0.1)
+    r = ReservoirNode(
+        units=10, spectral_radius=0.9, leak_rate=0.3, density=0.1
+    )
     req = WellPosedReservoir(
-        r, empirical_check=_StubEmpirical(["MLE=0.123 >= 0"]),
+        r,
+        empirical_check=_StubEmpirical(["MLE=0.123 >= 0"]),
     )
     assert not req.satisfied()
     expect_raises(ConstraintViolation, req.check)
 
 
 def test_well_posed_reservoir_range_checks_always_run():
-    r = ReservoirNode(units=10, spectral_radius=0.9, leak_rate=0.3, density=0.1)
+    r = ReservoirNode(
+        units=10, spectral_radius=0.9, leak_rate=0.3, density=0.1
+    )
     r.leak_rate = 1.5  # bypass validator to set illegal value
     req = WellPosedReservoir(r, empirical_check=_StubEmpirical([]))
     assert any("LeakRange" in v for v in req.violations())
@@ -174,8 +203,9 @@ def test_readout_feature_defaults():
 
 
 def test_structured_topology_attributes():
-    r = ReservoirNode(units=10, topology=Topology.SCR,
-                      chain_weight=0.7, chain_feedback=0.0)
+    r = ReservoirNode(
+        units=10, topology=Topology.SCR, chain_weight=0.7, chain_feedback=0.0
+    )
     assert r.is_structured()
     assert r.topology == Topology.SCR
     r2 = ReservoirNode(units=10, topology=Topology.RANDOM)
@@ -184,29 +214,36 @@ def test_structured_topology_attributes():
 
 def test_esp_constraint_topology_aware():
     # DLR is always ESP-satisfying regardless of spectral_radius
-    r_dlr = ReservoirNode(units=10, topology=Topology.DLR,
-                          spectral_radius=5.0, chain_weight=2.0)
+    r_dlr = ReservoirNode(
+        units=10, topology=Topology.DLR, spectral_radius=5.0, chain_weight=2.0
+    )
     assert echo_state_property(r_dlr)
     # SCR uses chain_weight, not spectral_radius
-    r_scr_ok = ReservoirNode(units=10, topology=Topology.SCR,
-                             spectral_radius=99.0, chain_weight=0.9)
+    r_scr_ok = ReservoirNode(
+        units=10, topology=Topology.SCR, spectral_radius=99.0, chain_weight=0.9
+    )
     assert echo_state_property(r_scr_ok)
-    r_scr_bad = ReservoirNode(units=10, topology=Topology.SCR,
-                              spectral_radius=0.1, chain_weight=1.5)
+    r_scr_bad = ReservoirNode(
+        units=10, topology=Topology.SCR, spectral_radius=0.1, chain_weight=1.5
+    )
     assert not echo_state_property(r_scr_bad)
     # DLRB uses |chain_weight| + |chain_feedback|
-    r_dlrb_ok = ReservoirNode(units=10, topology=Topology.DLRB,
-                              chain_weight=0.6, chain_feedback=0.3)
+    r_dlrb_ok = ReservoirNode(
+        units=10, topology=Topology.DLRB, chain_weight=0.6, chain_feedback=0.3
+    )
     assert echo_state_property(r_dlrb_ok)
-    r_dlrb_bad = ReservoirNode(units=10, topology=Topology.DLRB,
-                               chain_weight=0.8, chain_feedback=0.5)
+    r_dlrb_bad = ReservoirNode(
+        units=10, topology=Topology.DLRB, chain_weight=0.8, chain_feedback=0.5
+    )
     assert not echo_state_property(r_dlrb_bad)
 
 
 def test_input_distribution_flows_through_composite():
     rc = ReservoirComputer(
         input=InputNode(units=1, input_distribution=Distribution.BERNOULLI),
-        reservoir=ReservoirNode(units=10, topology=Topology.SCR, chain_weight=0.7),
+        reservoir=ReservoirNode(
+            units=10, topology=Topology.SCR, chain_weight=0.7
+        ),
         readout=ReadoutNode(units=1),
     )
     assert rc.W_in.spec.distribution == Distribution.BERNOULLI
@@ -225,18 +262,22 @@ def test_rc_mode_state_machine():
     assert m.state == Mode.IDLE
     m.fit()
     assert m.state == Mode.TRAINING
-    expect_raises(RuntimeError, m.fit)         # cannot fit while training
-    expect_raises(RuntimeError, m.predict)     # cannot predict while training
+    expect_raises(RuntimeError, m.fit)  # cannot fit while training
+    expect_raises(RuntimeError, m.predict)  # cannot predict while training
     m.done()
     assert m.state == Mode.IDLE
     m.predict()
     assert m.state == Mode.INFERRING
     m.done()
     assert m.state == Mode.IDLE
-    expect_raises(RuntimeError, m.done)        # cannot signal done from idle
+    expect_raises(RuntimeError, m.done)  # cannot signal done from idle
 
 
-TESTS = [v for k, v in list(globals().items()) if k.startswith("test_") and callable(v)]
+TESTS = [
+    v
+    for k, v in list(globals().items())
+    if k.startswith("test_") and callable(v)
+]
 
 
 def main() -> int:

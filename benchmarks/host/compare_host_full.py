@@ -11,6 +11,7 @@ For each (topology, N) case:
       acc    : RMSE / R² vs ground-truth target on the held-out window
       diff   : max |Y_naive - Y_rclite| (numeric parity check)
 """
+
 from __future__ import annotations
 import ctypes
 import pathlib
@@ -25,8 +26,13 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 import numpy as np
 
 from rclite import (
-    InputNode, ReservoirNode, ReadoutNode, ReservoirComputer,
-    Activation, Distribution, Topology, Trainer,
+    InputNode,
+    ReservoirNode,
+    ReadoutNode,
+    ReservoirComputer,
+    Activation,
+    Topology,
+    Trainer,
 )
 from rclite.runtime import RCExecutor
 from rclite.codegen import compile_rc
@@ -54,8 +60,7 @@ def render_scratch_c(rc, exe, out_path):
     F = exe._feature_dim()
     tmpl = TEMPLATE.read_text()
     out_path.write_text(
-        tmpl
-        .replace("@@N@@", str(N))
+        tmpl.replace("@@N@@", str(N))
         .replace("@@K@@", str(K))
         .replace("@@M@@", str(M))
         .replace("@@F@@", str(F))
@@ -75,8 +80,17 @@ def build_so_naive(c_path, so_path, cc="gcc"):
     # `-march=x86-64-v3` = AVX2/FMA/BMI baseline (no AVX-512). This keeps
     # the instruction set comparable with rclite's MCJIT default and stays
     # within Valgrind 3.22's supported opcode set.
-    cmd = [cc, "-O3", "-march=x86-64-v3", "-shared", "-fPIC",
-           str(c_path), "-o", str(so_path), "-lm"]
+    cmd = [
+        cc,
+        "-O3",
+        "-march=x86-64-v3",
+        "-shared",
+        "-fPIC",
+        str(c_path),
+        "-o",
+        str(so_path),
+        "-lm",
+    ]
     cp = subprocess.run(cmd, capture_output=True, text=True)
     if cp.returncode != 0:
         raise RuntimeError(f"build failed:\n{cp.stderr}")
@@ -110,6 +124,7 @@ def time_so(lib, X_c, Y_c, repeats=7):
             X_c.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
             Y_c.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
         )
+
     best = float("inf")
     for _ in range(repeats):
         t0 = time.perf_counter()
@@ -121,8 +136,12 @@ def time_so(lib, X_c, Y_c, repeats=7):
 
 
 def section_size(so_path, section=".text"):
-    cp = subprocess.run(["objdump", "-h", str(so_path)],
-                         capture_output=True, text=True, check=True)
+    cp = subprocess.run(
+        ["objdump", "-h", str(so_path)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
     for line in cp.stdout.splitlines():
         m = re.match(r"\s*\d+\s+(\S+)\s+([0-9a-fA-F]+)\s+", line)
         if m and m.group(1) == section:
@@ -132,8 +151,12 @@ def section_size(so_path, section=".text"):
 
 def predict_fn_size(so_path):
     """Size of the rc_predict function as reported by `nm --print-size`."""
-    cp = subprocess.run(["nm", "--print-size", "--radix=d", str(so_path)],
-                         capture_output=True, text=True, check=True)
+    cp = subprocess.run(
+        ["nm", "--print-size", "--radix=d", str(so_path)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
     for line in cp.stdout.splitlines():
         parts = line.split()
         if len(parts) >= 4 and parts[-1] == "rc_predict":
@@ -145,7 +168,8 @@ def static_instr_count(so_path, symbol="rc_predict"):
     """Count instructions in the disassembled `symbol` (rough static count)."""
     cp = subprocess.run(
         ["objdump", "-d", f"--disassemble={symbol}", str(so_path)],
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
     )
     if cp.returncode != 0:
         return 0
@@ -173,10 +197,15 @@ def callgrind_instructions(driver_bin, so_path, T, n_calls=5, out_dir=None):
     out_dir = pathlib.Path(out_dir or BUILD)
     out_file = out_dir / "callgrind.out"
     cmd = [
-        "valgrind", "--tool=callgrind",
-        "--cache-sim=no", "--branch-sim=no",
+        "valgrind",
+        "--tool=callgrind",
+        "--cache-sim=no",
+        "--branch-sim=no",
         f"--callgrind-out-file={out_file}",
-        str(driver_bin), str(so_path), str(T), str(n_calls),
+        str(driver_bin),
+        str(so_path),
+        str(T),
+        str(n_calls),
     ]
     cp = subprocess.run(cmd, capture_output=True, text=True)
     if cp.returncode != 0:
@@ -206,22 +235,41 @@ def accuracy(Y_pred, Y_true):
 
 def build_esn(N, topology, input_offset, seed=42):
     return ReservoirComputer(
-        input=InputNode(units=1, activation=Activation.IDENTITY,
-                        input_scaling=1.0, input_offset=input_offset, name="in"),
-        reservoir=ReservoirNode(units=N, activation=Activation.TANH,
-                                 spectral_radius=0.95, leak_rate=0.3,
-                                 density=0.05, topology=topology,
-                                 chain_weight=0.9, chain_feedback=0.05,
-                                 seed=seed, name="res"),
-        readout=ReadoutNode(units=1, activation=Activation.IDENTITY,
-                             trainer=Trainer.RIDGE, regularization=1e-6,
-                             washout=200, include_bias=True,
-                             include_input=True, name="out"),
+        input=InputNode(
+            units=1,
+            activation=Activation.IDENTITY,
+            input_scaling=1.0,
+            input_offset=input_offset,
+            name="in",
+        ),
+        reservoir=ReservoirNode(
+            units=N,
+            activation=Activation.TANH,
+            spectral_radius=0.95,
+            leak_rate=0.3,
+            density=0.05,
+            topology=topology,
+            chain_weight=0.9,
+            chain_feedback=0.05,
+            seed=seed,
+            name="res",
+        ),
+        readout=ReadoutNode(
+            units=1,
+            activation=Activation.IDENTITY,
+            trainer=Trainer.RIDGE,
+            regularization=1e-6,
+            washout=200,
+            include_bias=True,
+            include_input=True,
+            name="out",
+        ),
     )
 
 
-def run_one(topology, N, X_tr, Y_tr, X_te, Y_te, input_offset,
-             driver_bin, want_ir=True):
+def run_one(
+    topology, N, X_tr, Y_tr, X_te, Y_te, input_offset, driver_bin, want_ir=True
+):
     out_dir = BUILD / f"{topology.name}_N{N}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -247,12 +295,16 @@ def run_one(topology, N, X_tr, Y_tr, X_te, Y_te, input_offset,
     X_c = np.ascontiguousarray(X_te, dtype=np.float64)
     Y_n = np.zeros((X_te.shape[0], 1), dtype=np.float64)
     Y_r = np.zeros_like(Y_n)
-    lib_n.rc_predict(X_c.shape[0],
-                       X_c.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
-                       Y_n.ctypes.data_as(ctypes.POINTER(ctypes.c_double)))
-    lib_r.rc_predict(X_c.shape[0],
-                       X_c.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
-                       Y_r.ctypes.data_as(ctypes.POINTER(ctypes.c_double)))
+    lib_n.rc_predict(
+        X_c.shape[0],
+        X_c.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+        Y_n.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+    )
+    lib_r.rc_predict(
+        X_c.shape[0],
+        X_c.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+        Y_r.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+    )
 
     parity = float(np.max(np.abs(Y_n - Y_r)))
 
@@ -276,22 +328,31 @@ def run_one(topology, N, X_tr, Y_tr, X_te, Y_te, input_offset,
     # Dynamic instruction count (callgrind)
     ir_n = ir_r = None
     if want_ir:
-        ir_n = callgrind_instructions(driver_bin, naive_so, X_te.shape[0],
-                                        n_calls=2, out_dir=out_dir)
-        ir_r = callgrind_instructions(driver_bin, rclite_so, X_te.shape[0],
-                                        n_calls=2, out_dir=out_dir)
+        ir_n = callgrind_instructions(
+            driver_bin, naive_so, X_te.shape[0], n_calls=2, out_dir=out_dir
+        )
+        ir_r = callgrind_instructions(
+            driver_bin, rclite_so, X_te.shape[0], n_calls=2, out_dir=out_dir
+        )
 
     return {
-        "topology": topology.name, "N": N,
-        "t_naive_ms": t_n * 1000, "t_rclite_ms": t_r * 1000,
+        "topology": topology.name,
+        "N": N,
+        "t_naive_ms": t_n * 1000,
+        "t_rclite_ms": t_r * 1000,
         "speedup": t_n / t_r if t_r > 0 else float("nan"),
-        "text_naive_b": text_n, "text_rclite_b": text_r,
-        "fn_naive_b": fn_n, "fn_rclite_b": fn_r,
+        "text_naive_b": text_n,
+        "text_rclite_b": text_r,
+        "fn_naive_b": fn_n,
+        "fn_rclite_b": fn_r,
         "insns_static_naive": insns_static_n,
         "insns_static_rclite": insns_static_r,
-        "ir_naive": ir_n, "ir_rclite": ir_r,
-        "rmse_naive": rmse_n, "rmse_rclite": rmse_r,
-        "r2_naive": r2_n, "r2_rclite": r2_r,
+        "ir_naive": ir_n,
+        "ir_rclite": ir_r,
+        "rmse_naive": rmse_n,
+        "rmse_rclite": rmse_r,
+        "r2_naive": r2_n,
+        "r2_rclite": r2_r,
         "parity_max_diff": parity,
     }
 
@@ -307,6 +368,7 @@ def main():
     build_driver(driver_bin)
 
     from examples.forecasting.mackey_glass_esn import mackey_glass
+
     series = mackey_glass(n=3000)
     X, Y = series[:-1, None], series[1:, None]
     n_train = 2000
@@ -322,11 +384,14 @@ def main():
     rows = []
     for topology, N in cases:
         print(f"[{topology.name} N={N}] ...", end=" ", flush=True)
-        row = run_one(topology, N, X_tr, Y_tr, X_te, Y_te, input_offset,
-                       driver_bin)
+        row = run_one(
+            topology, N, X_tr, Y_tr, X_te, Y_te, input_offset, driver_bin
+        )
         rows.append(row)
-        print(f"naive={row['t_naive_ms']:.1f}ms rclite={row['t_rclite_ms']:.1f}ms"
-              f" speedup={row['speedup']:.2f}x parity={row['parity_max_diff']:.1e}")
+        print(
+            f"naive={row['t_naive_ms']:.1f}ms rclite={row['t_rclite_ms']:.1f}ms"
+            f" speedup={row['speedup']:.2f}x parity={row['parity_max_diff']:.1e}"
+        )
 
     # Final report
     print()
@@ -335,21 +400,27 @@ def main():
     print("-" * 100)
     print(f"{'case':<22} {'naive':>10} {'rclite':>10} {'speedup':>9}")
     for r in rows:
-        print(f"{r['topology']+' N='+str(r['N']):<22} "
-              f"{r['t_naive_ms']:>10.3f} {r['t_rclite_ms']:>10.3f} "
-              f"{r['speedup']:>8.2f}x")
+        print(
+            f"{r['topology'] + ' N=' + str(r['N']):<22} "
+            f"{r['t_naive_ms']:>10.3f} {r['t_rclite_ms']:>10.3f} "
+            f"{r['speedup']:>8.2f}x"
+        )
 
     print()
     print("=" * 100)
     print("SIZE (bytes)")
     print("-" * 100)
-    print(f"{'case':<22} {'naive .text':>13} {'rclite .text':>14} "
-          f"{'naive fn':>11} {'rclite fn':>11} {'naive insn':>12} {'rclite insn':>12}")
+    print(
+        f"{'case':<22} {'naive .text':>13} {'rclite .text':>14} "
+        f"{'naive fn':>11} {'rclite fn':>11} {'naive insn':>12} {'rclite insn':>12}"
+    )
     for r in rows:
-        print(f"{r['topology']+' N='+str(r['N']):<22} "
-              f"{r['text_naive_b']:>13,} {r['text_rclite_b']:>14,} "
-              f"{r['fn_naive_b']:>11,} {r['fn_rclite_b']:>11,} "
-              f"{r['insns_static_naive']:>12,} {r['insns_static_rclite']:>12,}")
+        print(
+            f"{r['topology'] + ' N=' + str(r['N']):<22} "
+            f"{r['text_naive_b']:>13,} {r['text_rclite_b']:>14,} "
+            f"{r['fn_naive_b']:>11,} {r['fn_rclite_b']:>11,} "
+            f"{r['insns_static_naive']:>12,} {r['insns_static_rclite']:>12,}"
+        )
 
     print()
     print("=" * 100)
@@ -357,23 +428,33 @@ def main():
     print("-" * 100)
     print(f"{'case':<22} {'naive (Ir)':>14} {'rclite (Ir)':>14} {'ratio':>9}")
     for r in rows:
-        if r['ir_naive'] is None:
+        if r["ir_naive"] is None:
             continue
-        ratio = r['ir_naive'] / r['ir_rclite'] if r['ir_rclite'] > 0 else float("nan")
-        print(f"{r['topology']+' N='+str(r['N']):<22} "
-              f"{r['ir_naive']:>14,} {r['ir_rclite']:>14,} {ratio:>8.2f}x")
+        ratio = (
+            r["ir_naive"] / r["ir_rclite"]
+            if r["ir_rclite"] > 0
+            else float("nan")
+        )
+        print(
+            f"{r['topology'] + ' N=' + str(r['N']):<22} "
+            f"{r['ir_naive']:>14,} {r['ir_rclite']:>14,} {ratio:>8.2f}x"
+        )
 
     print()
     print("=" * 100)
     print("ACCURACY vs ground-truth Mackey-Glass (RMSE, R²)")
     print("-" * 100)
-    print(f"{'case':<22} {'naive RMSE':>11} {'rclite RMSE':>12} "
-          f"{'naive R²':>10} {'rclite R²':>11} {'parity':>10}")
+    print(
+        f"{'case':<22} {'naive RMSE':>11} {'rclite RMSE':>12} "
+        f"{'naive R²':>10} {'rclite R²':>11} {'parity':>10}"
+    )
     for r in rows:
-        print(f"{r['topology']+' N='+str(r['N']):<22} "
-              f"{r['rmse_naive']:>11.6f} {r['rmse_rclite']:>12.6f} "
-              f"{r['r2_naive']:>10.6f} {r['r2_rclite']:>11.6f} "
-              f"{r['parity_max_diff']:>10.1e}")
+        print(
+            f"{r['topology'] + ' N=' + str(r['N']):<22} "
+            f"{r['rmse_naive']:>11.6f} {r['rmse_rclite']:>12.6f} "
+            f"{r['r2_naive']:>10.6f} {r['r2_rclite']:>11.6f} "
+            f"{r['parity_max_diff']:>10.1e}"
+        )
 
 
 if __name__ == "__main__":

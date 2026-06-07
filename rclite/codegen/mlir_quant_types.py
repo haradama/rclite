@@ -14,12 +14,13 @@ arith-based emitters (`mlir_affine` / `mlir_symmetric`) guarantee. The arith
 kernels are the executable realization of exactly these types; this module
 documents the type-level contract and validates it with the toolchain.
 """
+
 from __future__ import annotations
 import shutil
 import subprocess
 import tempfile
 import pathlib
-from typing import List, Optional
+from typing import List
 
 import numpy as np
 
@@ -60,12 +61,18 @@ def emit_quant_types(qmodel: AffineQuantizedModel) -> str:
     t_out = uniform_type(sb, cfg.output.scale, cfg.output.zero_point)
     # W_res: per-axis if per-channel, else per-tensor (symmetric)
     if not structured:
-        wres_scale = (cfg.W_res_scales if cfg.W_res_scales is not None
-                      else cfg.W_res.scale)
+        wres_scale = (
+            cfg.W_res_scales
+            if cfg.W_res_scales is not None
+            else cfg.W_res.scale
+        )
         t_wres = uniform_type(sb, wres_scale)
     # W_out state block: per-axis if per-channel, else per-tensor
-    wout_scale = (cfg.W_out_state_scales if cfg.W_out_state_scales is not None
-                  else cfg.W_out_state.scale)
+    wout_scale = (
+        cfg.W_out_state_scales
+        if cfg.W_out_state_scales is not None
+        else cfg.W_out_state.scale
+    )
     t_wout = uniform_type(wob, wout_scale)
     t_win = uniform_type(sb, cfg.W_in.scale)
 
@@ -76,16 +83,20 @@ def emit_quant_types(qmodel: AffineQuantizedModel) -> str:
     L: List[str] = []
     a = L.append
     a("// rclite affine model — first-class quant.uniform type signature")
-    a(f"// topology={rc.reservoir.topology.name} N={N} K={K} M={M} "
-      f"storage=i{sb} w_out=i{wob}")
+    a(
+        f"// topology={rc.reservoir.topology.name} N={N} K={K} M={M} "
+        f"storage=i{sb} w_out=i{wob}"
+    )
     a(f"// per-channel: W_res={pc_res} W_out={pc_out}")
     a("module {")
     # A signature func whose operands carry the quantized types. The body is a
     # no-op; this is a declarative, verifiable type contract.
     # quant.uniform is a valid *tensor* element type (not memref).
-    args = [f"%x: tensor<?x{t_input}>",
-            f"%h: tensor<{N}x{t_state}>",
-            f"%w_in: tensor<{N}x{K}x{t_win}>"]
+    args = [
+        f"%x: tensor<?x{t_input}>",
+        f"%h: tensor<{N}x{t_state}>",
+        f"%w_in: tensor<{N}x{K}x{t_win}>",
+    ]
     if not structured:
         args.append(f"%w_res: tensor<{N}x{N}x{t_wres}>")
     args.append(f"%w_out: tensor<{M}x{qmodel.F}x{t_wout}>")
@@ -104,5 +115,7 @@ def verify(mlir_text: str) -> bool:
     with tempfile.TemporaryDirectory() as td:
         p = pathlib.Path(td) / "q.mlir"
         p.write_text(mlir_text)
-        r = subprocess.run(["mlir-opt", str(p)], capture_output=True, text=True)
+        r = subprocess.run(
+            ["mlir-opt", str(p)], capture_output=True, text=True
+        )
         return r.returncode == 0
