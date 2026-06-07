@@ -26,6 +26,7 @@ from typing import Optional
 import numpy as np
 
 from rclite.codegen import compile_rc, cross_compile_rc
+from rclite.codegen.templating import render_template
 from rclite.ir import sparse_passes
 from ..target import Target, CompiledArtifact, RunResult
 
@@ -156,16 +157,15 @@ class WasmTarget(Target):
         y_flat = y_ref.ravel()
 
         # 4. Render main.rs from template.
-        tmpl = (_SUPPORT_DIR / "main_template.rs").read_text()
         main_path = out / "main.rs"
-        main_path.write_text(
-            tmpl
-            .replace("@@T@@", str(T))
-            .replace("@@K@@", str(K))
-            .replace("@@M@@", str(M))
-            .replace("@@X_VALUES@@", ", ".join(f"{v:.9g}_f32" for v in x_flat))
-            .replace("@@Y_VALUES@@", ", ".join(f"{v:.9g}_f32" for v in y_flat))
-        )
+        main_path.write_text(render_template(
+            _SUPPORT_DIR / "main_template.rs",
+            T=str(T),
+            K=str(K),
+            M=str(M),
+            X_VALUES=", ".join(f"{v:.9g}_f32" for v in x_flat),
+            Y_VALUES=", ".join(f"{v:.9g}_f32" for v in y_flat),
+        ))
 
         # 5. Link via rustc: rustc compiles main.rs against rust-std
         #    (which bundles wasi-libc for `tanhf`/`memcpy`/...), then wasm-ld
@@ -320,20 +320,17 @@ class WasmTarget(Target):
             y_float = y_float[:, None]
         Y_ref_q = np.rint(y_float * cfg.state_scale).astype(np_storage)
 
-        tmpl = (_SUPPORT_DIR / "main_template_q.rs").read_text()
         main_path = out / "main_q.rs"
-        main_path.write_text(
-            tmpl
-            .replace("@@T@@", str(T))
-            .replace("@@K@@", str(K))
-            .replace("@@M@@", str(M))
-            .replace("@@STORAGE_T@@", storage_rs)
-            .replace("@@STATE_FRAC@@", str(cfg.state_frac))
-            .replace("@@X_VALUES_Q@@",
-                     ", ".join(str(int(v)) for v in X_q.ravel()))
-            .replace("@@Y_VALUES_Q@@",
-                     ", ".join(str(int(v)) for v in Y_ref_q.ravel()))
-        )
+        main_path.write_text(render_template(
+            _SUPPORT_DIR / "main_template_q.rs",
+            T=str(T),
+            K=str(K),
+            M=str(M),
+            STORAGE_T=storage_rs,
+            STATE_FRAC=str(cfg.state_frac),
+            X_VALUES_Q=", ".join(str(int(v)) for v in X_q.ravel()),
+            Y_VALUES_Q=", ".join(str(int(v)) for v in Y_ref_q.ravel()),
+        ))
 
         wasm = out / "rc_q.wasm"
         self._link_rustc(main_path, rc_o, wasm)
@@ -422,18 +419,17 @@ class WasmTarget(Target):
         x_flat = x_in.astype(np.float32).ravel()
         y_flat = y_ref.ravel()
 
-        tmpl = (_SUPPORT_DIR / "bench_template.rs").read_text()
         main_path = out / "bench.rs"
-        main_path.write_text(
-            tmpl
-            .replace("@@T@@", str(T))
-            .replace("@@K@@", str(K))
-            .replace("@@M@@", str(M))
-            .replace("@@REPEATS@@", str(repeats))
-            .replace("@@WARMUP@@", str(warmup))
-            .replace("@@X_VALUES@@", ", ".join(f"{v:.9g}_f32" for v in x_flat))
-            .replace("@@Y_VALUES@@", ", ".join(f"{v:.9g}_f32" for v in y_flat))
-        )
+        main_path.write_text(render_template(
+            _SUPPORT_DIR / "bench_template.rs",
+            T=str(T),
+            K=str(K),
+            M=str(M),
+            REPEATS=str(repeats),
+            WARMUP=str(warmup),
+            X_VALUES=", ".join(f"{v:.9g}_f32" for v in x_flat),
+            Y_VALUES=", ".join(f"{v:.9g}_f32" for v in y_flat),
+        ))
 
         wasm = out / "rc_bench.wasm"
         cmd = [

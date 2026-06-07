@@ -32,6 +32,7 @@ from typing import Optional
 import numpy as np
 
 from ..target import Target, CompiledArtifact, RunResult
+from ...codegen.templating import render_template
 from .emit_c import emit_affine_kernel_c
 
 
@@ -115,17 +116,18 @@ class ArduinoUnoTarget(Target):
                     x_raw_q, qexe.state_q).astype(np_storage)
 
         # Render sketch.ino
-        tmpl = (_TEMPLATE_DIR / "sketch.ino").read_text()
         x_lit = ", ".join(str(int(v)) for v in X_q.ravel())
         y_lit = ", ".join(str(int(v)) for v in Y_ref_q.ravel())
-        ino = (tmpl
-               .replace("@@T@@", str(T))
-               .replace("@@NROWS@@", str(n_rows))
-               .replace("@@RC_K@@", str(qmodel.K))
-               .replace("@@RC_M@@", str(qmodel.M))
-               .replace("@@STORAGE_T@@", storage_t)
-               .replace("@@X_VALUES@@", x_lit)
-               .replace("@@Y_VALUES@@", y_lit))
+        ino = render_template(
+            _TEMPLATE_DIR / "sketch.ino",
+            T=str(T),
+            NROWS=str(n_rows),
+            RC_K=str(qmodel.K),
+            RC_M=str(qmodel.M),
+            STORAGE_T=storage_t,
+            X_VALUES=x_lit,
+            Y_VALUES=y_lit,
+        )
         sketch_ino = sketch_dir / "sketch.ino"
         sketch_ino.write_text(ino)
 
@@ -227,19 +229,20 @@ class ArduinoUnoTarget(Target):
         def _lit(arr):
             return ", ".join(str(int(v)) for v in np.asarray(arr).ravel())
 
-        tmpl = (_TEMPLATE_DIR / "sketch_online.ino").read_text()
-        ino = (tmpl
-               .replace("@@T@@", str(T))
-               .replace("@@RC_K@@", str(qmodel.K))
-               .replace("@@RC_M@@", str(qmodel.M))
-               .replace("@@RC_F@@", str(F))
-               .replace("@@STORAGE_T@@", storage_t)
-               .replace("@@PGM_RD@@", pgm_rd)
-               .replace("@@U_VALUES@@", _lit(stream["u_q"]))
-               .replace("@@YT_VALUES@@", _lit(stream["y_target_q"]))
-               .replace("@@WARM_VALUES@@", _lit(stream["warm"]))
-               .replace("@@YP_REF@@", _lit(stream["y_pred_q"]))
-               .replace("@@WOUT_REF@@", _lit(stream["final_W_out"])))
+        ino = render_template(
+            _TEMPLATE_DIR / "sketch_online.ino",
+            T=str(T),
+            RC_K=str(qmodel.K),
+            RC_M=str(qmodel.M),
+            RC_F=str(F),
+            STORAGE_T=storage_t,
+            PGM_RD=pgm_rd,
+            U_VALUES=_lit(stream["u_q"]),
+            YT_VALUES=_lit(stream["y_target_q"]),
+            WARM_VALUES=_lit(stream["warm"]),
+            YP_REF=_lit(stream["y_pred_q"]),
+            WOUT_REF=_lit(stream["final_W_out"]),
+        )
         sketch_ino = sketch_dir / "sketch.ino"
         sketch_ino.write_text(ino)
 

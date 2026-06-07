@@ -26,6 +26,7 @@ from typing import Optional
 import numpy as np
 
 from rclite.codegen import compile_rc, cross_compile_rc
+from rclite.codegen.templating import render_template
 from ..target import CompiledArtifact, RunResult
 from .target import WasmTarget, _SUPPORT_DIR
 from ._wasm_inspect import inspect_wasm
@@ -108,34 +109,35 @@ class BrowserWasm(WasmTarget):
                               in_scaling: float, wasm_name: str,
                               demo_input: np.ndarray, T: int,
                               imports: list[str], wasm_size: int) -> list[pathlib.Path]:
-        loader = (_SUPPORT_DIR / "browser_loader.js").read_text()
-        loader = (loader
-                  .replace("@@DTYPE@@", dtype)
-                  .replace("@@K@@", str(K))
-                  .replace("@@M@@", str(M))
-                  .replace("@@ARRAY@@", array_ctor)
-                  .replace("@@BYTES@@", str(bytes_per))
-                  .replace("@@HAS_TANHF@@", "true" if has_tanhf else "false")
-                  .replace("@@INPUT_SCALE@@", repr(float(input_scale)))
-                  .replace("@@STATE_SCALE@@", repr(float(state_scale)))
-                  .replace("@@IN_OFFSET@@", repr(float(in_offset)))
-                  .replace("@@IN_SCALING@@", repr(float(in_scaling))))
+        loader = render_template(
+            _SUPPORT_DIR / "browser_loader.js",
+            DTYPE=dtype,
+            K=str(K),
+            M=str(M),
+            ARRAY=array_ctor,
+            BYTES=str(bytes_per),
+            HAS_TANHF="true" if has_tanhf else "false",
+            INPUT_SCALE=repr(float(input_scale)),
+            STATE_SCALE=repr(float(state_scale)),
+            IN_OFFSET=repr(float(in_offset)),
+            IN_SCALING=repr(float(in_scaling)),
+        )
         loader_path = out / self.loader_name
         loader_path.write_text(loader)
 
-        html = (_SUPPORT_DIR / "browser_index.html").read_text()
         demo_flat = np.ascontiguousarray(demo_input, dtype=np.float32).ravel()
-        html = (html
-                .replace("@@DTYPE@@", dtype)
-                .replace("@@K@@", str(K))
-                .replace("@@M@@", str(M))
-                .replace("@@T@@", str(T))
-                .replace("@@WASM_NAME@@", wasm_name)
-                .replace("@@WASM_SIZE@@", str(wasm_size))
-                .replace("@@LOADER_NAME@@", self.loader_name)
-                .replace("@@IMPORTS@@", ", ".join(imports) or "(none)")
-                .replace("@@DEMO_INPUT@@",
-                         ", ".join(f"{v:.6g}" for v in demo_flat)))
+        html = render_template(
+            _SUPPORT_DIR / "browser_index.html",
+            DTYPE=dtype,
+            K=str(K),
+            M=str(M),
+            T=str(T),
+            WASM_NAME=wasm_name,
+            WASM_SIZE=str(wasm_size),
+            LOADER_NAME=self.loader_name,
+            IMPORTS=", ".join(imports) or "(none)",
+            DEMO_INPUT=", ".join(f"{v:.6g}" for v in demo_flat),
+        )
         html_path = out / "index.html"
         html_path.write_text(html)
         return [loader_path, html_path]

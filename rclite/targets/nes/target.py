@@ -37,6 +37,7 @@ import numpy as np
 
 from ..target import Target, CompiledArtifact, RunResult
 from ..arduino.emit_c import emit_affine_kernel_c
+from ...codegen.templating import render_template
 
 
 _SUPPORT_DIR = pathlib.Path(__file__).parent / "support"
@@ -118,19 +119,18 @@ class NesTarget(Target):
         x_flat = np.ascontiguousarray(X_q).ravel()
         y_flat = np.ascontiguousarray(Y_ref_q).ravel()
 
-        tmpl = (_SUPPORT_DIR / "main_template_q_affine.c").read_text()
         main_path = out / "main.c"
-        main_path.write_text(
-            tmpl
-            .replace("@@T_STEPS@@", str(T))
-            .replace("@@X_LEN@@", str(len(x_flat)))
-            .replace("@@Y_LEN@@", str(len(y_flat)))
-            .replace("@@STORAGE_T@@", storage_t)
-            .replace("@@LUT_KIND@@", qmodel.lut_strategy.kind.value)
-            .replace("@@TOL@@", str(int(tol)))
-            .replace("@@X_VALUES_Q@@", ", ".join(str(int(v)) for v in x_flat))
-            .replace("@@Y_VALUES_Q@@", ", ".join(str(int(v)) for v in y_flat))
-        )
+        main_path.write_text(render_template(
+            _SUPPORT_DIR / "main_template_q_affine.c",
+            T_STEPS=str(T),
+            X_LEN=str(len(x_flat)),
+            Y_LEN=str(len(y_flat)),
+            STORAGE_T=storage_t,
+            LUT_KIND=qmodel.lut_strategy.kind.value,
+            TOL=str(int(tol)),
+            X_VALUES_Q=", ".join(str(int(v)) for v in x_flat),
+            Y_VALUES_Q=", ".join(str(int(v)) for v in y_flat),
+        ))
 
         metadata = {
             "cpu": "6502",

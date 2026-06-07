@@ -27,6 +27,7 @@ import numpy as np
 
 from rclite.codegen import compile_rc, cross_compile_rc
 from rclite.codegen.llvm import emit_quantized_module, emit_quantized_affine_module
+from rclite.codegen.templating import render_template
 from rclite.ir import sparse_passes
 from ..target import Target, CompiledArtifact, RunResult
 
@@ -195,19 +196,18 @@ class GbaTarget(Target):
         if expected_outputs is None:
             expected_outputs = host_jit.predict(test_inputs).astype(np.float32)
 
-        tmpl = (_SUPPORT_DIR / "main_template.c").read_text()
         x_flat = np.ascontiguousarray(test_inputs, dtype=np.float32).ravel()
         y_flat = np.ascontiguousarray(expected_outputs, dtype=np.float32).ravel()
         main_path = out / "main.c"
         # @@T_LEN@@ is the step count T; X/Y are embedded row-major (T, K)/(T, M)
         # with the dims coming from rc_predict.h's RC_INPUT_DIM / RC_OUTPUT_DIM.
-        main_path.write_text(
-            tmpl
-            .replace("@@T_LEN@@", str(test_inputs.shape[0]))
-            .replace("@@TOLF@@", f"{tol:.9g}")
-            .replace("@@X_VALUES@@", ", ".join(f"{v:.9g}f" for v in x_flat))
-            .replace("@@Y_VALUES@@", ", ".join(f"{v:.9g}f" for v in y_flat))
-        )
+        main_path.write_text(render_template(
+            _SUPPORT_DIR / "main_template.c",
+            T_LEN=str(test_inputs.shape[0]),
+            TOLF=f"{tol:.9g}",
+            X_VALUES=", ".join(f"{v:.9g}f" for v in x_flat),
+            Y_VALUES=", ".join(f"{v:.9g}f" for v in y_flat),
+        ))
 
         shutil.copy(_SUPPORT_DIR / "mgba_log.h", out / "mgba_log.h")
         rom = self._build_rom(out, rc_o, main_path, with_float=True)
@@ -285,20 +285,19 @@ class GbaTarget(Target):
             Y_ref_q[t] = qexe.predict_one_q(x_row.astype(np.int32),
                                             qexe.state_q).astype(np_storage)
 
-        tmpl = (_SUPPORT_DIR / "main_template_q.c").read_text()
         T = len(X_q)
         main_path = out / "main.c"
-        main_path.write_text(
-            tmpl
-            .replace("@@T_LEN@@", str(T))
-            .replace("@@RC_K@@", str(qmodel.K))
-            .replace("@@RC_M@@", str(qmodel.M))
-            .replace("@@STATE_FRAC@@", str(cfg.state_frac))
-            .replace("@@STORAGE_T@@", storage_t)
-            .replace("@@TOL@@", str(int(tol)))
-            .replace("@@X_VALUES_Q@@", ", ".join(str(int(v)) for v in X_q.ravel()))
-            .replace("@@Y_VALUES_Q@@", ", ".join(str(int(v)) for v in Y_ref_q.ravel()))
-        )
+        main_path.write_text(render_template(
+            _SUPPORT_DIR / "main_template_q.c",
+            T_LEN=str(T),
+            RC_K=str(qmodel.K),
+            RC_M=str(qmodel.M),
+            STATE_FRAC=str(cfg.state_frac),
+            STORAGE_T=storage_t,
+            TOL=str(int(tol)),
+            X_VALUES_Q=", ".join(str(int(v)) for v in X_q.ravel()),
+            Y_VALUES_Q=", ".join(str(int(v)) for v in Y_ref_q.ravel()),
+        ))
 
         shutil.copy(_SUPPORT_DIR / "mgba_log.h", out / "mgba_log.h")
         rom = self._build_rom(out, rc_o, main_path, with_float=False)
@@ -364,19 +363,18 @@ class GbaTarget(Target):
             qexe.step_q(u_pre_q)
             Y_ref_q[t] = qexe.predict_one_q(x_raw_q, qexe.state_q).astype(np_storage)
 
-        tmpl = (_SUPPORT_DIR / "main_template_q_affine.c").read_text()
         main_path = out / "main.c"
-        main_path.write_text(
-            tmpl
-            .replace("@@T_LEN@@", str(T))
-            .replace("@@RC_K@@", str(qmodel.K))
-            .replace("@@RC_M@@", str(qmodel.M))
-            .replace("@@STORAGE_T@@", storage_t)
-            .replace("@@LUT_KIND@@", qmodel.lut_strategy.kind.value)
-            .replace("@@TOL@@", str(int(tol)))
-            .replace("@@X_VALUES_Q@@", ", ".join(str(int(v)) for v in X_q.ravel()))
-            .replace("@@Y_VALUES_Q@@", ", ".join(str(int(v)) for v in Y_ref_q.ravel()))
-        )
+        main_path.write_text(render_template(
+            _SUPPORT_DIR / "main_template_q_affine.c",
+            T_LEN=str(T),
+            RC_K=str(qmodel.K),
+            RC_M=str(qmodel.M),
+            STORAGE_T=storage_t,
+            LUT_KIND=qmodel.lut_strategy.kind.value,
+            TOL=str(int(tol)),
+            X_VALUES_Q=", ".join(str(int(v)) for v in X_q.ravel()),
+            Y_VALUES_Q=", ".join(str(int(v)) for v in Y_ref_q.ravel()),
+        ))
 
         shutil.copy(_SUPPORT_DIR / "mgba_log.h", out / "mgba_log.h")
         rom = self._build_rom(out, rc_o, main_path, with_float=False)

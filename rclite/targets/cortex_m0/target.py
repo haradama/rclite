@@ -19,6 +19,7 @@ import numpy as np
 
 from rclite.codegen import compile_rc, cross_compile_rc
 from rclite.codegen.llvm import emit_quantized_module, emit_quantized_affine_module
+from rclite.codegen.templating import render_template
 from rclite.ir import sparse_passes
 from ..target import Target, CompiledArtifact, RunResult
 from .boards import CortexM0Board, MicrobitV1
@@ -92,17 +93,16 @@ class CortexM0Target(Target):
         # 4. Render main.c from template. @@T_LEN@@ is the step count T (not
         # T*K / T*M); X and Y are embedded row-major as (T, K) and (T, M),
         # the dims coming from rc_predict.h's RC_INPUT_DIM / RC_OUTPUT_DIM.
-        tmpl = (_SUPPORT_DIR / "main_template.c").read_text()
         T = test_inputs.shape[0]
         x_flat = np.ascontiguousarray(test_inputs, dtype=np.float32).ravel()
         y_flat = np.ascontiguousarray(expected_outputs, dtype=np.float32).ravel()
         main_path = out / "main.c"
-        main_path.write_text(
-            tmpl
-            .replace("@@T_LEN@@", str(T))
-            .replace("@@X_VALUES@@", ", ".join(f"{v:.9g}f" for v in x_flat))
-            .replace("@@Y_VALUES@@", ", ".join(f"{v:.9g}f" for v in y_flat))
-        )
+        main_path.write_text(render_template(
+            _SUPPORT_DIR / "main_template.c",
+            T_LEN=str(T),
+            X_VALUES=", ".join(f"{v:.9g}f" for v in x_flat),
+            Y_VALUES=", ".join(f"{v:.9g}f" for v in y_flat),
+        ))
 
         # 5. Stage startup + linker script next to the sources.
         startup_path = out / "startup.c"
@@ -236,19 +236,19 @@ class CortexM0Target(Target):
                                               qexe.state_q).astype(np_storage)
 
         # Render main.c from template
-        tmpl_path = _SUPPORT_DIR / "main_template_q.c"
-        tmpl = tmpl_path.read_text()
         T = len(X_q)
         x_lit = ", ".join(str(int(v)) for v in X_q.ravel())
         y_lit = ", ".join(str(int(v)) for v in Y_ref_q.ravel())
-        main_c = (tmpl
-                  .replace("@@T_LEN@@", str(T))
-                  .replace("@@RC_K@@", str(qmodel.K))
-                  .replace("@@RC_M@@", str(qmodel.M))
-                  .replace("@@STATE_FRAC@@", str(cfg.state_frac))
-                  .replace("@@STORAGE_T@@", storage_t)
-                  .replace("@@X_VALUES_Q@@", x_lit)
-                  .replace("@@Y_VALUES_Q@@", y_lit))
+        main_c = render_template(
+            _SUPPORT_DIR / "main_template_q.c",
+            T_LEN=str(T),
+            RC_K=str(qmodel.K),
+            RC_M=str(qmodel.M),
+            STATE_FRAC=str(cfg.state_frac),
+            STORAGE_T=storage_t,
+            X_VALUES_Q=x_lit,
+            Y_VALUES_Q=y_lit,
+        )
         main_path = out / "main.c"
         main_path.write_text(main_c)
 
@@ -392,18 +392,18 @@ class CortexM0Target(Target):
             Y_ref_q[t] = qexe.predict_one_q(x_raw_q, qexe.state_q).astype(np_storage)
 
         # Render the affine main.c
-        tmpl_path = _SUPPORT_DIR / "main_template_q_affine.c"
-        tmpl = tmpl_path.read_text()
         x_lit = ", ".join(str(int(v)) for v in X_q.ravel())
         y_lit = ", ".join(str(int(v)) for v in Y_ref_q.ravel())
-        main_c = (tmpl
-                  .replace("@@T_LEN@@", str(T))
-                  .replace("@@RC_K@@", str(qmodel.K))
-                  .replace("@@RC_M@@", str(qmodel.M))
-                  .replace("@@STORAGE_T@@", storage_t)
-                  .replace("@@LUT_KIND@@", qmodel.lut_strategy.kind.value)
-                  .replace("@@X_VALUES_Q@@", x_lit)
-                  .replace("@@Y_VALUES_Q@@", y_lit))
+        main_c = render_template(
+            _SUPPORT_DIR / "main_template_q_affine.c",
+            T_LEN=str(T),
+            RC_K=str(qmodel.K),
+            RC_M=str(qmodel.M),
+            STORAGE_T=storage_t,
+            LUT_KIND=qmodel.lut_strategy.kind.value,
+            X_VALUES_Q=x_lit,
+            Y_VALUES_Q=y_lit,
+        )
         main_path = out / "main.c"
         main_path.write_text(main_c)
 
