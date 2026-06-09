@@ -766,7 +766,7 @@ def emit_module(
 
     `dtype` selects f64 (host) vs f32 (Cortex-M cross-compile).
     `passes` is a list of `rclite.ir.passes.*` instances; defaults to
-    `[StructuralSpecialize()]`.
+    `[VerifyEchoStateConstraint(strict=False), StructuralSpecialize()]`.
     `head` selects the output format: None / "logits" (raw scores),
     "proba" (softmax), or "classify" (argmax class id, i32 output).
     """
@@ -779,11 +779,17 @@ def emit_module(
 
     # Import here to avoid an import cycle (rclite.ir uses runtime types).
     from rclite.ir import build_ir
-    from rclite.ir.passes import StructuralSpecialize
+    from rclite.ir.passes import (
+        VerifyEchoStateConstraint,
+        StructuralSpecialize,
+    )
 
     ir_module = build_ir(rc, exe, head=head)
     if passes is None:
-        passes = [StructuralSpecialize()]
+        passes = [
+            VerifyEchoStateConstraint(strict=False),
+            StructuralSpecialize(),
+        ]
     for p in passes:
         ir_module = p(ir_module)
     return _Lowerer(ir_module, dtype=dtype).lower()

@@ -27,6 +27,8 @@ from rclite.ir import (
     StructuralSpecialize,
     FuseStepReadout,
     TimeUnroll,
+    NormalizeReservoir,
+    VerifyEchoStateConstraint,
     TimeLoop,
     ReservoirStep,
     FusedStepReadout,
@@ -238,6 +240,79 @@ def test_printer_shows_unroll_hint():
     m = TimeUnroll(K=8)(m)
     text = to_mlir_text(m)
     assert "unroll=8" in text
+
+
+def test_normalize_reservoir_scales_dense_w_res():
+    rc, exe, _ = _build(topology=Topology.ESN_STANDARD)
+    m = build_ir(rc, exe)
+    W0 = np.asarray(m.weights["W_res"])
+    sr0 = float(np.max(np.abs(np.linalg.eigvals(W0))))
+    assert sr0 > 0.0
+
+    m2 = NormalizeReservoir(target_spectral_radius=0.7)(m)
+    W1 = np.asarray(m2.weights["W_res"])
+    sr1 = float(np.max(np.abs(np.linalg.eigvals(W1))))
+    assert abs(sr1 - 0.7) < 1e-6
+    assert "normalization_report" in m2.metadata
+
+
+def test_normalize_reservoir_noop_for_structured():
+    rc, exe, _ = _build(topology=Topology.SCR)
+    m = build_ir(rc, exe)
+    m2 = NormalizeReservoir(target_spectral_radius=0.7)(m)
+    assert m2.weights.keys() == m.weights.keys()
+    assert "normalization_report" not in m2.metadata
+
+
+def test_verify_echo_state_dense_warning_non_strict():
+    rc, exe, _ = _build(topology=Topology.ESN_STANDARD)
+    m = build_ir(rc, exe)
+    m2 = VerifyEchoStateConstraint(strict=False, dense_radius_limit=0.1)(m)
+    warns = m2.metadata.get("echo_state_warnings", [])
+    assert warns, "expected dense-radius warning"
+    assert m2.metadata.get("echo_state_verified") is False
+
+
+def test_verify_echo_state_dense_raises_strict():
+    rc, exe, _ = _build(topology=Topology.ESN_STANDARD)
+    m = build_ir(rc, exe)
+    expect_raises(
+        ValueError,
+        VerifyEchoStateConstraint(strict=True, dense_radius_limit=0.1),
+        m,
+    )
+
+
+def test_verify_echo_state_structured_scr_ok():
+    rc, exe, _ = _build(topology=Topology.SCR)
+    m = build_ir(rc, exe)
+    m2 = VerifyEchoStateConstraint(strict=True)(m)
+    assert m2.metadata.get("echo_state_verified") is True
+
+
+def test_verify_echo_state_structured_scr_violation():
+    rc, exe, _ = _build(topology=Topology.SCR)
+    m = build_ir(rc, exe)
+    from dataclasses import replace
+
+    step = m.ops[0].body[1]
+    bad = TimeLoop(
+        body=tuple(
+            replace(step, chain_weight=1.2)
+            if isinstance(o, ReservoirStep)
+            else o
+            for o in m.ops[0].body
+        )
+    )
+    m_bad = type(m)(
+        K=m.K,
+        N=m.N,
+        M=m.M,
+        weights=dict(m.weights),
+        ops=[bad],
+        metadata=dict(m.metadata),
+    )
+    expect_raises(ValueError, VerifyEchoStateConstraint(strict=True), m_bad)
 
 
 def _parity(passes, topology=Topology.ESN_STANDARD, units=60):

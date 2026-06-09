@@ -137,6 +137,7 @@ def build_ir(rc: ReservoirComputer, exe: RCExecutor, *, head=None) -> Module:
         ops=ops,
         metadata={
             "topology": rc.reservoir.topology.name,
+            "spectral_radius": float(rc.reservoir.spectral_radius),
             "include_bias": bool(rc.readout.include_bias),
             "include_input": bool(rc.readout.include_input),
             "feature_dim": F,

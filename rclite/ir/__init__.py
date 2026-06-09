@@ -29,6 +29,8 @@ from .passes import (
     TimeUnroll,
     SparsifyReservoir,
     sparse_passes,
+    NormalizeReservoir,
+    VerifyEchoStateConstraint,
 )
 
 __all__ = [
@@ -52,4 +54,6 @@ __all__ = [
     "TimeUnroll",
     "SparsifyReservoir",
     "sparse_passes",
+    "NormalizeReservoir",
+    "VerifyEchoStateConstraint",
 ]
