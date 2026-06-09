@@ -520,6 +520,40 @@ def test_gba_full_pipeline_mgba():
         assert "TEST_FAIL" not in result.output
 
 
+def test_microbit_compile_affine_emits_llvm_kernel_artifacts():
+    if shutil.which("arm-none-eabi-gcc") is None:
+        return  # skip — no ARM toolchain
+    qm, sample = _build_affine_gba()
+    with tempfile.TemporaryDirectory() as td:
+        art = Microbit().compile_affine_quantized(
+            qm,
+            output_dir=pathlib.Path(td),
+            test_inputs=sample,
+            kernel_backend="llvm",
+        )
+        assert art.binary is not None and art.binary.exists()
+        assert art.metadata["kernel_backend"] == "llvm_ir"
+        srcs = {p.name for p in art.sources}
+        assert {"main.c", "rc_kernel.ll"} <= srcs
+
+
+def test_microbit_compile_affine_emits_c_kernel_artifacts():
+    if shutil.which("arm-none-eabi-gcc") is None:
+        return  # skip — no ARM toolchain
+    qm, sample = _build_affine_gba()
+    with tempfile.TemporaryDirectory() as td:
+        art = Microbit().compile_affine_quantized(
+            qm,
+            output_dir=pathlib.Path(td),
+            test_inputs=sample,
+            kernel_backend="c",
+        )
+        assert art.binary is not None and art.binary.exists()
+        assert art.metadata["kernel_backend"] == "portable_c"
+        srcs = {p.name for p in art.sources}
+        assert {"main.c", "rc_kernel.c", "rc_wrapper.c"} <= srcs
+
+
 def test_nes_class_attributes():
     assert issubclass(Nes, NesTarget)
     n = Nes()
@@ -546,6 +580,22 @@ def test_nes_compile_emits_sources_without_toolchain():
         assert "0x6000" in main_txt and "TEST_PASS" in main_txt
 
 
+def test_nes_compile_emits_llvm_kernel_sources_without_toolchain():
+    qm, sample = _build_affine_gba()
+    with tempfile.TemporaryDirectory() as td:
+        art = Nes().compile_affine_quantized(
+            qm,
+            output_dir=pathlib.Path(td),
+            test_inputs=sample,
+            build=False,
+            kernel_backend="llvm",
+        )
+        assert art.binary is None
+        assert art.metadata["kernel_backend"] == "llvm_ir"
+        srcs = {p.name for p in art.sources}
+        assert {"main.c", "rc_kernel.ll"} <= srcs
+
+
 def test_nes_compile_emits_rom():
     if shutil.which("mos-nes-nrom-clang") is None:
         return  # skip — no llvm-mos toolchain
@@ -553,6 +603,21 @@ def test_nes_compile_emits_rom():
     with tempfile.TemporaryDirectory() as td:
         art = Nes().compile_affine_quantized(
             qm, output_dir=pathlib.Path(td), test_inputs=sample
+        )
+        assert art.binary is not None and art.binary.exists()
+        assert art.binary.suffix == ".nes"
+
+
+def test_nes_compile_emits_rom_with_llvm_kernel():
+    if shutil.which("mos-nes-nrom-clang") is None:
+        return  # skip — no llvm-mos toolchain
+    qm, sample = _build_affine_gba()
+    with tempfile.TemporaryDirectory() as td:
+        art = Nes().compile_affine_quantized(
+            qm,
+            output_dir=pathlib.Path(td),
+            test_inputs=sample,
+            kernel_backend="llvm",
         )
         assert art.binary is not None and art.binary.exists()
         assert art.binary.suffix == ".nes"

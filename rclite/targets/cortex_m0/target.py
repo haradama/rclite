@@ -25,6 +25,7 @@ from rclite.codegen.llvm import (
 )
 from rclite.codegen.templating import render_template
 from rclite.ir import sparse_passes
+from rclite.targets.arduino import emit_affine_kernel_c
 from ..target import Target, CompiledArtifact, RunResult
 from .boards import CortexM0Board
 
@@ -382,7 +383,14 @@ class CortexM0Target(Target):
         )
 
     def compile_affine_quantized(
-        self, qmodel, *, output_dir, test_inputs: np.ndarray, sparse=False, **_
+        self,
+        qmodel,
+        *,
+        output_dir,
+        test_inputs: np.ndarray,
+        sparse=False,
+        kernel_backend: str = "llvm",
+        **_,
     ) -> CompiledArtifact:
         """Cross-compile an `AffineQuantizedModel` to a Cortex-M0 ELF.
 
@@ -413,29 +421,118 @@ class CortexM0Target(Target):
                 f"compile_affine_quantized: storage_bits={sw} not supported"
             )
 
-        # Cross-compile the affine kernel
-        ll_mod = emit_quantized_affine_module(
-            qmodel, passes=sparse_passes(sparse, include_structural=False)
-        )
-        ll_mod.triple = self.triple
-        from rclite.codegen.llvm import _ensure_all_targets
+        kernel_sources = []
+        extra_link_objects = []
 
-        _ensure_all_targets()
-        mod = llvm.parse_assembly(str(ll_mod))
-        mod.verify()
-        target = llvm.Target.from_triple(self.triple)
-        tm = target.create_target_machine(cpu=self.cpu, opt=2, reloc="static")
-        pto = llvm.create_pipeline_tuning_options()
-        pto.speed_level = 2
-        pto.loop_vectorization = False
-        pto.slp_vectorization = False
-        pb = llvm.create_pass_builder(tm, pto)
-        pb.getModulePassManager().run(mod, pb)
-        rc_o = out / "rc_predict.o"
-        with open(rc_o, "wb") as f:
-            f.write(tm.emit_object(mod))
-        with open(out / "rc_predict.s", "w") as f:
-            f.write(tm.emit_assembly(mod))
+        if kernel_backend == "llvm":
+            # First-class LLVM path: persist IR as a build artifact and
+            # cross-compile to rc_predict.o for the target triple.
+            ll_mod = emit_quantized_affine_module(
+                qmodel, passes=sparse_passes(sparse, include_structural=False)
+            )
+            ll_mod.triple = self.triple
+            (out / "rc_kernel.ll").write_text(str(ll_mod))
+            kernel_sources.append(out / "rc_kernel.ll")
+
+            from rclite.codegen.llvm import _ensure_all_targets
+
+            _ensure_all_targets()
+            mod = llvm.parse_assembly(str(ll_mod))
+            mod.verify()
+            target = llvm.Target.from_triple(self.triple)
+            tm = target.create_target_machine(
+                cpu=self.cpu, opt=2, reloc="static"
+            )
+            pto = llvm.create_pipeline_tuning_options()
+            pto.speed_level = 2
+            pto.loop_vectorization = False
+            pto.slp_vectorization = False
+            pb = llvm.create_pass_builder(tm, pto)
+            pb.getModulePassManager().run(mod, pb)
+            rc_o = out / "rc_predict.o"
+            with open(rc_o, "wb") as f:
+                f.write(tm.emit_object(mod))
+            with open(out / "rc_predict.s", "w") as f:
+                f.write(tm.emit_assembly(mod))
+            kernel_kind = "llvm_ir"
+        elif kernel_backend == "c":
+            # Portable-C kernel path for apples-to-apples product builds.
+            # main_template_q_affine expects rc_predict(int64_t,...), so wrap
+            # the C emitter's int32_t-T entrypoint with a tiny adapter.
+            kernel_c_path = out / "rc_kernel.c"
+            kernel_c_path.write_text(
+                emit_affine_kernel_c(qmodel, sparse=sparse)
+            )
+            kernel_sources.append(kernel_c_path)
+
+            rc_i32_o = out / "rc_predict_i32.o"
+            cp = subprocess.run(
+                [
+                    self.cc,
+                    "-c",
+                    f"-mcpu={self.cpu}",
+                    "-mthumb",
+                    "-O2",
+                    "-g",
+                    "-ffunction-sections",
+                    "-fdata-sections",
+                    "-Wall",
+                    f"-I{out}",
+                    "-Drc_predict=rc_predict_i32",
+                    str(kernel_c_path),
+                    "-o",
+                    str(rc_i32_o),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            if cp.returncode != 0:
+                raise RuntimeError(
+                    f"compile failed for {kernel_c_path.name}: {cp.stderr}"
+                )
+
+            wrapper_path = out / "rc_wrapper.c"
+            wrapper_path.write_text(
+                "#include <stdint.h>\n"
+                f"typedef {storage_t} rc_storage_t;\n"
+                "extern void rc_predict_i32(int32_t T, const rc_storage_t *X, rc_storage_t *Y);\n"
+                "void rc_predict(int64_t T, rc_storage_t *X, rc_storage_t *Y) {\n"
+                "    rc_predict_i32((int32_t)T, (const rc_storage_t *)X, Y);\n"
+                "}\n"
+            )
+            wrapper_o = out / "rc_wrapper.o"
+            cp = subprocess.run(
+                [
+                    self.cc,
+                    "-c",
+                    f"-mcpu={self.cpu}",
+                    "-mthumb",
+                    "-O2",
+                    "-g",
+                    "-ffunction-sections",
+                    "-fdata-sections",
+                    "-Wall",
+                    f"-I{out}",
+                    str(wrapper_path),
+                    "-o",
+                    str(wrapper_o),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            if cp.returncode != 0:
+                raise RuntimeError(
+                    f"compile failed for {wrapper_path.name}: {cp.stderr}"
+                )
+
+            rc_o = rc_i32_o
+            extra_link_objects.append(str(wrapper_o))
+            kernel_sources.extend([wrapper_path])
+            kernel_kind = "portable_c"
+        else:
+            raise ValueError(
+                f"unknown kernel_backend {kernel_backend!r}; expected 'llvm' or 'c'"
+            )
 
         # Quantize input through the model's input params (mirrors what
         # CompiledAffineRC.predict does).
@@ -522,6 +619,7 @@ class CortexM0Target(Target):
             str(out / "startup.o"),
             str(out / "main.o"),
             str(rc_o),
+            *extra_link_objects,
             "-o",
             str(elf),
             "-lgcc",
@@ -540,6 +638,7 @@ class CortexM0Target(Target):
             "quantized": True,
             "affine": True,
             "lut_kind": qmodel.lut_strategy.kind.value,
+            "kernel_backend": kernel_kind,
         }
         try:
             sz = subprocess.run(
@@ -552,12 +651,16 @@ class CortexM0Target(Target):
         except Exception:
             pass
 
+        objects = [rc_o, out / "startup.o", out / "main.o"]
+        for obj in extra_link_objects:
+            objects.append(pathlib.Path(obj))
+
         return CompiledArtifact(
             target_name=self.name + "/affine",
             output_dir=out,
             binary=elf,
-            sources=[main_path, startup_path, linker_path],
-            objects=[rc_o, out / "startup.o", out / "main.o"],
+            sources=[main_path, startup_path, linker_path, *kernel_sources],
+            objects=objects,
             metadata=metadata,
         )
 
