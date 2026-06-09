@@ -15,8 +15,6 @@ errors out if it is unstable.
 
 from __future__ import annotations
 from dataclasses import replace
-from typing import Iterable
-
 from rclite.core.profile import Topology
 
 from ..module import Module
@@ -26,6 +24,7 @@ from ..ops import (
     FusedStepReadout,
     TimeLoop,
 )
+from ._ops_utils import iter_reservoir_ops
 
 
 _STRUCTURED = (Topology.DLR, Topology.DLRB, Topology.SCR)
@@ -80,12 +79,5 @@ def _validate_chain_bounds(topology: Topology, cw: float, cb: float) -> None:
         )
 
 
-def _module_uses_W_res(ops: Iterable[Op]) -> bool:
-    for op in ops:
-        if isinstance(op, TimeLoop):
-            if _module_uses_W_res(op.body):
-                return True
-        if isinstance(op, (ReservoirStep, FusedStepReadout)):
-            if op.W_res_name is not None:
-                return True
-    return False
+def _module_uses_W_res(ops) -> bool:
+    return any(op.W_res_name is not None for op in iter_reservoir_ops(ops))

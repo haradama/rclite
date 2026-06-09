@@ -196,6 +196,55 @@ class RCExecutor:
             F += self.rc.input.units
         return F
 
+    def _solve_ridge(
+        self, A: "np.ndarray", B: "np.ndarray", n_outputs: int
+    ) -> "np.ndarray":
+        if B.shape[0] == 0:
+            self.W_out = np.zeros((n_outputs, A.shape[0]))
+        else:
+            self.W_out = np.linalg.solve(A, B).T
+        return self.W_out
+
+    def _fit_ridge_streaming(
+        self, X: "np.ndarray", Y: "np.ndarray"
+    ) -> "np.ndarray":
+        Xp = self._preprocess(X)
+        T = X.shape[0]
+        N = self.rc.reservoir.units
+        M = Y.shape[1]
+        F = self._feature_dim()
+        act = _activation_fn(self.rc.reservoir.activation)
+        leak = self.rc.reservoir.leak_rate
+        bias = self.rc.reservoir.bias
+        washout = max(int(self.rc.readout.washout), 0)
+        lam = self.rc.readout.regularization
+        use_fb = self.W_fb is not None
+
+        A = lam * np.eye(F)
+        B = np.zeros((F, M))
+        h = np.zeros(N)
+        samples = 0
+
+        for t in range(T):
+            pre = self.W_in @ Xp[t] + self.W_res @ h + bias
+            if use_fb:
+                y_prev = Y[t - 1] if t > 0 else np.zeros(M)
+                pre = pre + self.W_fb @ y_prev
+            h = (1.0 - leak) * h + leak * act(pre)
+
+            if t < washout:
+                continue
+
+            phi = self._augment_one(X[t], h)
+            A += np.outer(phi, phi)
+            B += np.outer(phi, Y[t])
+            samples += 1
+
+        if samples == 0:
+            self.W_out = np.zeros((M, F))
+            return self.W_out
+        return self._solve_ridge(A, B, M)
+
     def collect_states(
         self,
         X: "np.ndarray",
@@ -243,26 +292,45 @@ class RCExecutor:
         self.classes_ = np.arange(Y.shape[1])
         return Y
 
-    def fit(self, X: "np.ndarray", Y: "np.ndarray") -> "np.ndarray":
-        """Batch training (RIDGE / PINV). Use `online_fit` for online trainers."""
+    def fit(
+        self,
+        X: "np.ndarray",
+        Y: "np.ndarray",
+        *,
+        materialize_states: bool = True,
+    ) -> "np.ndarray":
+        """Batch training (RIDGE / PINV). Use `online_fit` for online trainers.
+
+        `materialize_states` is accepted for backward compatibility with the
+        previous API. Both modes currently use the same numerically stable
+        batch solve path.
+        """
+        _ = materialize_states
         if X.ndim == 1:
             X = X[:, None]
         Y = np.asarray(Y)
         Y = self._encode_targets(Y)
         if Y.ndim == 1:
             Y = Y[:, None]
-        use_fb = self.W_fb is not None
-        H = self.collect_states(X, Y if use_fb else None)
-        Phi = self._augment(X, H)
-        w = self.rc.readout.washout
-        Phi_w, Y_w = Phi[w:], Y[w:]
         trainer = self.rc.readout.trainer
         if trainer == Trainer.RIDGE:
+            if not materialize_states:
+                return self._fit_ridge_streaming(X, Y)
+            use_fb = self.W_fb is not None
+            H = self.collect_states(X, Y if use_fb else None)
+            Phi = self._augment(X, H)
+            w = self.rc.readout.washout
+            Phi_w, Y_w = Phi[w:], Y[w:]
             lam = self.rc.readout.regularization
             A = Phi_w.T @ Phi_w + lam * np.eye(Phi_w.shape[1])
             B = Phi_w.T @ Y_w
-            self.W_out = np.linalg.solve(A, B).T
+            return self._solve_ridge(A, B, Y.shape[1])
         elif trainer == Trainer.PINV:
+            use_fb = self.W_fb is not None
+            H = self.collect_states(X, Y if use_fb else None)
+            Phi = self._augment(X, H)
+            w = self.rc.readout.washout
+            Phi_w, Y_w = Phi[w:], Y[w:]
             self.W_out = (np.linalg.pinv(Phi_w) @ Y_w).T
         elif trainer in (Trainer.RLS, Trainer.LMS, Trainer.FORCE):
             raise ValueError(

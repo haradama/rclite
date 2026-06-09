@@ -66,9 +66,10 @@
             ];
 
             shellHook = ''
-              # Force the nix LLVM-20 ahead of ~/opt/circt and any apt llc, so
-              # llc / mlir-opt / mlir-translate have the ARM/thumb/wasm targets.
-              export PATH="${llvm.llvm}/bin:$PATH"
+              # Force nix LLVM-20 binaries ahead of ~/opt/circt and host tools.
+              # Keep both mlir and llvm bins explicit so mlir-opt/mlir-translate
+              # and llc are guaranteed to come from the same LLVM major.
+              export PATH="${llvm.mlir}/bin:${llvm.llvm}/bin:$PATH"
 
               # The AVR cross toolchain's setup hook exports CC=avr-gcc. Rust's
               # cc-rs (build.rs) then uses it to compile HOST objects too, passing
@@ -78,6 +79,8 @@
               export CC=gcc
               export CXX=g++
               echo "rclite devShell"
+              echo "  mlir-opt      : $(command -v mlir-opt)"
+              echo "  mlir-translate: $(command -v mlir-translate)"
               echo "  llc           : $(command -v llc)"
               echo "  llc targets   : $(llc --version 2>/dev/null | grep -A1 'Registered Targets' >/dev/null && echo ok || echo '??')"
               echo "  Python        : uv ($(uv --version 2>/dev/null)) — run 'uv sync' then 'uv run pytest'"

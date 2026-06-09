@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import ctypes
 import pathlib
+import re
 import shutil
 import subprocess
 import tempfile
@@ -81,9 +82,34 @@ def _ensure_llvm() -> None:
         _LLVM_READY = True
 
 
+def _llvm_tool_major(tool: str) -> int | None:
+    """Best-effort LLVM major version from `<tool> --version`."""
+    exe = shutil.which(tool)
+    if exe is None:
+        return None
+    r = subprocess.run([exe, "--version"], capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    m = re.search(r"LLVM version\s+(\d+)\.", r.stdout)
+    if m is None:
+        return None
+    return int(m.group(1))
+
+
 def tools_available() -> bool:
-    """True if the MLIR->LLVMIR CLI tools are on PATH (execution uses llvmlite)."""
-    return all(shutil.which(t) for t in _TRANSLATE_TOOLS)
+    """True when MLIR CLI tools are present and LLVM major versions match.
+
+    The bridge translates MLIR with external LLVM tools and then parses the
+    LLVM IR using llvmlite's embedded LLVM parser. Different LLVM majors can
+    emit/accept different IR attribute syntax and fail at parse time.
+    """
+    if not all(shutil.which(t) for t in _TRANSLATE_TOOLS):
+        return False
+    tool_major = _llvm_tool_major("mlir-opt")
+    if tool_major is None:
+        return False
+    llvmlite_major = int(llvm.llvm_version_info[0])
+    return tool_major == llvmlite_major
 
 
 def mlir_to_llvm_ir(mlir_text: str) -> str:

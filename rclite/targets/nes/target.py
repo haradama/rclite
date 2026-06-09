@@ -36,6 +36,9 @@ from typing import Optional
 
 import numpy as np
 
+from rclite.codegen.llvm import emit_quantized_affine_module
+from rclite.ir import sparse_passes
+
 from ..target import Target, CompiledArtifact, RunResult
 from ..arduino.emit_c import emit_affine_kernel_c
 from ...codegen.templating import render_template
@@ -78,6 +81,7 @@ class NesTarget(Target):
         tol: int = 1,
         build: Optional[bool] = None,
         sparse=None,
+        kernel_backend: str = "c",
     ) -> CompiledArtifact:
         """Emit the kernel + harness and link them into a `.nes` cartridge.
 
@@ -97,14 +101,28 @@ class NesTarget(Target):
         out = pathlib.Path(output_dir)
         out.mkdir(parents=True, exist_ok=True)
 
-        # Portable affine kernel. i32 accumulators where they provably fit:
-        # llvm-mos is a modern clang (no avr-gcc 7.x widening-MAC bug), so this
-        # is bit-exact and dodges the 6502's expensive 64-bit libcalls.
-        kernel_c = emit_affine_kernel_c(
-            qmodel, allow_i32_accum=True, sparse=sparse
-        )
-        kernel_path = out / "rc_kernel.c"
-        kernel_path.write_text(kernel_c)
+        if kernel_backend == "llvm":
+            ll_mod = emit_quantized_affine_module(
+                qmodel, passes=sparse_passes(sparse, include_structural=False)
+            )
+            ll_mod.triple = "mos-nes-nrom"
+            kernel_path = out / "rc_kernel.ll"
+            kernel_path.write_text(str(ll_mod))
+            kernel_kind = "llvm_ir"
+        elif kernel_backend == "c":
+            # Portable affine kernel. i32 accumulators where they provably fit:
+            # llvm-mos is a modern clang (no avr-gcc 7.x widening-MAC bug), so this
+            # is bit-exact and dodges the 6502's expensive 64-bit libcalls.
+            kernel_c = emit_affine_kernel_c(
+                qmodel, allow_i32_accum=True, sparse=sparse
+            )
+            kernel_path = out / "rc_kernel.c"
+            kernel_path.write_text(kernel_c)
+            kernel_kind = "portable_c"
+        else:
+            raise ValueError(
+                f"kernel_backend must be 'c' or 'llvm', got {kernel_backend!r}"
+            )
 
         # Quantize test inputs + bit-exact reference outputs via the affine
         # executor (the same path the C kernel reproduces exactly).
@@ -152,6 +170,7 @@ class NesTarget(Target):
             "quantized": True,
             "affine": True,
             "tol": int(tol),
+            "kernel_backend": kernel_kind,
         }
 
         if build is None:

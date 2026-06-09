@@ -41,6 +41,7 @@ from ..ops import (
     SparseSpec,
     TimeLoop,
 )
+from ._ops_utils import iter_reservoir_ops
 from .structural import StructuralSpecialize
 
 
@@ -190,11 +191,4 @@ class SparsifyReservoir:
 
 
 def _module_uses(ops: Iterable[Op], name: str) -> bool:
-    for op in ops:
-        if isinstance(op, TimeLoop):
-            if _module_uses(op.body, name):
-                return True
-        if isinstance(op, (ReservoirStep, FusedStepReadout)):
-            if op.W_res_name == name:
-                return True
-    return False
+    return any(op.W_res_name == name for op in iter_reservoir_ops(ops))

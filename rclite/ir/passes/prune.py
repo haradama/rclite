@@ -19,8 +19,6 @@ This pass is intended to run before sparsification.
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import Iterable
-
 import numpy as np
 
 from ..module import Module
@@ -34,22 +32,11 @@ from ..ops import (
     AccumulateState,
     FinalizeAggregate,
 )
+from ._ops_utils import iter_reservoir_ops
 
 
-def _walk_ops(ops: Iterable[Op]) -> Iterable[Op]:
-    for op in ops:
-        if isinstance(op, TimeLoop):
-            yield from _walk_ops(op.body)
-        else:
-            yield op
-
-
-def _has_sparse_spec(ops: Iterable[Op]) -> bool:
-    for op in _walk_ops(ops):
-        if isinstance(op, (ReservoirStep, FusedStepReadout)):
-            if op.res_sparse is not None:
-                return True
-    return False
+def _has_sparse_spec(ops) -> bool:
+    return any(op.res_sparse is not None for op in iter_reservoir_ops(ops))
 
 
 class PruneInactiveNodes:

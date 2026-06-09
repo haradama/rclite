@@ -50,21 +50,21 @@ class RefitReadout:
         drop_prefix: int | None = None,
         ridge_lambda: float | None = None,
     ):
-        if isinstance(states, (list, tuple)):
-            self.states = [np.asarray(s, dtype=np.float64) for s in states]
-        else:
-            self.states = np.asarray(states, dtype=np.float64)
-
-        if inputs is None:
-            self.inputs = None
-        elif isinstance(inputs, (list, tuple)):
-            self.inputs = [np.asarray(x, dtype=np.float64) for x in inputs]
-        else:
-            self.inputs = np.asarray(inputs, dtype=np.float64)
+        self.states = self._coerce_array_like(states, allow_none=False)
+        self.inputs = self._coerce_array_like(inputs, allow_none=True)
 
         self.targets = np.asarray(targets, dtype=np.float64)
         self.drop_prefix = drop_prefix
         self.ridge_lambda = ridge_lambda
+
+    def _coerce_array_like(self, value, *, allow_none: bool):
+        if value is None:
+            if allow_none:
+                return None
+            raise ValueError("value must not be None")
+        if isinstance(value, (list, tuple)):
+            return [np.asarray(v, dtype=np.float64) for v in value]
+        return np.asarray(value, dtype=np.float64)
 
     def __call__(self, module: Module) -> Module:
         md = dict(module.metadata)
