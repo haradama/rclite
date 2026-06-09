@@ -33,6 +33,7 @@ from .passes import (
     VerifyEchoStateConstraint,
     PruneInactiveNodes,
     ProfileReservoir,
+    RefitReadout,
 )
 
 __all__ = [
@@ -60,4 +61,5 @@ __all__ = [
     "VerifyEchoStateConstraint",
     "PruneInactiveNodes",
     "ProfileReservoir",
+    "RefitReadout",
 ]

@@ -43,6 +43,7 @@ from rclite.ir.passes import (
     FuseStepReadout,
     PruneInactiveNodes,
     ProfileReservoir,
+    RefitReadout,
 )
 from rclite.runtime import RCExecutor
 
@@ -164,24 +165,6 @@ def _collect_states_pruned(rc, m, X):
     return H
 
 
-def _fit_readout_on_pruned_states(rc, H, X_raw, Y):
-    T = H.shape[0]
-    parts = []
-    if rc.readout.include_bias:
-        parts.append(np.ones((T, 1), dtype=np.float64))
-    if rc.readout.include_input:
-        parts.append(np.asarray(X_raw, dtype=np.float64))
-    parts.append(np.asarray(H, dtype=np.float64))
-    Phi = np.concatenate(parts, axis=1)
-    w = int(rc.readout.washout)
-    Phi_w = Phi[w:]
-    Y_w = np.asarray(Y, dtype=np.float64)[w:]
-    lam = float(rc.readout.regularization)
-    A = Phi_w.T @ Phi_w + lam * np.eye(Phi_w.shape[1])
-    B = Phi_w.T @ Y_w
-    return np.linalg.solve(A, B).T
-
-
 def _predict_from_pruned(m, H, X_raw, W_out_override=None):
     if W_out_override is None:
         W_out = np.asarray(m.weights["W_out"], dtype=np.float64)
@@ -207,10 +190,10 @@ def _light_refit_rmse(rc, m, X_train, Y_train, X_eval, Y_eval):
     ):
         return float("nan")
     H_tr = _collect_states_pruned(rc, m, X_train)
-    W_new = _fit_readout_on_pruned_states(rc, H_tr, X_train, Y_train)
+    m_refit = RefitReadout(H_tr, X_train, Y_train)(m)
     # Keep the same dynamics (W_in/W_res) and evaluate with refit W_out.
     H_ev = _collect_states_pruned(rc, m, X_eval)
-    y = _predict_from_pruned(m, H_ev, X_eval, W_out_override=W_new)
+    y = _predict_from_pruned(m_refit, H_ev, X_eval)
     return _rmse(y, Y_eval)
 
 

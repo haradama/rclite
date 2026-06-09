@@ -11,6 +11,7 @@ from .sparsify import SparsifyReservoir, sparse_passes
 from .stability import NormalizeReservoir, VerifyEchoStateConstraint
 from .prune import PruneInactiveNodes
 from .profile import ProfileReservoir
+from .refit import RefitReadout
 
 __all__ = [
     "StructuralSpecialize",
@@ -22,4 +23,5 @@ __all__ = [
     "VerifyEchoStateConstraint",
     "PruneInactiveNodes",
     "ProfileReservoir",
+    "RefitReadout",
 ]

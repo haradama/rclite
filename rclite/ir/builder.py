@@ -141,6 +141,8 @@ def build_ir(rc: ReservoirComputer, exe: RCExecutor, *, head=None) -> Module:
             "include_bias": bool(rc.readout.include_bias),
             "include_input": bool(rc.readout.include_input),
             "feature_dim": F,
+            "washout": int(rc.readout.washout),
+            "regularization": float(rc.readout.regularization),
             "task": rc.readout.task.name,
             "aggregation": agg.name,
             "head": head or "logits",

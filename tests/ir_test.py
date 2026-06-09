@@ -16,6 +16,7 @@ from rclite import (
     ReadoutNode,
     ReservoirComputer,
     Activation,
+    Aggregation,
     Distribution,
     Topology,
     Trainer,
@@ -31,6 +32,7 @@ from rclite.ir import (
     VerifyEchoStateConstraint,
     PruneInactiveNodes,
     ProfileReservoir,
+    RefitReadout,
     SparsifyReservoir,
     TimeLoop,
     ReservoirStep,
@@ -449,6 +451,181 @@ def test_profile_then_prune_profile_criterion_no_fallback_warning():
     warns = m2.metadata.get("prune_warnings", [])
     assert not any("falling back to readout_norm" in w for w in warns)
     assert m2.N == 12
+
+
+def _module_predict_from_states(m, X_raw, H_full):
+    md = m.metadata
+    H = H_full
+    kept = md.get("kept_indices")
+    if kept is not None:
+        H = H_full[:, np.asarray(kept, dtype=np.int64)]
+    parts = []
+    if bool(md.get("include_bias", True)):
+        parts.append(np.ones((X_raw.shape[0], 1)))
+    if bool(md.get("include_input", False)):
+        parts.append(X_raw)
+    parts.append(H)
+    Phi = np.concatenate(parts, axis=1)
+    return Phi @ np.asarray(m.weights["W_out"]).T
+
+
+def test_refit_readout_updates_w_out_and_records_metadata():
+    rc, exe, Xs = _build(topology=Topology.ESN_STANDARD, units=24)
+    H = exe.collect_states(Xs)
+    Y = exe.predict(Xs)
+    m = build_ir(rc, exe)
+
+    m2 = RefitReadout(H, Xs, Y, drop_prefix=0, ridge_lambda=0.0)(m)
+    assert m2.weights["W_out"].shape == m.weights["W_out"].shape
+    info = m2.metadata.get("readout_refit")
+    assert isinstance(info, dict)
+    assert info["samples"] == Xs.shape[0]
+    assert info["washout"] == 0
+
+
+def test_refit_readout_after_prune_improves_train_fit():
+    rc, exe, Xs = _build(topology=Topology.ESN_STANDARD, units=60)
+    H = exe.collect_states(Xs)
+    Y = exe.predict(Xs)
+    m = build_ir(rc, exe)
+    m_pr = PruneInactiveNodes(keep_ratio=0.6)(m)
+
+    y_before = _module_predict_from_states(m_pr, Xs, H)
+    e_before = float(np.sqrt(np.mean((y_before - Y) ** 2)))
+
+    m_rf = RefitReadout(H, Xs, Y, drop_prefix=0)(m_pr)
+    y_after = _module_predict_from_states(m_rf, Xs, H)
+    e_after = float(np.sqrt(np.mean((y_after - Y) ** 2)))
+
+    assert e_after <= e_before
+
+
+def _build_sequence_module(aggregation, *, units=48):
+    rc = ReservoirComputer(
+        input=InputNode(
+            units=1,
+            input_offset=0.5,
+            input_scaling=1.0,
+            input_distribution=Distribution.BERNOULLI,
+            name="in",
+        ),
+        reservoir=ReservoirNode(
+            units=units,
+            activation=Activation.TANH,
+            topology=Topology.ESN_STANDARD,
+            chain_weight=0.85,
+            spectral_radius=0.9,
+            leak_rate=0.3,
+            density=0.2,
+            seed=17,
+            name="res",
+        ),
+        readout=ReadoutNode(
+            units=1,
+            trainer=Trainer.RIDGE,
+            regularization=1e-5,
+            washout=6,
+            include_bias=True,
+            include_input=False,
+            aggregation=aggregation,
+            name="out",
+        ),
+    )
+    exe = RCExecutor(rc)
+    rng = np.random.default_rng(12)
+    seqs = []
+    for _ in range(36):
+        T = int(rng.integers(16, 34))
+        seqs.append((rng.standard_normal((T, 1)) * 0.3 + 0.5).astype(float))
+    labels = np.array([float(s.mean()) for s in seqs])
+    exe.fit_sequences(seqs, labels)
+    return rc, exe, seqs
+
+
+def _module_predict_sequences_from_states(m, seq_inputs, seq_states):
+    md = m.metadata
+    mode = str(md.get("aggregation", "NONE"))
+    washout = int(md.get("washout", 0))
+    include_bias = bool(md.get("include_bias", True))
+    include_input = bool(md.get("include_input", False))
+
+    ys = []
+    for X, H_full in zip(seq_inputs, seq_states):
+        H = np.asarray(H_full, dtype=np.float64)
+        kept = md.get("kept_indices")
+        if kept is not None:
+            H = H[:, np.asarray(kept, dtype=np.int64)]
+
+        if mode == "LAST":
+            h_bar = H[-1]
+            x_bar = np.asarray(X[-1], dtype=np.float64)
+        elif mode == "MEAN":
+            w = min(max(washout, 0), H.shape[0] - 1)
+            h_bar = H[w:].mean(axis=0)
+            x_bar = np.asarray(X[w:].mean(axis=0), dtype=np.float64)
+        else:
+            raise ValueError(f"expected aggregated module, got mode={mode}")
+
+        parts = []
+        if include_bias:
+            parts.append(np.ones(1))
+        if include_input:
+            parts.append(np.atleast_1d(x_bar))
+        parts.append(h_bar)
+        phi = np.concatenate(parts)
+        ys.append(np.asarray(m.weights["W_out"]) @ phi)
+    return np.asarray(ys)
+
+
+def test_refit_readout_sequence_mean_improves_train_fit():
+    rc, exe, seqs = _build_sequence_module(Aggregation.MEAN)
+    m = build_ir(rc, exe)
+    seq_states = [exe.collect_states(x) for x in seqs]
+    y_true = exe.predict_sequences(seqs)
+
+    # Perturb readout so there is room for refit improvement.
+    m_bad = type(m)(
+        K=m.K,
+        N=m.N,
+        M=m.M,
+        weights={**m.weights, "W_out": np.asarray(m.weights["W_out"]) * 0.0},
+        ops=m.ops,
+        metadata=dict(m.metadata),
+    )
+    y_before = _module_predict_sequences_from_states(m_bad, seqs, seq_states)
+    e_before = float(np.sqrt(np.mean((y_before - y_true) ** 2)))
+
+    m_refit = RefitReadout(seq_states, None, y_true)(m_bad)
+    y_after = _module_predict_sequences_from_states(m_refit, seqs, seq_states)
+    e_after = float(np.sqrt(np.mean((y_after - y_true) ** 2)))
+
+    assert e_after <= e_before
+    assert m_refit.metadata["readout_refit"]["aggregation"] == "MEAN"
+
+
+def test_refit_readout_sequence_last_improves_train_fit():
+    rc, exe, seqs = _build_sequence_module(Aggregation.LAST)
+    m = build_ir(rc, exe)
+    seq_states = [exe.collect_states(x) for x in seqs]
+    y_true = exe.predict_sequences(seqs)
+
+    m_bad = type(m)(
+        K=m.K,
+        N=m.N,
+        M=m.M,
+        weights={**m.weights, "W_out": np.asarray(m.weights["W_out"]) * 0.0},
+        ops=m.ops,
+        metadata=dict(m.metadata),
+    )
+    y_before = _module_predict_sequences_from_states(m_bad, seqs, seq_states)
+    e_before = float(np.sqrt(np.mean((y_before - y_true) ** 2)))
+
+    m_refit = RefitReadout(seq_states, None, y_true)(m_bad)
+    y_after = _module_predict_sequences_from_states(m_refit, seqs, seq_states)
+    e_after = float(np.sqrt(np.mean((y_after - y_true) ** 2)))
+
+    assert e_after <= e_before
+    assert m_refit.metadata["readout_refit"]["aggregation"] == "LAST"
 
 
 def _parity(passes, topology=Topology.ESN_STANDARD, units=60):
