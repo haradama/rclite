@@ -31,6 +31,8 @@ from .passes import (
     sparse_passes,
     NormalizeReservoir,
     VerifyEchoStateConstraint,
+    PruneInactiveNodes,
+    ProfileReservoir,
 )
 
 __all__ = [
@@ -56,4 +58,6 @@ __all__ = [
     "sparse_passes",
     "NormalizeReservoir",
     "VerifyEchoStateConstraint",
+    "PruneInactiveNodes",
+    "ProfileReservoir",
 ]

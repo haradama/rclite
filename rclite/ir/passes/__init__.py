@@ -9,6 +9,8 @@ from .fuse import FuseStepReadout
 from .unroll import TimeUnroll
 from .sparsify import SparsifyReservoir, sparse_passes
 from .stability import NormalizeReservoir, VerifyEchoStateConstraint
+from .prune import PruneInactiveNodes
+from .profile import ProfileReservoir
 
 __all__ = [
     "StructuralSpecialize",
@@ -18,4 +20,6 @@ __all__ = [
     "sparse_passes",
     "NormalizeReservoir",
     "VerifyEchoStateConstraint",
+    "PruneInactiveNodes",
+    "ProfileReservoir",
 ]

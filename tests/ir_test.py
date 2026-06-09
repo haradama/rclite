@@ -29,6 +29,9 @@ from rclite.ir import (
     TimeUnroll,
     NormalizeReservoir,
     VerifyEchoStateConstraint,
+    PruneInactiveNodes,
+    ProfileReservoir,
+    SparsifyReservoir,
     TimeLoop,
     ReservoirStep,
     FusedStepReadout,
@@ -313,6 +316,139 @@ def test_verify_echo_state_structured_scr_violation():
         metadata=dict(m.metadata),
     )
     expect_raises(ValueError, VerifyEchoStateConstraint(strict=True), m_bad)
+
+
+def test_prune_inactive_nodes_rewrites_dimensions_and_weights():
+    rc, exe, _ = _build(topology=Topology.ESN_STANDARD, units=60)
+    m = build_ir(rc, exe)
+    m2 = PruneInactiveNodes(keep_ratio=0.5)(m)
+    assert m2.N == 30
+    assert m2.weights["W_in"].shape == (30, 1)
+    assert m2.weights["W_res"].shape == (30, 30)
+    # F = 1(bias) + 1(input) + N
+    assert m2.weights["W_out"].shape[1] == 32
+    assert m2.metadata.get("pruned_nodes") == 30
+
+
+def test_prune_inactive_nodes_compiles_and_predicts():
+    rc, exe, Xs = _build(topology=Topology.ESN_STANDARD, units=80)
+    jit = compile_rc(rc, exe, passes=[PruneInactiveNodes(keep_ratio=0.5)])
+    Y = jit.predict(Xs)
+    assert Y.shape == (Xs.shape[0], 1)
+    assert np.all(np.isfinite(Y))
+
+
+def test_prune_after_sparsify_is_skipped_with_warning():
+    rc, exe, _ = _build(topology=Topology.ESN_STANDARD, units=60)
+    m = build_ir(rc, exe)
+    m_sp = SparsifyReservoir()(m)
+    m_pr = PruneInactiveNodes(keep_ratio=0.5)(m_sp)
+    warns = m_pr.metadata.get("prune_warnings", [])
+    assert warns
+    assert "Run prune before SparsifyReservoir" in warns[0]
+
+
+def test_prune_profile_criterion_uses_variance_and_correlation():
+    rc, exe, _ = _build(topology=Topology.ESN_STANDARD, units=6)
+    m = build_ir(rc, exe)
+    # Neutralize readout effect so profile stats dominate selection.
+    W_out = np.asarray(m.weights["W_out"]).copy()
+    W_out[:, 2:] = 1.0
+    m.weights["W_out"] = W_out
+    m.metadata["profile_stats"] = {
+        "node_variance": [0.9, 0.1, 0.2, 0.8, 0.05, 1.0],
+        "correlation_with_other_nodes": [0.1, 0.95, 0.8, 0.2, 0.9, 0.1],
+    }
+
+    m2 = PruneInactiveNodes(
+        keep_ratio=0.5,
+        criterion="low_variance_or_high_corr",
+    )(m)
+    assert m2.N == 3
+    # Expected strongest nodes: indices 0, 3, 5
+    assert m2.metadata.get("kept_indices") == [0, 3, 5]
+    assert m2.metadata.get("prune_criterion") == "low_variance_or_high_corr"
+
+
+def test_prune_profile_criterion_fallbacks_without_stats():
+    rc, exe, _ = _build(topology=Topology.ESN_STANDARD, units=12)
+    m = build_ir(rc, exe)
+    m2 = PruneInactiveNodes(
+        keep_ratio=0.5,
+        criterion="low_variance_or_high_corr",
+    )(m)
+    warns = m2.metadata.get("prune_warnings", [])
+    assert warns
+    assert "falling back to readout_norm" in warns[0]
+
+
+def test_prune_profile_criterion_score_weights_affect_selection():
+    rc, exe, _ = _build(topology=Topology.ESN_STANDARD, units=6)
+    m = build_ir(rc, exe)
+    # Make readout term prefer node 1 strongly.
+    W_out = np.asarray(m.weights["W_out"]).copy()
+    W_out[:, 2:] = 0.0
+    W_out[:, 2 + 1] = 10.0
+    m.weights["W_out"] = W_out
+    m.metadata["profile_stats"] = {
+        "node_variance": [0.0, 0.1, 1.0, 0.9, 0.8, 0.7],
+        "correlation_with_other_nodes": [0.0, 0.9, 0.1, 0.2, 0.1, 0.2],
+    }
+
+    a = PruneInactiveNodes(
+        keep_ratio=0.5,
+        criterion="low_variance_or_high_corr",
+        w_readout=1.0,
+        w_variance=0.0,
+        w_corr=0.0,
+    )(m)
+    b = PruneInactiveNodes(
+        keep_ratio=0.5,
+        criterion="low_variance_or_high_corr",
+        w_readout=0.0,
+        w_variance=1.0,
+        w_corr=1.0,
+    )(m)
+
+    assert a.metadata.get("kept_indices") != b.metadata.get("kept_indices")
+    assert a.metadata.get("prune_score_weights") == {
+        "readout": 1.0,
+        "variance": 0.0,
+        "corr": 0.0,
+    }
+
+
+def test_profile_reservoir_populates_stats():
+    rc, exe, Xs = _build(topology=Topology.ESN_STANDARD, units=20)
+    H = exe.collect_states(Xs)
+    m = build_ir(rc, exe)
+    m2 = ProfileReservoir(H, drop_prefix=3)(m)
+    ps = m2.metadata.get("profile_stats")
+    assert isinstance(ps, dict)
+    for k in (
+        "node_variance",
+        "mean_activation",
+        "correlation_with_other_nodes",
+        "n_profile_steps",
+    ):
+        assert k in ps
+    assert len(ps["node_variance"]) == m.N
+    assert len(ps["correlation_with_other_nodes"]) == m.N
+    assert ps["n_profile_steps"] == max(1, Xs.shape[0] - 3)
+
+
+def test_profile_then_prune_profile_criterion_no_fallback_warning():
+    rc, exe, Xs = _build(topology=Topology.ESN_STANDARD, units=24)
+    H = exe.collect_states(Xs)
+    m = build_ir(rc, exe)
+    m = ProfileReservoir(H)(m)
+    m2 = PruneInactiveNodes(
+        keep_ratio=0.5,
+        criterion="low_variance_or_high_corr",
+    )(m)
+    warns = m2.metadata.get("prune_warnings", [])
+    assert not any("falling back to readout_norm" in w for w in warns)
+    assert m2.N == 12
 
 
 def _parity(passes, topology=Topology.ESN_STANDARD, units=60):
