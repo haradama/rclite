@@ -85,11 +85,29 @@ def build_unroll_rows(W, threshold: float = 0.0):
     )
 
 
+def _index_dtype(max_value: int):
+    """Smallest signed int dtype that holds the non-negative index range.
+
+    CSR `col` / `rowptr` are non-negative indices the LLVM lowerers load and
+    `sext` to i64, so the narrowest signed type whose positive range covers
+    `max_value` round-trips exactly — shrinking the index tables in Flash
+    (the column table is the dominant cost of a CSR reservoir).
+    """
+    if max_value <= 127:
+        return np.int8
+    if max_value <= 32767:
+        return np.int16
+    return np.int32
+
+
 def build_csr(W, threshold: float = 0.0):
     """Return (val, col, rowptr) CSR arrays in ascending column order per row.
 
     `val` preserves W's dtype (int storage for quantized W_res_q, float for
-    the float path); `col`/`rowptr` are int32.
+    the float path). `col` and `rowptr` use the narrowest signed int dtype
+    that holds their index range (column index < N, rowptr value <= nnz) so
+    the emitted index tables are as small as possible; the lowerers sext on
+    load, so the value is unchanged.
     """
     W = np.asarray(W)
     N = W.shape[0]
@@ -101,10 +119,11 @@ def build_csr(W, threshold: float = 0.0):
             col.append(int(j))
             val.append(W[i, j])
         rowptr.append(len(col))
+    nnz = len(col)
     return (
         np.asarray(val, dtype=W.dtype),
-        np.asarray(col, dtype=np.int32),
-        np.asarray(rowptr, dtype=np.int32),
+        np.asarray(col, dtype=_index_dtype(max(N - 1, 0))),
+        np.asarray(rowptr, dtype=_index_dtype(nnz)),
     )
 
 

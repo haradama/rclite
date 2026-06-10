@@ -48,6 +48,29 @@ from .quantize import AffineQuantizedModel
 from ..softmax_lut import SoftmaxLUTSpec, build_params as build_softmax_params
 
 
+def _fit_rowsum(arr) -> np.ndarray:
+    """Downcast a row-sum table to the narrowest signed int dtype that holds
+    every value (int8/16/32), shrinking it in Flash.
+
+    The affine lowerer sign-extends row sums back to the accumulator width on
+    load, so the narrowed value is restored exactly. Row sums are precomputed
+    `zp · row_sum` correction terms; their magnitude is data-dependent, so the
+    width is picked per model from the actual values.
+    """
+    a = np.asarray(arr)
+    if a.size == 0:
+        dtype = np.int8
+    else:
+        lo, hi = int(a.min()), int(a.max())
+        if lo >= -128 and hi <= 127:
+            dtype = np.int8
+        elif lo >= -32768 and hi <= 32767:
+            dtype = np.int16
+        else:
+            dtype = np.int32
+    return a.astype(dtype)
+
+
 def build_ir_from_quantized_affine(
     qmodel: AffineQuantizedModel, *, head=None
 ) -> Module:
@@ -81,12 +104,12 @@ def build_ir_from_quantized_affine(
     weights: dict[str, np.ndarray] = {
         "W_in": qmodel.W_in_q,
         "W_out": qmodel.W_out_q,
-        "row_sum_W_in": qmodel.row_sum_W_in,
-        "row_sum_Wout_state": qmodel.row_sum_Wout_state,
+        "row_sum_W_in": _fit_rowsum(qmodel.row_sum_W_in),
+        "row_sum_Wout_state": _fit_rowsum(qmodel.row_sum_Wout_state),
     }
     if not is_structured:
         weights["W_res"] = qmodel.W_res_q
-        weights["row_sum_W_res"] = qmodel.row_sum_W_res
+        weights["row_sum_W_res"] = _fit_rowsum(qmodel.row_sum_W_res)
         # Per-channel reservoir-step multiplier: emit per-row (M0, n) as i32
         # globals so the lowering can index them per reservoir row.
         if qmodel.M_res_M0_arr is not None:
@@ -100,7 +123,7 @@ def build_ir_from_quantized_affine(
             raise RuntimeError(
                 "qmodel has include_input=True but row_sum_Wout_input is None"
             )
-        weights["row_sum_Wout_input"] = qmodel.row_sum_Wout_input
+        weights["row_sum_Wout_input"] = _fit_rowsum(qmodel.row_sum_Wout_input)
 
     # Per-channel readout multipliers as i32 globals (per output row).
     if qmodel.M_out_state_M0_arr is not None:

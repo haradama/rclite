@@ -1856,6 +1856,17 @@ class _AffineLowerer:
     # ------------------------------------------------------------------
     # core helpers
 
+    def _widen_to_accum(self, v):
+        """Sign-extend an integer SSA value up to `accum_ty`.
+
+        Row-sum globals are stored at their minimal signed width to save
+        Flash; their values always fit `accum_ty`, so a plain `sext` (or a
+        pass-through when already that width) restores the exact value.
+        """
+        if v.type.width < self.accum_ty.width:
+            return self.b.sext(v, self.accum_ty)
+        return v
+
     def _clamp_to_i32(self, val_ty):
         """If accumulator is i64, clamp to i32 range and truncate; else passthrough."""
         if self.accum_ty == _I32:
@@ -2249,12 +2260,7 @@ class _AffineLowerer:
                 x = _load1d(b, self.X_arg, b.add(b.mul(t, _ci(K)), k))
             prod = b.mul(b.sext(w, self.accum_ty), b.sext(x, self.accum_ty))
             b.store(b.add(b.load(acc_in_var), prod), acc_in_var)
-        rs_in_i32 = _load1d_global(b, g_rs_in, i)
-        rs_in = (
-            rs_in_i32
-            if self.accum_ty == _I32
-            else b.sext(rs_in_i32, self.accum_ty)
-        )
+        rs_in = self._widen_to_accum(_load1d_global(b, g_rs_in, i))
         acc_in_final = b.sub(
             b.load(acc_in_var), b.mul(self._ca(self.zp_u_pre), rs_in)
         )
@@ -2287,12 +2293,7 @@ class _AffineLowerer:
                         b.sext(w, self.accum_ty), b.sext(h, self.accum_ty)
                     )
                     b.store(b.add(b.load(acc_res_var), prod), acc_res_var)
-            rs_res_i32 = _load1d_global(b, g_rs_res, i)
-            rs_res = (
-                rs_res_i32
-                if self.accum_ty == _I32
-                else b.sext(rs_res_i32, self.accum_ty)
-            )
+            rs_res = self._widen_to_accum(_load1d_global(b, g_rs_res, i))
             acc_res_final = b.sub(
                 b.load(acc_res_var), b.mul(self._ca(self.zp_state), rs_res)
             )
