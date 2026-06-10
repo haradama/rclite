@@ -43,6 +43,22 @@ def _arr(name: str, ctype: str, values, rd_macro: str) -> str:
     return f"static const {ctype} {name}[] RC_PROGMEM = {{ {body} }};"
 
 
+def _fit_ctype(arr):
+    """(C type, RC_RD macro) for the narrowest signed int holding arr's values.
+
+    The row-sum / CSR-index tables are read into `int`-or-wider arithmetic
+    (C integer promotion sign-extends a narrower load), so storing them at
+    their minimal width shrinks Flash without changing the computed value.
+    """
+    a = np.asarray(arr)
+    lo, hi = (int(a.min()), int(a.max())) if a.size else (0, 0)
+    if lo >= -128 and hi <= 127:
+        return "int8_t", "RC_RD8"
+    if lo >= -32768 and hi <= 32767:
+        return "int16_t", "RC_RD16"
+    return "int32_t", "RC_RD32"
+
+
 def emit_affine_kernel_c(
     qmodel: AffineQuantizedModel,
     fn_name: str = "rc_predict",
@@ -110,8 +126,9 @@ def emit_affine_kernel_c(
         from rclite.ir.passes.sparsify import build_csr
 
         _wres_val, _wres_col, _wres_rowptr = build_csr(qmodel.W_res_q)
-        col_t = "int16_t" if N <= 32767 else "int32_t"
-        rd_col = "RC_RD16" if N <= 32767 else "RC_RD32"
+        # build_csr already returns col/rowptr at their minimal signed width.
+        col_t, rd_col = _fit_ctype(_wres_col)
+        rowptr_t, rd_rowptr = _fit_ctype(_wres_rowptr)
 
     # Per-channel reservoir-step multiplier (per-row M0/n) for dense topologies.
     use_per_channel_res = (
@@ -167,25 +184,30 @@ def emit_affine_kernel_c(
     a("typedef %s rc_storage_t;" % storage_t)
     a("")
 
+    # Row-sum correction tables are stored at their minimal signed width.
+    rs_in_t, rd_rs_in = _fit_ctype(qmodel.row_sum_W_in)
+    rs_os_t, rd_rs_os = _fit_ctype(qmodel.row_sum_Wout_state)
+
     # ---- weight / LUT tables ----
     a(_arr("rc_W_in", storage_t, qmodel.W_in_q, rd_s))
     a(_arr("rc_W_out", wout_t, qmodel.W_out_q, rd_w))
-    a(_arr("rc_row_sum_W_in", "int32_t", qmodel.row_sum_W_in, "RC_RD32"))
+    a(_arr("rc_row_sum_W_in", rs_in_t, qmodel.row_sum_W_in, rd_rs_in))
     a(
         _arr(
             "rc_row_sum_Wout_state",
-            "int32_t",
+            rs_os_t,
             qmodel.row_sum_Wout_state,
-            "RC_RD32",
+            rd_rs_os,
         )
     )
     if rc.readout.include_input:
+        rs_oi_t, rd_rs_oi = _fit_ctype(qmodel.row_sum_Wout_input)
         a(
             _arr(
                 "rc_row_sum_Wout_input",
-                "int32_t",
+                rs_oi_t,
                 qmodel.row_sum_Wout_input,
-                "RC_RD32",
+                rd_rs_oi,
             )
         )
     if use_per_channel_out:
@@ -240,13 +262,14 @@ def emit_affine_kernel_c(
                 )
             )
     if not is_structured:
+        rs_res_t, rd_rs_res = _fit_ctype(qmodel.row_sum_W_res)
         if use_sparse:
             a(_arr("rc_W_res_val", storage_t, _wres_val, rd_s))
             a(_arr("rc_W_res_col", col_t, _wres_col, rd_col))
-            a(_arr("rc_W_res_rowptr", "int32_t", _wres_rowptr, "RC_RD32"))
+            a(_arr("rc_W_res_rowptr", rowptr_t, _wres_rowptr, rd_rowptr))
         else:
             a(_arr("rc_W_res", storage_t, qmodel.W_res_q, rd_s))
-        a(_arr("rc_row_sum_W_res", "int32_t", qmodel.row_sum_W_res, "RC_RD32"))
+        a(_arr("rc_row_sum_W_res", rs_res_t, qmodel.row_sum_W_res, rd_rs_res))
         if use_per_channel_res:
             a(_arr("rc_M_res_M0", "int32_t", qmodel.M_res_M0_arr, "RC_RD32"))
             a(_arr("rc_M_res_n", "int32_t", qmodel.M_res_n_arr, "RC_RD32"))
@@ -425,7 +448,7 @@ def emit_affine_kernel_c(
     a(
         f"                acc_in += (int32_t){rd_s}(&rc_W_in[i*RC_K + k]) * (int32_t)({u_expr});"
     )
-    a(f"            acc_in -= {zp_upre} * RC_RD32(&rc_row_sum_W_in[i]);")
+    a(f"            acc_in -= {zp_upre} * {rd_rs_in}(&rc_row_sum_W_in[i]);")
     a(
         f"            int32_t rq_in = RC_RQ(acc_in, {qmodel.M_in_M0}, {qmodel.M_in_n});"
     )
@@ -444,15 +467,15 @@ def emit_affine_kernel_c(
         )
     elif use_sparse:
         a(f"            {res_t} acc_res = 0;")
-        a("            { int32_t rp = RC_RD32(&rc_W_res_rowptr[i]);")
-        a("              int32_t rpe = RC_RD32(&rc_W_res_rowptr[i+1]);")
+        a(f"            {{ int32_t rp = {rd_rowptr}(&rc_W_res_rowptr[i]);")
+        a(f"              int32_t rpe = {rd_rowptr}(&rc_W_res_rowptr[i+1]);")
         a("              for (j = rp; j < rpe; j++)")
         a(
             f"                acc_res += {res_cast}{rd_s}(&rc_W_res_val[j]) * "
             f"{res_cast}rc_h[{rd_col}(&rc_W_res_col[j])]; }}"
         )
         a(
-            f"            acc_res -= {res_cast}{zp_state} * {res_cast}RC_RD32(&rc_row_sum_W_res[i]);"
+            f"            acc_res -= {res_cast}{zp_state} * {res_cast}{rd_rs_res}(&rc_row_sum_W_res[i]);"
         )
     else:
         a(f"            {res_t} acc_res = 0;")
@@ -461,7 +484,7 @@ def emit_affine_kernel_c(
             f"                acc_res += {res_cast}{rd_s}(&rc_W_res[i*RC_N + j]) * {res_cast}rc_h[j];"
         )
         a(
-            f"            acc_res -= {res_cast}{zp_state} * {res_cast}RC_RD32(&rc_row_sum_W_res[i]);"
+            f"            acc_res -= {res_cast}{zp_state} * {res_cast}{rd_rs_res}(&rc_row_sum_W_res[i]);"
         )
     if use_per_channel_res:
         # per-row (M0[i], n[i]) — reuse the same runtime requantize fn.
@@ -520,7 +543,7 @@ def emit_affine_kernel_c(
                 f"* {ro_cast}X[({row})*RC_K + k];"
             )
             a(
-                f"{ind}    acc_i -= {ro_cast}{zp_input} * {ro_cast}RC_RD32(&rc_row_sum_Wout_input[m]);"
+                f"{ind}    acc_i -= {ro_cast}{zp_input} * {ro_cast}{rd_rs_oi}(&rc_row_sum_Wout_input[m]);"
             )
             m_in = (
                 "RC_RD32(&rc_M_out_input_M0[m]), RC_RD32(&rc_M_out_input_n[m])"
@@ -535,7 +558,7 @@ def emit_affine_kernel_c(
             f"* {ro_cast}rc_h[j];"
         )
         a(
-            f"{ind}    acc_s -= {ro_cast}{zp_state} * {ro_cast}RC_RD32(&rc_row_sum_Wout_state[m]);"
+            f"{ind}    acc_s -= {ro_cast}{zp_state} * {ro_cast}{rd_rs_os}(&rc_row_sum_Wout_state[m]);"
         )
         m_st = (
             "RC_RD32(&rc_M_out_state_M0[m]), RC_RD32(&rc_M_out_state_n[m])"
