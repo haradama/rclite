@@ -19,7 +19,8 @@ reproducing numpy's `trunc_i32` / `astype` wrap behaviour.
 """
 
 from __future__ import annotations
-from typing import List
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
 
 import numpy as np
 
@@ -41,6 +42,147 @@ def _sat_storage(v: int, sb: int) -> int:
     return max(lo, min(hi, int(v)))
 
 
+@dataclass(frozen=True)
+class _SymBase:
+    """Shared scalar setup for both symmetric kernels.
+
+    Bundles the storage widths, shapes, fixed-point shifts and quantized
+    bias / leak / tanh-LUT bounds so the bit-exact quantization math
+    (truncate-not-round `bias_q` / `leak_q`, the `shift_in` invariant, the
+    LUT domain) is computed once for the inference and online emitters.
+    """
+
+    sb: int
+    storage_t: str
+    rd: str
+    N: int
+    K: int
+    M: int
+    F: int
+    qmin: int
+    qmax: int
+    state_frac: int
+    input_frac: int
+    weight_frac: int
+    shift_in: int
+    state_scale: int
+    bias_q: int
+    leak_q: int
+    one_minus_leak_q: int
+    xmin_q: int
+    xmax_q: int
+    denom: int
+    lut_n: int
+
+
+def _symmetric_base(qmodel: QuantizedModel, *, what: str = "") -> _SymBase:
+    """Compute the shared scalar parameters for a symmetric kernel emit.
+
+    `what` is interpolated into the `shift_in` error message ("" for the
+    inference kernel, "online " for the LMS kernel) so the diagnostics match
+    the original per-emitter messages exactly.
+    """
+    rc, cfg = qmodel.rc, qmodel.config
+    sb = qmodel.target.storage_bits
+    state_frac, input_frac, weight_frac = (
+        cfg.state_frac,
+        cfg.input_frac,
+        cfg.weight_frac,
+    )
+    shift_in = weight_frac + input_frac - state_frac
+    if shift_in < 0:
+        raise NotImplementedError(
+            f"symmetric {what}C emit needs weight_frac+input_frac >= "
+            f"state_frac (shift_in={shift_in})"
+        )
+    state_scale = 1 << state_frac
+    # bias/leak follow `QuantTarget.quantize_state`: int(x * scale) (truncate
+    # toward zero), then saturate to storage. NOT round() — the executor uses
+    # plain int() here, and rounding would diverge by one LSB.
+    bias_q = _sat_storage(int(float(rc.reservoir.bias) * state_scale), sb)
+    leak_q = _sat_storage(int(float(rc.reservoir.leak_rate) * state_scale), sb)
+    xmin_q = int(qmodel.lut.xmin * state_scale)
+    xmax_q = int(qmodel.lut.xmax * state_scale)
+    return _SymBase(
+        sb=sb,
+        storage_t=_C_TYPE[sb],
+        rd=_RD[sb],
+        N=qmodel.N,
+        K=qmodel.K,
+        M=qmodel.M,
+        F=qmodel.F,
+        qmin=-(1 << (sb - 1)),
+        qmax=(1 << (sb - 1)) - 1,
+        state_frac=state_frac,
+        input_frac=input_frac,
+        weight_frac=weight_frac,
+        shift_in=shift_in,
+        state_scale=state_scale,
+        bias_q=bias_q,
+        leak_q=leak_q,
+        one_minus_leak_q=state_scale - leak_q,
+        xmin_q=xmin_q,
+        xmax_q=xmax_q,
+        denom=xmax_q - xmin_q,
+        lut_n=int(np.asarray(qmodel.lut_table_q).shape[0]),
+    )
+
+
+@dataclass(frozen=True)
+class _ReservoirLayout:
+    """Topology / chain-weight / CSR-sparse layout shared by both emitters."""
+
+    is_structured: bool
+    topo: str
+    chain_weight_q: int
+    chain_feedback_q: int
+    use_sparse: bool
+    rd_col: Optional[str]
+    col_t: Optional[str]
+    csr: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]
+
+
+def _reservoir_layout(qmodel: QuantizedModel, sparse) -> _ReservoirLayout:
+    """Resolve the W_res representation (structured chain / CSR / dense).
+
+    Chain weights are read straight from the quantized dense W_res so they are
+    byte-identical to what the executor's CSR-over-dense matmul reads.
+    Structured topologies place the forward chain on the lower sub-diagonal
+    (`W_res_q[i, i-1]`) and the DLRB feedback on the upper one
+    (`W_res_q[i, i+1]`); all forward (resp. backward) entries share one scalar,
+    so a single representative entry is exact. Any requested sparse strategy on
+    a dense topology maps to CSR (bounded code size, bit-exact).
+    """
+    N = qmodel.N
+    is_structured = qmodel.rc.reservoir.topology in (
+        Topology.DLR,
+        Topology.DLRB,
+        Topology.SCR,
+    )
+    topo = qmodel.rc.reservoir.topology.name
+    Wr = np.asarray(qmodel.W_res_q)
+    chain_weight_q = int(Wr[1, 0]) if (is_structured and N > 1) else 0
+    chain_feedback_q = int(Wr[0, 1]) if (is_structured and N > 1) else 0
+    use_sparse = bool(sparse) and not is_structured
+    rd_col = col_t = csr = None
+    if use_sparse:
+        from rclite.ir.passes.sparsify import build_csr
+
+        csr = build_csr(Wr)
+        col_t = "int16_t" if N <= 32767 else "int32_t"
+        rd_col = "RC_RD16" if N <= 32767 else "RC_RD32"
+    return _ReservoirLayout(
+        is_structured=is_structured,
+        topo=topo,
+        chain_weight_q=chain_weight_q,
+        chain_feedback_q=chain_feedback_q,
+        use_sparse=use_sparse,
+        rd_col=rd_col,
+        col_t=col_t,
+        csr=csr,
+    )
+
+
 def emit_symmetric_kernel_c(
     qmodel: QuantizedModel,
     fn_name: str = "rc_predict",
@@ -57,69 +199,32 @@ def emit_symmetric_kernel_c(
     proba = head == "proba"
     rc = qmodel.rc
     cfg = qmodel.config
-    sb = qmodel.target.storage_bits
-    storage_t = _C_TYPE[sb]
-    rd = _RD[sb]
-    N, K, M = qmodel.N, qmodel.K, qmodel.M
-    F = qmodel.F
-    qmin, qmax = -(1 << (sb - 1)), (1 << (sb - 1)) - 1
-
-    state_frac = cfg.state_frac
-    input_frac = cfg.input_frac
-    weight_frac = cfg.weight_frac
-    shift_in = weight_frac + input_frac - state_frac
-    if shift_in < 0:
-        raise NotImplementedError(
-            f"symmetric C emit needs weight_frac+input_frac >= state_frac "
-            f"(shift_in={shift_in})"
-        )
+    base = _symmetric_base(qmodel)
+    sb, storage_t, rd = base.sb, base.storage_t, base.rd
+    N, K, M, F = base.N, base.K, base.M, base.F
+    qmin, qmax = base.qmin, base.qmax
+    state_frac, input_frac, weight_frac = (
+        base.state_frac,
+        base.input_frac,
+        base.weight_frac,
+    )
+    shift_in = base.shift_in
     shift_res = weight_frac
-    state_scale = 1 << state_frac
+    bias_q, leak_q = base.bias_q, base.leak_q
+    one_minus_leak_q = base.one_minus_leak_q
+    xmin_q, xmax_q, denom, lut_n = (
+        base.xmin_q,
+        base.xmax_q,
+        base.denom,
+        base.lut_n,
+    )
+
     input_scale = 1 << input_frac
     weight_scale = 1 << weight_frac
-
-    # bias/leak follow `QuantTarget.quantize_state`: int(x * scale) (truncate
-    # toward zero), then saturate to storage. NOT round() — the executor uses
-    # plain int() here, and rounding would diverge by one LSB.
-    bias_q = _sat_storage(int(float(rc.reservoir.bias) * state_scale), sb)
-    leak_q = _sat_storage(int(float(rc.reservoir.leak_rate) * state_scale), sb)
-    one_minus_leak_q = state_scale - leak_q
-    xmin_q = int(qmodel.lut.xmin * state_scale)
-    xmax_q = int(qmodel.lut.xmax * state_scale)
-    denom = xmax_q - xmin_q
-    lut_n = int(np.asarray(qmodel.lut_table_q).shape[0])
-
     offset_q = int(round(float(rc.input.input_offset) * input_scale))
     scaling_q = int(round(float(rc.input.input_scaling) * weight_scale))
 
-    is_structured = rc.reservoir.topology in (
-        Topology.DLR,
-        Topology.DLRB,
-        Topology.SCR,
-    )
-    topo = rc.reservoir.topology.name
-
-    # Chain weights are read straight from the quantized dense W_res so they
-    # are byte-identical to what the executor's CSR-over-dense matmul reads.
-    # Structured topologies place the forward chain on the lower sub-diagonal
-    # (W_res_q[i, i-1]) and the DLRB feedback on the upper one (W_res_q[i, i+1]);
-    # all forward (resp. backward) entries share one scalar, so a single
-    # representative entry is exact.
-    Wr = np.asarray(qmodel.W_res_q)
-    chain_weight_q = int(Wr[1, 0]) if (is_structured and N > 1) else 0
-    chain_feedback_q = int(Wr[0, 1]) if (is_structured and N > 1) else 0
-
-    # Sparse W_res (CSR) for dense topologies — bounded code size, so any
-    # requested strategy maps to CSR here. Bit-exact: skips exact-zero MACs
-    # in ascending column order.
-    use_sparse = bool(sparse) and not is_structured
-    rd_col = None
-    if use_sparse:
-        from rclite.ir.passes.sparsify import build_csr
-
-        _wres_val, _wres_col, _wres_rowptr = build_csr(Wr)
-        col_t = "int16_t" if N <= 32767 else "int32_t"
-        rd_col = "RC_RD16" if N <= 32767 else "RC_RD32"
+    layout = _reservoir_layout(qmodel, sparse)
 
     off_bias = 0
     off_input = 1 if rc.readout.include_bias else 0
@@ -148,13 +253,7 @@ def emit_symmetric_kernel_c(
     a(_arr("rc_W_in", storage_t, qmodel.W_in_q))
     a(_arr("rc_W_out", storage_t, qmodel.W_out_q))
     a(_arr("rc_lut", storage_t, qmodel.lut_table_q))
-    if not is_structured:
-        if use_sparse:
-            a(_arr("rc_W_res_val", storage_t, _wres_val))
-            a(_arr("rc_W_res_col", col_t, _wres_col))
-            a(_arr("rc_W_res_rowptr", "int32_t", _wres_rowptr))
-        else:
-            a(_arr("rc_W_res", storage_t, qmodel.W_res_q))
+    _emit_wres_tables(a, qmodel, layout, storage_t)
     if proba:
         from rclite.quant.softmax_lut import (
             SoftmaxLUTSpec,
@@ -208,37 +307,13 @@ def emit_symmetric_kernel_c(
     )
     a("        }")
     # pre-activation
-    a("        for (i = 0; i < RC_N; i++) {")
-    a(f"            int32_t acc = {bias_q};")
-    a("            for (k = 0; k < RC_K; k++)")
-    a(
-        f"                acc = rc_w32((int64_t)acc + rc_fmul({rd}(&rc_W_in[i*RC_K + k]), rc_u[k], RC_SHIFT_IN));"
+    _emit_preactivation(
+        a, ind=8, N=N, bias_q=bias_q, rd=rd, input_var="rc_u", layout=layout
     )
-    _emit_wres_accum(
-        a,
-        ind=12,
-        is_structured=is_structured,
-        use_sparse=use_sparse,
-        topo=topo,
-        N=N,
-        chain_weight_q=chain_weight_q,
-        chain_feedback_q=chain_feedback_q,
-        rd=rd,
-        rd_col=rd_col,
-    )
-    a("            rc_pre[i] = rc_ws(acc);")
-    a("        }")
     # activation + leaky integration
-    a("        for (i = 0; i < RC_N; i++) {")
-    a("            rc_storage_t act = rc_tanh((int32_t)rc_pre[i]);")
-    a(
-        f"            rc_storage_t t1 = rc_ws(rc_fmul(rc_h[i], {one_minus_leak_q}, RC_STATE_FRAC));"
+    _emit_activation_leaky(
+        a, ind=8, one_minus_leak_q=one_minus_leak_q, leak_q=leak_q
     )
-    a(
-        f"            rc_storage_t t2 = rc_ws(rc_fmul(act, {leak_q}, RC_STATE_FRAC));"
-    )
-    a("            rc_h[i] = rc_ws((int32_t)t1 + (int32_t)t2);")
-    a("        }")
     # readout (mirage mixed-scale, i64 accumulate)
     if classify:
         a("        best_m = 0; best_v = 0;")
@@ -428,6 +503,74 @@ def _emit_wres_accum(
         )
 
 
+def _emit_wres_tables(a, qmodel, layout: _ReservoirLayout, storage_t) -> None:
+    """Emit the W_res constant tables: CSR triple (sparse) or dense matrix.
+
+    Structured topologies carry the chain as a baked-in scalar, so they emit
+    no W_res table at all.
+    """
+    if layout.is_structured:
+        return
+    if layout.use_sparse:
+        val, col, rowptr = layout.csr
+        a(_arr("rc_W_res_val", storage_t, val))
+        a(_arr("rc_W_res_col", layout.col_t, col))
+        a(_arr("rc_W_res_rowptr", "int32_t", rowptr))
+    else:
+        a(_arr("rc_W_res", storage_t, qmodel.W_res_q))
+
+
+def _emit_preactivation(
+    a, *, ind, N, bias_q, rd, input_var, layout: _ReservoirLayout
+) -> None:
+    """Per-row pre-activation accumulator (W_in MAC + W_res contribution).
+
+    `ind` is the indent (spaces) of the `for (i ...)` row — the inference
+    kernel emits its reservoir loop at 8, the online forward step at 4.
+    `input_var` is the C name of the input vector: `rc_u` (preprocessed) in
+    the inference kernel, `u_q` (caller-supplied) in the online kernel.
+    """
+    b = " " * ind
+    c = " " * (ind + 4)
+    d = " " * (ind + 8)
+    a(f"{b}for (i = 0; i < RC_N; i++) {{")
+    a(f"{c}int32_t acc = {bias_q};")
+    a(f"{c}for (k = 0; k < RC_K; k++)")
+    a(
+        f"{d}acc = rc_w32((int64_t)acc + rc_fmul({rd}(&rc_W_in[i*RC_K + k]), "
+        f"{input_var}[k], RC_SHIFT_IN));"
+    )
+    _emit_wres_accum(
+        a,
+        ind=ind + 4,
+        is_structured=layout.is_structured,
+        use_sparse=layout.use_sparse,
+        topo=layout.topo,
+        N=N,
+        chain_weight_q=layout.chain_weight_q,
+        chain_feedback_q=layout.chain_feedback_q,
+        rd=rd,
+        rd_col=layout.rd_col,
+    )
+    a(f"{c}rc_pre[i] = rc_ws(acc);")
+    a(f"{b}}}")
+
+
+def _emit_activation_leaky(a, *, ind, one_minus_leak_q, leak_q) -> None:
+    """tanh activation + leaky integration into rc_h[] (indent-parametrized)."""
+    b = " " * ind
+    c = " " * (ind + 4)
+    a(f"{b}for (i = 0; i < RC_N; i++) {{")
+    a(f"{c}rc_storage_t act = rc_tanh((int32_t)rc_pre[i]);")
+    a(
+        f"{c}rc_storage_t t1 = rc_ws(rc_fmul(rc_h[i], {one_minus_leak_q}, "
+        f"RC_STATE_FRAC));"
+    )
+    a(f"{c}rc_storage_t t2 = rc_ws(rc_fmul(act, {leak_q}, RC_STATE_FRAC));")
+    a(f"{c}rc_h[i] = rc_ws((int32_t)t1 + (int32_t)t2);")
+    a(f"{b}}}")
+
+
 def emit_symmetric_online_kernel_c(
     qmodel: QuantizedModel,
     learning_rate: float,
@@ -471,33 +614,25 @@ def emit_symmetric_online_kernel_c(
     if ro.units < 1:
         raise ValueError("online kernel needs readout.units >= 1")
     # Online LMS is a regression learner; classification uses RIDGE/PINV.
-    sb = qmodel.target.storage_bits
-    storage_t = _C_TYPE[sb]
-    rd = _RD[sb]
-    N, K, M = qmodel.N, qmodel.K, qmodel.M
-    F = qmodel.F
-    qmin, qmax = -(1 << (sb - 1)), (1 << (sb - 1)) - 1
-
-    state_frac = cfg.state_frac
-    input_frac = cfg.input_frac
-    weight_frac = cfg.weight_frac
-    shift_in = weight_frac + input_frac - state_frac
-    if shift_in < 0:
-        raise NotImplementedError(
-            f"symmetric online C emit needs weight_frac+input_frac >= "
-            f"state_frac (shift_in={shift_in})"
-        )
-    state_scale = 1 << state_frac
-    input_scale = 1 << input_frac
-    weight_scale = 1 << weight_frac
-
-    bias_q = _sat_storage(int(float(rc.reservoir.bias) * state_scale), sb)
-    leak_q = _sat_storage(int(float(rc.reservoir.leak_rate) * state_scale), sb)
-    one_minus_leak_q = state_scale - leak_q
-    xmin_q = int(qmodel.lut.xmin * state_scale)
-    xmax_q = int(qmodel.lut.xmax * state_scale)
-    denom = xmax_q - xmin_q
-    lut_n = int(np.asarray(qmodel.lut_table_q).shape[0])
+    base = _symmetric_base(qmodel, what="online ")
+    storage_t, rd = base.storage_t, base.rd
+    N, K, M, F = base.N, base.K, base.M, base.F
+    qmin, qmax = base.qmin, base.qmax
+    state_frac, input_frac, weight_frac = (
+        base.state_frac,
+        base.input_frac,
+        base.weight_frac,
+    )
+    shift_in = base.shift_in
+    state_scale = base.state_scale
+    bias_q, leak_q = base.bias_q, base.leak_q
+    one_minus_leak_q = base.one_minus_leak_q
+    xmin_q, xmax_q, denom, lut_n = (
+        base.xmin_q,
+        base.xmax_q,
+        base.denom,
+        base.lut_n,
+    )
 
     # Learning rate quantized at state scale — a compile-time constant, baked in.
     lr_q = int(qmodel.target.quantize_state(float(learning_rate), cfg))
@@ -511,24 +646,7 @@ def emit_symmetric_online_kernel_c(
         )
     delta_q = int(float(delta) * state_scale)
 
-    is_structured = rc.reservoir.topology in (
-        Topology.DLR,
-        Topology.DLRB,
-        Topology.SCR,
-    )
-    topo = rc.reservoir.topology.name
-    Wr = np.asarray(qmodel.W_res_q)
-    chain_weight_q = int(Wr[1, 0]) if (is_structured and N > 1) else 0
-    chain_feedback_q = int(Wr[0, 1]) if (is_structured and N > 1) else 0
-
-    use_sparse = bool(sparse) and not is_structured
-    rd_col = None
-    if use_sparse:
-        from rclite.ir.passes.sparsify import build_csr
-
-        _wres_val, _wres_col, _wres_rowptr = build_csr(Wr)
-        col_t = "int16_t" if N <= 32767 else "int32_t"
-        rd_col = "RC_RD16" if N <= 32767 else "RC_RD32"
+    layout = _reservoir_layout(qmodel, sparse)
 
     include_bias = ro.include_bias
     include_input = ro.include_input
@@ -571,13 +689,7 @@ def emit_symmetric_online_kernel_c(
     # tables — W_in / W_res / LUT are const (Flash); W_out is mutable RAM.
     a(_arr("rc_W_in", storage_t, qmodel.W_in_q))
     a(_arr("rc_lut", storage_t, qmodel.lut_table_q))
-    if not is_structured:
-        if use_sparse:
-            a(_arr("rc_W_res_val", storage_t, _wres_val))
-            a(_arr("rc_W_res_col", col_t, _wres_col))
-            a(_arr("rc_W_res_rowptr", "int32_t", _wres_rowptr))
-        else:
-            a(_arr("rc_W_res", storage_t, qmodel.W_res_q))
+    _emit_wres_tables(a, qmodel, layout, storage_t)
     wout_body = ", ".join(
         str(int(v)) for v in np.asarray(qmodel.W_out_q).reshape(-1)
     )
@@ -613,37 +725,12 @@ def emit_symmetric_online_kernel_c(
         "static void rc_forward_predict(const rc_storage_t *u_q, int32_t *y_pred_q){"
     )
     a("    int32_t i, j, k, m;")
-    a("    for (i = 0; i < RC_N; i++) {")
-    a(f"        int32_t acc = {bias_q};")
-    a("        for (k = 0; k < RC_K; k++)")
-    a(
-        f"            acc = rc_w32((int64_t)acc + rc_fmul({rd}(&rc_W_in[i*RC_K + k]), u_q[k], RC_SHIFT_IN));"
+    _emit_preactivation(
+        a, ind=4, N=N, bias_q=bias_q, rd=rd, input_var="u_q", layout=layout
     )
-    # W_res accumulation (shared with the inference kernel; 8-space indent here)
-    _emit_wres_accum(
-        a,
-        ind=8,
-        is_structured=is_structured,
-        use_sparse=use_sparse,
-        topo=topo,
-        N=N,
-        chain_weight_q=chain_weight_q,
-        chain_feedback_q=chain_feedback_q,
-        rd=rd,
-        rd_col=rd_col,
+    _emit_activation_leaky(
+        a, ind=4, one_minus_leak_q=one_minus_leak_q, leak_q=leak_q
     )
-    a("        rc_pre[i] = rc_ws(acc);")
-    a("    }")
-    a("    for (i = 0; i < RC_N; i++) {")
-    a("        rc_storage_t act = rc_tanh((int32_t)rc_pre[i]);")
-    a(
-        f"        rc_storage_t t1 = rc_ws(rc_fmul(rc_h[i], {one_minus_leak_q}, RC_STATE_FRAC));"
-    )
-    a(
-        f"        rc_storage_t t2 = rc_ws(rc_fmul(act, {leak_q}, RC_STATE_FRAC));"
-    )
-    a("        rc_h[i] = rc_ws((int32_t)t1 + (int32_t)t2);")
-    a("    }")
     a("    for (m = 0; m < RC_M; m++) {")
     a("        int64_t out = 0;")
     if include_bias:
