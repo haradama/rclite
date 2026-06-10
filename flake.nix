@@ -46,13 +46,15 @@
               llvm.llvm
               llvm.lld
 
-              # --- MLIR tools: mlir-opt / mlir-translate (used by rclite/codegen
-              #     mlir_*.py and tests/mlir_*_test.py).
-              #     NOTE: this is the ONE attribute to verify against your nixpkgs
-              #     pin. If `nix develop` errors that `llvmPackages_20.mlir` is
-              #     missing, either (a) bump the nixpkgs input to a channel that
-              #     ships it, or (b) comment this line out — the rest of the shell
-              #     (the llc fix) still works without it. ---
+              # --- MLIR tools: mlir-opt / mlir-translate / mlir-* (used by
+              #     rclite/codegen/mlir_*.py and tests/mlir_*_test.py).
+              #     Confirmed present in the locked nixpkgs pin as
+              #     llvmPackages_20.mlir == 20.1.8 — the SAME LLVM patch as the
+              #     llvmlite wheel embeds (llvm.llvm_version_info == (20,1,8)).
+              #     rclite.codegen.mlir_jit.tools_available() gates the MLIR
+              #     bridge on this major matching llvmlite's, so pinning it here
+              #     is what makes the host<->device bit-exact MLIR tests actually
+              #     RUN (rather than skip) — see the shellHook guard below. ---
               llvm.mlir
 
               # --- emulators / runners exercised by tests + benchmarks ---
@@ -66,9 +68,18 @@
             ];
 
             shellHook = ''
-              # Force nix LLVM-20 binaries ahead of ~/opt/circt and host tools.
-              # Keep both mlir and llvm bins explicit so mlir-opt/mlir-translate
-              # and llc are guaranteed to come from the same LLVM major.
+              # --- Pin the MLIR toolchain to llvmlite's LLVM, exclude host CIRCT ---
+              # llvmlite embeds LLVM 20 (today 20.1.8). The MLIR bridge
+              # (mlir-opt -> mlir-translate -> llvmlite, see
+              # rclite.codegen.mlir_jit.tools_available) only runs when the CLI
+              # tools' LLVM *major* matches llvmlite's. The host's ~/opt/circt
+              # ships an LLVM-23 mlir-opt/llc that the version gate refuses (so the
+              # bit-exact MLIR tests would silently skip) and that also miscompiles
+              # the generic-form IR. Merely prepending isn't enough — actively
+              # SCRUB every CIRCT entry out of PATH first, then put the pinned nix
+              # LLVM-20 mlir + llvm bins ahead of everything else.
+              export PATH="$(printf '%s' "$PATH" | tr ':' '\n' \
+                | grep -vE '/circt(/|$)|/opt/circt' | paste -sd: -)"
               export PATH="${llvm.mlir}/bin:${llvm.llvm}/bin:$PATH"
 
               # The AVR cross toolchain's setup hook exports CC=avr-gcc. Rust's
@@ -78,8 +89,23 @@
               # `avr-gcc` by name, so AVR builds are unaffected.
               export CC=gcc
               export CXX=g++
-              echo "rclite devShell"
-              echo "  mlir-opt      : $(command -v mlir-opt)"
+
+              # --- Loud guard: never silently vouch for bit-exactness ---
+              # If anything but the pinned nix LLVM-20 mlir-opt resolves (e.g.
+              # CIRCT leaked back in), say so on stderr instead of letting the
+              # tests quietly skip / a mismatched tool slip through.
+              _mo="$(command -v mlir-opt || true)"
+              _mver="$(mlir-opt --version 2>/dev/null \
+                | sed -n 's/.*LLVM version \([0-9][0-9]*\).*/\1/p' | head -1)"
+              case "$_mo:$_mver" in
+                ${llvm.mlir}/*:20) : ;;  # OK — pinned nix LLVM-20.x
+                *) echo "WARNING: mlir-opt is NOT the pinned nix LLVM-20 (resolved" \
+                        "'$_mo', LLVM major '$_mver'). CIRCT/host LLVM may have" \
+                        "leaked into PATH; MLIR bit-exact tests cannot be trusted." >&2 ;;
+              esac
+
+              echo "rclite devShell — MLIR pinned to llvmlite's LLVM 20 (CIRCT excluded)"
+              echo "  mlir-opt      : $_mo  [LLVM $_mver]"
               echo "  mlir-translate: $(command -v mlir-translate)"
               echo "  llc           : $(command -v llc)"
               echo "  llc targets   : $(llc --version 2>/dev/null | grep -A1 'Registered Targets' >/dev/null && echo ok || echo '??')"

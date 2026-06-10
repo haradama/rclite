@@ -48,6 +48,11 @@ from .mlir_xdsl_common import (
     fmul,
     for_,
 )
+from .mlir_quant_xdsl import (
+    emit_sat_func,
+    emit_argmax_head,
+    emit_softmax_head,
+)
 
 
 def emit_symmetric_mlir_xdsl(
@@ -142,13 +147,7 @@ def emit_symmetric_mlir_xdsl(
         globals_.append(_dense_global("sm_lut", sm.lut_q, sb))
 
     # ---- @sat(i32) -> isb ----
-    sat_r = Region([Block(arg_types=[_I32])])
-    with ImplicitBuilder(sat_r.block) as (x,):
-        b = arith.MinSIOp(
-            arith.MaxSIOp(x, c_i(qmin, _I32)), c_i(qmax, _I32)
-        ).result
-        func.ReturnOp(arith.TruncIOp(b, isb).result)
-    sat_fn = func.FuncOp("sat", ([_I32], [isb]), sat_r, visibility="private")
+    sat_fn = emit_sat_func(qmin, qmax, isb)
 
     # ---- @activate(isb) -> isb : interpolating tanh LUT ----
     act_r = Region([Block(arg_types=[isb])])
@@ -389,85 +388,25 @@ def emit_symmetric_mlir_xdsl(
 
             # head
             if classify:
-                bv0 = memref.LoadOp.get(logits, [c0]).res
-
-                def amax(m, args):
-                    bv, bi = args
-                    v = memref.LoadOp.get(logits, [m]).res
-                    gt = arith.CmpiOp(v, bv, "sgt").result
-                    return [
-                        arith.SelectOp(gt, v, bv).result,
-                        arith.SelectOp(gt, m, bi).result,
-                    ]
-
-                best = for_(c1, cM, c1, [bv0, c0], amax)
-                cls = arith.IndexCastOp(best[1], _I32).result
-                memref.StoreOp.get(cls, Y, [t])
+                emit_argmax_head(logits, Y, t, c0, c1, cM)
             elif proba:
-                mx0 = arith.ExtSIOp(
-                    memref.LoadOp.get(logits, [c0]).res, _I32
-                ).result
-
-                def fmax(m, args):
-                    (mxa,) = args
-                    v = arith.ExtSIOp(
-                        memref.LoadOp.get(logits, [m]).res, _I32
-                    ).result
-                    gt = arith.CmpiOp(v, mxa, "sgt").result
-                    return [arith.SelectOp(gt, v, mxa).result]
-
-                mx = for_(c1, cM, c1, [mx0], fmax)[0]
-                dmin = c_i(sm_dmin, _I32)
-                ndmin64 = c_i(-sm_dmin, _I64)
-                smnm1 = c_i(sm_n - 1, _I64)
-                idxf64 = c_i(sm_idxf, _I64)
-                smnm2 = c_i(sm_n - 2, _I64)
-
-                def sbody(m, args):
-                    (sa,) = args
-                    v = arith.ExtSIOp(
-                        memref.LoadOp.get(logits, [m]).res, _I32
-                    ).result
-                    d0 = arith.SubiOp(v, mx).result
-                    dlt = arith.CmpiOp(d0, dmin, "slt").result
-                    d = arith.SelectOp(dlt, dmin, d0).result
-                    num = arith.SubiOp(d, dmin).result
-                    nn = arith.MuliOp(ext(num), smnm1).result
-                    posn = arith.ShLIOp(nn, idxf64).result
-                    pos = arith.DivSIOp(posn, ndmin64).result
-                    i0r = arith.ShRSIOp(pos, idxf64).result
-                    i0 = arith.MinSIOp(
-                        arith.MaxSIOp(i0r, z64).result, smnm2
-                    ).result
-                    i0sh = arith.ShLIOp(i0, idxf64).result
-                    frac = arith.SubiOp(pos, i0sh).result
-                    i0idx = arith.IndexCastOp(i0, _IDX).result
-                    i1idx = arith.AddiOp(i0idx, c1).result
-                    y0 = ext(memref.LoadOp.get(SM, [i0idx]).res)
-                    y1 = ext(memref.LoadOp.get(SM, [i1idx]).res)
-                    dy = arith.SubiOp(y1, y0).result
-                    mdf = arith.MuliOp(dy, frac).result
-                    sh = arith.ShRSIOp(mdf, idxf64).result
-                    e = arith.AddiOp(y0, sh).result
-                    memref.StoreOp.get(
-                        arith.TruncIOp(e, _I32).result, exps, [m]
-                    )
-                    return [arith.AddiOp(sa, e).result]
-
-                total = for_(c0, cM, c1, [z64], sbody)[0]
-                pfc = c_i(sm_pf, _I64)
-                qmaxc = c_i(qmax, _I64)
-
-                def pbody(m, _):
-                    e = memref.LoadOp.get(exps, [m]).res
-                    esh = arith.ShLIOp(ext(e), pfc).result
-                    p = arith.DivSIOp(esh, total).result
-                    pc = arith.MinSIOp(p, qmaxc).result
-                    pq = arith.TruncIOp(pc, isb).result
-                    memref.StoreOp.get(pq, Y, [arith.AddiOp(tM, m).result])
-                    return []
-
-                for_(c0, cM, c1, [], pbody)
+                emit_softmax_head(
+                    logits,
+                    exps,
+                    Y,
+                    SM,
+                    tM,
+                    isb,
+                    qmax,
+                    sm_n,
+                    sm_dmin,
+                    sm_idxf,
+                    sm_pf,
+                    c0,
+                    c1,
+                    cM,
+                    z64,
+                )
             return []
 
         for_(c0, Ti, c1, [], time_body)

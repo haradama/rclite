@@ -9,8 +9,10 @@ pipeline (`mlir_affine.build_shared_lib`), so it is bit-exact by construction.
 Feature parity with the text emitter: dense + structured (DLR/SCR/DLRB) + CSR
 sparse, identity or integer preprocess, DIRECT / LINEAR_INTERP / POLYNOMIAL tanh
 LUT, logits / classify / proba heads, affine i8/i16 with mixed-precision W_out.
-Per-channel is unsupported (so is the text emitter). Lower with an LLVM-20
-mlir-opt (the nix devShell) — the IR is printed in generic op form.
+Per-channel (per-axis) requantize is supported via `emit_requantize_axis_func`:
+per-row (M0[i], n[i]) for the W_res step and per-output (M0[m], n[m]) for the
+W_out bias/input/state readout blocks. Lower with an LLVM-20 mlir-opt (the nix
+devShell) — the IR is printed in generic op form.
 """
 
 from __future__ import annotations
@@ -47,6 +49,15 @@ from .mlir_xdsl_common import (
     call,
     for_,
 )
+from .mlir_quant_xdsl import (
+    emit_sat_func,
+    emit_clip32_func,
+    emit_requantize_func,
+    emit_requantize_axis_func,
+    zp_cross,
+    emit_argmax_head,
+    emit_softmax_head,
+)
 
 
 def emit_affine_mlir_xdsl(
@@ -61,11 +72,12 @@ def emit_affine_mlir_xdsl(
     art, strat = qmodel.lut_artifacts, qmodel.lut_strategy
     topo = rc.reservoir.topology
     structured = topo in _STRUCTURED
-    if (
-        qmodel.M_res_M0_arr is not None
-        or qmodel.M_out_state_M0_arr is not None
-    ):
-        raise NotImplementedError("xDSL affine: per-channel not supported")
+    # Per-channel (per-axis) requantize: the step (W_res) and readout (W_out
+    # state block) carry per-row (M0[i], n[i]) multipliers instead of a scalar.
+    # Mirrors `_AffineLowerer`: per-row W_res only applies to dense/sparse, not
+    # the structured chain; per-row readout applies whenever per_channel_W_out.
+    pc_res = qmodel.M_res_M0_arr is not None and not structured
+    pc_out = qmodel.M_out_state_M0_arr is not None
     use_sparse = bool(sparse) and not structured
 
     N, K, M, F = qmodel.N, qmodel.K, qmodel.M, qmodel.F
@@ -146,31 +158,63 @@ def emit_affine_mlir_xdsl(
         globals_.append(_dense_global("lut", qmodel.lut_q, sb))
     if proba:
         globals_.append(_dense_global("sm_lut", sm.lut_q, sb))
+    if pc_res:
+        globals_ += [
+            _dense_global("rq_res_M0", qmodel.M_res_M0_arr, 32),
+            _dense_global("rq_res_n", qmodel.M_res_n_arr, 32),
+        ]
+    if pc_out:
+        # per_channel_W_out makes ALL readout blocks (bias/input/state) per-axis
+        # over the M output rows (mirrors AffineQuantizedExecutor.predict_one_q).
+        globals_ += [
+            _dense_global("rq_os_M0", qmodel.M_out_state_M0_arr, 32),
+            _dense_global("rq_os_n", qmodel.M_out_state_n_arr, 32),
+        ]
+        if inc_b:
+            globals_ += [
+                _dense_global("rq_ob_M0", qmodel.M_out_bias_M0_arr, 32),
+                _dense_global("rq_ob_n", qmodel.M_out_bias_n_arr, 32),
+            ]
+        if inc_i:
+            globals_ += [
+                _dense_global("rq_oi_M0", qmodel.M_out_input_M0_arr, 32),
+                _dense_global("rq_oi_n", qmodel.M_out_input_n_arr, 32),
+            ]
 
     funcs = []
 
     # ---- requantize funcs: (x:i32) -> i32 via (M0,n) round-shift ----
     def rq_func(name, M0, n):
-        r = Region([Block(arg_types=[_I32])])
-        with ImplicitBuilder(r.block) as (x,):
-            if M0 == 0:
-                func.ReturnOp(c_i(0, _I32))
-            else:
-                p = arith.MuliOp(ext(x), c_i(M0, _I64)).result
-                if n > 0:
-                    p = arith.AddiOp(p, c_i(1 << (n - 1), _I64)).result
-                s = arith.ShRSIOp(p, c_i(n, _I64)).result
-                func.ReturnOp(arith.TruncIOp(s, _I32).result)
-        funcs.append(
-            func.FuncOp(name, ([_I32], [_I32]), r, visibility="private")
-        )
+        funcs.append(emit_requantize_func(name, M0, n))
 
     rq_func("rq_in", qmodel.M_in_M0, qmodel.M_in_n)
-    rq_func("rq_res", qmodel.M_res_M0, qmodel.M_res_n)
+    if pc_res:
+        funcs.append(
+            emit_requantize_axis_func("rq_res", "rq_res_M0", "rq_res_n", N)
+        )
+    else:
+        rq_func("rq_res", qmodel.M_res_M0, qmodel.M_res_n)
     rq_func("rq_leak", qmodel.leak_M0, qmodel.leak_n)
-    rq_func("rq_ob", qmodel.M_out_bias_M0, qmodel.M_out_bias_n)
-    rq_func("rq_oi", qmodel.M_out_input_M0, qmodel.M_out_input_n)
-    rq_func("rq_os", qmodel.M_out_state_M0, qmodel.M_out_state_n)
+    # readout requantize: per-axis (one (M0,n) per output row m) when
+    # per_channel_W_out, scalar otherwise. bias/input only when their block is on.
+    if pc_out and inc_b:
+        funcs.append(
+            emit_requantize_axis_func("rq_ob", "rq_ob_M0", "rq_ob_n", M)
+        )
+    else:
+        rq_func("rq_ob", qmodel.M_out_bias_M0, qmodel.M_out_bias_n)
+    if pc_out and inc_i:
+        funcs.append(
+            emit_requantize_axis_func("rq_oi", "rq_oi_M0", "rq_oi_n", M)
+        )
+    else:
+        rq_func("rq_oi", qmodel.M_out_input_M0, qmodel.M_out_input_n)
+    if pc_out:
+        funcs.append(
+            emit_requantize_axis_func("rq_os", "rq_os_M0", "rq_os_n", M)
+        )
+    else:
+        rq_func("rq_os", qmodel.M_out_state_M0, qmodel.M_out_state_n)
     if int_pre:
         rq_func("rq_pre", qmodel.pre_M0, qmodel.pre_n)
     if lut_kind == LUTKind.LINEAR_INTERP:
@@ -180,25 +224,10 @@ def emit_affine_mlir_xdsl(
         rq_func("rq_polyb", art.qf_to_state_M0, art.qf_to_state_n)
 
     # ---- clip32: i64 -> i32 (saturate) ----
-    r = Region([Block(arg_types=[_I64])])
-    with ImplicitBuilder(r.block) as (x,):
-        b = arith.MinSIOp(
-            arith.MaxSIOp(x, c_i(-2147483648, _I64)).result,
-            c_i(2147483647, _I64),
-        ).result
-        func.ReturnOp(arith.TruncIOp(b, _I32).result)
-    funcs.append(
-        func.FuncOp("clip32", ([_I64], [_I32]), r, visibility="private")
-    )
+    funcs.append(emit_clip32_func())
 
     # ---- sat: i32 -> storage (saturate) ----
-    r = Region([Block(arg_types=[_I32])])
-    with ImplicitBuilder(r.block) as (x,):
-        b = arith.MinSIOp(
-            arith.MaxSIOp(x, c_i(qmin, _I32)).result, c_i(qmax, _I32)
-        ).result
-        func.ReturnOp(arith.TruncIOp(b, isb).result)
-    funcs.append(func.FuncOp("sat", ([_I32], [isb]), r, visibility="private"))
+    funcs.append(emit_sat_func(qmin, qmax, isb))
 
     # ---- activate: storage -> storage (DIRECT / LINEAR_INTERP / POLYNOMIAL) ----
     r = Region([Block(arg_types=[isb])])
@@ -406,10 +435,11 @@ def emit_affine_mlir_xdsl(
                         return [arith.AddiOp(ar, pr).result]
 
                     accr = for_(c0, cN, c1, [z64], jbody)[0]
-                rsr64 = ext(memref.LoadOp.get(rsRes, [i]).res)
-                zrres = arith.MuliOp(c_i(zp_state, _I64), rsr64).result
-                adjres = arith.SubiOp(accr, zrres).result
-                accres = call("clip32", [adjres], _I32)
+                accres = zp_cross(
+                    accr, zp_state, memref.LoadOp.get(rsRes, [i]).res
+                )
+            if pc_res:
+                return call("rq_res", [accres, i], _I32)
             return call("rq_res", [accres], _I32)
 
         def time_body(t, _):
@@ -447,9 +477,7 @@ def emit_affine_mlir_xdsl(
                     return [arith.AddiOp(ai, pr).result]
 
                 accin = for_(c0, cK, c1, [z64], kin)[0]
-                rsi64 = ext(memref.LoadOp.get(rsIn, [i]).res)
-                zrin = arith.MuliOp(c_i(zp_u, _I64), rsi64).result
-                cin = call("clip32", [arith.SubiOp(accin, zrin).result], _I32)
+                cin = zp_cross(accin, zp_u, memref.LoadOp.get(rsIn, [i]).res)
                 rqin = call("rq_in", [cin], _I32)
                 rqres = acc_res(i)
                 zpp = c_i(zp_pre + qmodel.bias_pre, _I32)
@@ -484,7 +512,12 @@ def emit_affine_mlir_xdsl(
                         Wout, [arith.AddiOp(mF, c_idx(off_b)).result]
                     ).res
                     cb = call("clip32", [ext(w0)], _I32)
-                    yb = arith.AddiOp(zpo, call("rq_ob", [cb], _I32)).result
+                    rq_ob = (
+                        call("rq_ob", [cb, m], _I32)
+                        if pc_out
+                        else call("rq_ob", [cb], _I32)
+                    )
+                    yb = arith.AddiOp(zpo, rq_ob).result
                 else:
                     yb = zpo
                 if inc_i:
@@ -506,12 +539,15 @@ def emit_affine_mlir_xdsl(
                         ]
 
                     accoi = for_(c0, cK, c1, [z64], kbody)[0]
-                    rsoi64 = ext(memref.LoadOp.get(rsOI, [m]).res)
-                    zroi = arith.MuliOp(c_i(zp_input, _I64), rsoi64).result
-                    coi = call(
-                        "clip32", [arith.SubiOp(accoi, zroi).result], _I32
+                    coi = zp_cross(
+                        accoi, zp_input, memref.LoadOp.get(rsOI, [m]).res
                     )
-                    yi = arith.AddiOp(yb, call("rq_oi", [coi], _I32)).result
+                    rq_oi = (
+                        call("rq_oi", [coi, m], _I32)
+                        if pc_out
+                        else call("rq_oi", [coi], _I32)
+                    )
+                    yi = arith.AddiOp(yb, rq_oi).result
                 else:
                     yi = yb
                 cs = c_idx(off_s)
@@ -528,10 +564,14 @@ def emit_affine_mlir_xdsl(
                     ]
 
                 accos = for_(c0, cN, c1, [z64], jbody)[0]
-                rsos64 = ext(memref.LoadOp.get(rsOS, [m]).res)
-                zros = arith.MuliOp(c_i(zp_state, _I64), rsos64).result
-                cos = call("clip32", [arith.SubiOp(accos, zros).result], _I32)
-                ys = arith.AddiOp(yi, call("rq_os", [cos], _I32)).result
+                cos = zp_cross(
+                    accos, zp_state, memref.LoadOp.get(rsOS, [m]).res
+                )
+                if pc_out:
+                    rq_os = call("rq_os", [cos, m], _I32)
+                else:
+                    rq_os = call("rq_os", [cos], _I32)
+                ys = arith.AddiOp(yi, rq_os).result
                 yq = call("sat", [ys], isb)
                 if has_logits_buf:
                     memref.StoreOp.get(yq, logits, [m])
@@ -543,89 +583,25 @@ def emit_affine_mlir_xdsl(
 
             # head
             if classify:
-                bv0 = memref.LoadOp.get(logits, [c0]).res
-
-                def amax(m, args):
-                    bv, bi = args
-                    v = memref.LoadOp.get(logits, [m]).res
-                    gt = arith.CmpiOp(v, bv, "sgt").result
-                    return [
-                        arith.SelectOp(gt, v, bv).result,
-                        arith.SelectOp(gt, m, bi).result,
-                    ]
-
-                best = for_(c1, cM, c1, [bv0, c0], amax)
-                memref.StoreOp.get(
-                    arith.IndexCastOp(best[1], _I32).result, Y, [t]
-                )
+                emit_argmax_head(logits, Y, t, c0, c1, cM)
             elif proba:
-                mx0 = arith.ExtSIOp(
-                    memref.LoadOp.get(logits, [c0]).res, _I32
-                ).result
-
-                def fmax(m, args):
-                    (mxa,) = args
-                    v = arith.ExtSIOp(
-                        memref.LoadOp.get(logits, [m]).res, _I32
-                    ).result
-                    gt = arith.CmpiOp(v, mxa, "sgt").result
-                    return [arith.SelectOp(gt, v, mxa).result]
-
-                mx = for_(c1, cM, c1, [mx0], fmax)[0]
-                dmin = c_i(sm_dmin, _I32)
-                ndmin64, smnm1 = c_i(-sm_dmin, _I64), c_i(sm_n - 1, _I64)
-                idxf64, smnm2 = c_i(sm_idxf, _I64), c_i(sm_n - 2, _I64)
-
-                def sbody(m, args):
-                    (sa,) = args
-                    v = arith.ExtSIOp(
-                        memref.LoadOp.get(logits, [m]).res, _I32
-                    ).result
-                    d0 = arith.SubiOp(v, mx).result
-                    d = arith.SelectOp(
-                        arith.CmpiOp(d0, dmin, "slt").result, dmin, d0
-                    ).result
-                    num = arith.SubiOp(d, dmin).result
-                    nn = arith.MuliOp(ext(num), smnm1).result
-                    pos = arith.DivSIOp(
-                        arith.ShLIOp(nn, idxf64).result, ndmin64
-                    ).result
-                    i0r = arith.ShRSIOp(pos, idxf64).result
-                    i0 = arith.MinSIOp(
-                        arith.MaxSIOp(i0r, z64).result, smnm2
-                    ).result
-                    frac = arith.SubiOp(
-                        pos, arith.ShLIOp(i0, idxf64).result
-                    ).result
-                    i0idx = arith.IndexCastOp(i0, _IDX).result
-                    i1idx = arith.AddiOp(i0idx, c1).result
-                    y0 = ext(memref.LoadOp.get(SM, [i0idx]).res)
-                    y1 = ext(memref.LoadOp.get(SM, [i1idx]).res)
-                    dy = arith.SubiOp(y1, y0).result
-                    sh = arith.ShRSIOp(
-                        arith.MuliOp(dy, frac).result, idxf64
-                    ).result
-                    e = arith.AddiOp(y0, sh).result
-                    memref.StoreOp.get(
-                        arith.TruncIOp(e, _I32).result, exps, [m]
-                    )
-                    return [arith.AddiOp(sa, e).result]
-
-                total = for_(c0, cM, c1, [z64], sbody)[0]
-                pfc, qmaxc = c_i(sm_pf, _I64), c_i(qmax, _I64)
-
-                def pbody(m, _):
-                    e = memref.LoadOp.get(exps, [m]).res
-                    p = arith.DivSIOp(
-                        arith.ShLIOp(ext(e), pfc).result, total
-                    ).result
-                    pq = arith.TruncIOp(
-                        arith.MinSIOp(p, qmaxc).result, isb
-                    ).result
-                    memref.StoreOp.get(pq, Y, [arith.AddiOp(tM, m).result])
-                    return []
-
-                for_(c0, cM, c1, [], pbody)
+                emit_softmax_head(
+                    logits,
+                    exps,
+                    Y,
+                    SM,
+                    tM,
+                    isb,
+                    qmax,
+                    sm_n,
+                    sm_dmin,
+                    sm_idxf,
+                    sm_pf,
+                    c0,
+                    c1,
+                    cM,
+                    z64,
+                )
             return []
 
         for_(c0, Ti, c1, [], time_body)

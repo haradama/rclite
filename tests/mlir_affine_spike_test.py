@@ -43,7 +43,9 @@ PASS = "\033[32m[PASS]\033[0m"
 FAIL = "\033[31m[FAIL]\033[0m"
 try:
     import xdsl  # noqa: F401
-    from rclite.codegen.mlir_affine_xdsl import emit_affine_mlir_xdsl
+    from rclite.codegen.mlir_affine_xdsl import (  # noqa: F401
+        emit_affine_mlir_xdsl,
+    )
 
     _HAVE_XDSL = True
 except ImportError:
@@ -133,12 +135,13 @@ def _check(qm, Xt, label, head=None, sparse=None):
 
 
 def _qm(rc, exe, X, sb=8, **kw):
+    pc = ("per_channel_W_res", "per_channel_W_out")
     cfg = calibrate_from_data(
         rc,
         exe,
         X[:240],
         storage_bits=sb,
-        **{k: kw[k] for k in ("per_channel_W_res",) if k in kw},
+        **{k: kw[k] for k in pc if k in kw},
     )
     lut = kw.get("lut_strategy")
     return (
@@ -222,21 +225,30 @@ def test_heads():
     print("  argmax (classify) + softmax (proba) heads bit-exact, i8/i16")
 
 
-def test_per_channel_unsupported():
-    if not _HAVE_XDSL:
-        print("  (skip: xdsl not installed)")
+def test_per_channel():
+    if not HAVE:
+        print("  (skip)")
         return
-    rc, exe, X = _model(M=2)
-    cfg = calibrate_from_data(
-        rc, exe, X[:240], storage_bits=8, per_channel_W_res=True
-    )
-    qm = quantize_model_affine(rc, exe, cfg)
-    try:
-        emit_affine_mlir_xdsl(qm)
-        raise AssertionError("expected NotImplementedError for per-channel")
-    except NotImplementedError:
-        pass
-    print("  per-channel raises NotImplementedError (not yet in MLIR path)")
+    # Per-axis (per-row) requantize. M=4 so per-channel W_out is non-trivial.
+    for pcr, pco, seed, tag in [
+        (True, False, 11, "W_res"),
+        (False, True, 12, "W_out"),
+        (True, True, 13, "both"),
+    ]:
+        rc, exe, X = _model(M=4, seed=seed)
+        qm = _qm(
+            rc, exe, X, sb=8, per_channel_W_res=pcr, per_channel_W_out=pco
+        )
+        assert (qm.M_res_M0_arr is not None) == pcr
+        assert (qm.M_out_state_M0_arr is not None) == pco
+        _check(qm, X[240:262], f"per-channel {tag}")
+    # per-channel W_res across i16 + CSR + classify head (per-row over N rows).
+    rc, exe, X = _model(M=4, units=28, seed=14)
+    qm = _qm(rc, exe, X, sb=16, per_channel_W_res=True, per_channel_W_out=True)
+    _check(qm, X[240:262], "per-channel i16 dense")
+    _check(qm, X[240:262], "per-channel i16 csr", sparse="csr")
+    _check(qm, X[240:262], "per-channel i16 argmax", head="classify")
+    print("  per-channel W_res/W_out/both bit-exact (dense/csr/head, i8/i16)")
 
 
 TESTS = [
@@ -246,7 +258,7 @@ TESTS = [
     test_lut_strategies,
     test_csr_sparse,
     test_heads,
-    test_per_channel_unsupported,
+    test_per_channel,
 ]
 
 

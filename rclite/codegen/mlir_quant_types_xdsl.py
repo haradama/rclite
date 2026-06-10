@@ -20,12 +20,8 @@ import shutil
 import subprocess
 import tempfile
 
-import numpy as np
-
-from xdsl.irdl import irdl_attr_definition
-from xdsl.ir import ParametrizedAttribute, TypeAttribute
 from xdsl.dialects import func, memref
-from xdsl.dialects.builtin import ModuleOp, TensorType, StringAttr
+from xdsl.dialects.builtin import ModuleOp, TensorType
 from xdsl.ir import Region, Block
 from xdsl.builder import ImplicitBuilder
 from xdsl.printer import Printer
@@ -33,36 +29,13 @@ from xdsl.printer import Printer
 from rclite.core.profile import Topology
 from rclite.quant.affine.quantize import AffineQuantizedModel
 
+# The `!quant.uniform` type and its formatter now live in the shared quant
+# layer; this module keeps only the declarative type-signature emitter and
+# re-exports `uniform_type` for the type-string test.
+from .mlir_quant_xdsl import uniform_type  # noqa: F401 (re-exported)
+
 _STRUCTURED = (Topology.DLR, Topology.DLRB, Topology.SCR)
 _DYN = memref.DYNAMIC_INDEX
-
-
-@irdl_attr_definition
-class QuantUniform(ParametrizedAttribute, TypeAttribute):
-    """`!quant.uniform<...>` — body holds the verbatim inner syntax."""
-
-    name = "quant.uniform"
-    body: StringAttr
-
-    def print_parameters(self, printer: Printer) -> None:
-        printer.print_string("<" + self.body.data + ">")
-
-
-def _f(x) -> str:
-    return f"{float(x):.8e}"
-
-
-def uniform_type(sb: int, scale, zero_point: int = 0) -> QuantUniform:
-    """`!quant.uniform` type. `scale` may be scalar (per-tensor) or 1-D array
-    (per-axis along output axis 0). zero_point applies per-tensor."""
-    arr = np.atleast_1d(np.asarray(scale, dtype=np.float64))
-    if arr.size == 1:
-        zp = f":{int(zero_point)}" if zero_point else ""
-        inner = f"i{sb}:f32, {_f(arr[0])}{zp}"
-    else:
-        scales = ",".join(_f(s) for s in arr)
-        inner = f"i{sb}:f32:0, {{{scales}}}"
-    return QuantUniform(StringAttr(inner))
 
 
 def emit_quant_types_xdsl(qmodel: AffineQuantizedModel) -> str:

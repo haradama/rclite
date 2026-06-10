@@ -43,6 +43,22 @@ run = "nix --extra-experimental-features 'nix-command flakes' develop"
 description = "Run the full test suite inside the nix devShell (incl. MLIR/cross tests)"
 run = "nix --extra-experimental-features 'nix-command flakes' develop -c uv run python -m pytest tests"
 
+# MLIR-only bit-exact tests in the pinned shell. These SKIP outside nix (the
+# host ~/opt/circt mlir-opt is LLVM 23 != llvmlite's LLVM 20, so the version
+# gate refuses it); inside the devShell the pinned LLVM-20 mlir-opt resolves and
+# they run host<->device bit-exact. Fast MLIR-focused check.
+[tasks.test-mlir-repro]
+description = "Run the MLIR bit-exact tests inside the nix devShell (pinned LLVM 20)"
+run = """
+nix --extra-experimental-features 'nix-command flakes' develop -c \
+  uv run python -m pytest \
+    tests/mlir_symmetric_spike_test.py \
+    tests/mlir_affine_spike_test.py \
+    tests/mlir_quant_types_test.py \
+    tests/mlir_target_test.py \
+    tests/mlir_jit_test.py
+"""
+
 [tasks.bench-repro]
 description = "Run host benchmarks inside the nix devShell"
 run = "nix --extra-experimental-features 'nix-command flakes' develop -c uv run python benchmarks/compare_host_full.py"
