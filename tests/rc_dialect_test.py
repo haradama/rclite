@@ -116,12 +116,16 @@ def test_fuse_pattern():
     )
 
 
-def _jit_float(mlir_text, X, K, M):
-    """JIT a float `rc_predict` kernel and run it (f64 c-interface ABI)."""
+def _jit_float(mlir_text, X, M, func_name, extra_passes=()):
+    """JIT a float kernel and run it (f64 c-interface ABI). `func_name` is made
+    unique per kernel so two engines can coexist in one process without their
+    `_mlir_ciface_*` symbols colliding."""
     mlir_jit._ensure_llvm()
     import llvmlite.binding as llvm
 
-    mod = llvm.parse_assembly(mlir_jit.mlir_to_llvm_ir(mlir_text))
+    mod = llvm.parse_assembly(
+        mlir_jit.mlir_to_llvm_ir(mlir_text, extra_passes=extra_passes)
+    )
     mod.verify()
     tm = llvm.Target.from_triple(
         llvm.get_default_triple()
@@ -134,7 +138,7 @@ def _jit_float(mlir_text, X, K, M):
         ctypes.c_int64,
         ctypes.POINTER(mlir_jit._MemRef1D),
         ctypes.POINTER(mlir_jit._MemRef1D),
-    )(eng.get_function_address("_mlir_ciface_rc_predict"))
+    )(eng.get_function_address("_mlir_ciface_" + func_name))
     Xt = np.ascontiguousarray(X, dtype=np.float64).reshape(-1)
     T = X.shape[0]
     Y = np.zeros(T * M, dtype=np.float64)
@@ -151,18 +155,116 @@ def test_lower_fused_float_numeric():
     m = build_ir(rc, exe)
     mod = build_rc_module(m)
     fuse_step_readout(mod)
-    txt = lower_fused_float(mod, m.weights)
-    got = _jit_float(txt, X, rc.input.units, rc.readout.units)
+    txt = lower_fused_float(mod, m.weights, func_name="rc_predict_scalar")
+    got = _jit_float(txt, X, rc.readout.units, "rc_predict_scalar")
     ref = exe.predict(X)
     d = float(np.max(np.abs(got - ref)))
     assert d < 1e-9, f"rc-dialect kernel vs runtime max|diff|={d:.2e}"
     print(f"  fused rc -> arith kernel matches runtime (max|diff|={d:.1e})")
 
 
+def test_lower_fused_float_vector():
+    if not HAVE:
+        print("  (skip)")
+        return
+    rc, exe, X = _model(units=40, activation=Activation.IDENTITY)
+    m = build_ir(rc, exe)
+    mod = build_rc_module(m)
+    fuse_step_readout(mod)
+    # vlen=4 vectorises the N-wide reductions; N=40 also exercises N%vlen==0,
+    # and a distinct func name avoids the _mlir_ciface_* collision with the
+    # scalar kernel JITed in the same process.
+    txt = lower_fused_float(mod, m.weights, vlen=4, func_name="rc_predict_vec")
+    got = _jit_float(
+        txt,
+        X,
+        rc.readout.units,
+        "rc_predict_vec",
+        extra_passes=["--convert-vector-to-llvm"],
+    )
+    ref = exe.predict(X)
+    d = float(np.max(np.abs(got - ref)))
+    # float reassociation from the SIMD partial sums, not a logic error.
+    assert d < 1e-9, f"vectorized rc kernel vs runtime max|diff|={d:.2e}"
+    print(
+        f"  vectorized rc -> arith kernel matches runtime (max|diff|={d:.1e})"
+    )
+
+
+def _simd_lines(triple, features, regex, vlen, extra):
+    import re
+
+    rc, exe, _ = _model(units=64, activation=Activation.IDENTITY)
+    m = build_ir(rc, exe)
+    mod = build_rc_module(m)
+    fuse_step_readout(mod)
+    asm = mlir_jit.cross_compile_object(
+        lower_fused_float(mod, m.weights, vlen=vlen),
+        triple=triple,
+        features=features,
+        extra_passes=extra,
+        filetype="asm",
+    ).decode()
+    pat = re.compile(regex)
+    return sum(1 for ln in asm.splitlines() if pat.search(ln))
+
+
+def test_cross_isa_simd():
+    """One rc vector dialect -> real SIMD on each ISA; scalar baseline stays
+    scalar (LLVM won't reassociate the float reduction). Skips targets llc
+    can't register on this host."""
+    if not HAVE:
+        print("  (skip)")
+        return
+    targets = [
+        (
+            "x86_64",
+            "x86_64-unknown-linux-gnu",
+            "+avx2,+fma",
+            r"vfmadd\w*pd|\bmulpd|\baddpd",
+            4,
+        ),
+        (
+            "wasm32",
+            "wasm32-unknown-unknown",
+            "+simd128",
+            r"f64x2\.(mul|add)",
+            2,
+        ),
+        (
+            "aarch64",
+            "aarch64-unknown-linux-gnu",
+            "+neon",
+            r"\bfmla\b.*\.2d|\bfmul\b.*\.2d|\bfadd\b.*\.2d",
+            2,
+        ),
+    ]
+    vectorised = []
+    for name, tri, feat, rx, vlen in targets:
+        try:
+            n_vec = _simd_lines(
+                tri, feat, rx, vlen, ["--convert-vector-to-llvm"]
+            )
+            n_scalar = _simd_lines(tri, feat, rx, 1, [])
+        except RuntimeError:
+            continue  # target not registered in this llc build
+        assert n_scalar == 0, (
+            f"{name}: scalar baseline unexpectedly vectorised"
+        )
+        assert n_vec > 0, f"{name}: vector kernel produced no {name} SIMD"
+        vectorised.append(name)
+    assert "x86_64" in vectorised, "host x86_64 SIMD must be reachable"
+    print(
+        f"  one rc dialect -> SIMD on {', '.join(vectorised)} (scalar=0 each)"
+    )
+
+
 TESTS = [
     test_dialect_build_and_verify,
     test_fuse_pattern,
     test_lower_fused_float_numeric,
+    test_lower_fused_float_vector,
+    test_cross_isa_simd,
 ]
 
 

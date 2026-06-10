@@ -112,12 +112,14 @@ def tools_available() -> bool:
     return tool_major == llvmlite_major
 
 
-def mlir_to_llvm_ir(mlir_text: str) -> str:
+def mlir_to_llvm_ir(mlir_text: str, *, extra_passes=()) -> str:
     """Lower + translate MLIR to LLVM IR text.
 
-    `mlir-opt <_LOWER_PASSES>` then `mlir-translate --mlir-to-llvmir`. The same
-    lowering pipeline the text/xDSL emitters target; only the final object
-    emission (llc/gcc) is replaced — by llvmlite downstream.
+    `mlir-opt <extra_passes> <_LOWER_PASSES>` then `mlir-translate
+    --mlir-to-llvmir`. The same lowering pipeline the text/xDSL emitters target;
+    only the final object emission (llc/gcc) is replaced — by llvmlite
+    downstream. `extra_passes` are prepended (e.g. `--convert-vector-to-llvm`
+    for the Stage-3 `vector`-dialect float kernels).
     """
     missing = [t for t in _TRANSLATE_TOOLS if shutil.which(t) is None]
     if missing:
@@ -129,24 +131,34 @@ def mlir_to_llvm_ir(mlir_text: str) -> str:
             raise RuntimeError(f"{cmd[0]} failed:\n{r.stderr[:4000]}")
         return r.stdout
 
-    lowered = run(["mlir-opt", *_LOWER_PASSES], mlir_text)
+    lowered = run(["mlir-opt", *extra_passes, *_LOWER_PASSES], mlir_text)
     return run(["mlir-translate", "--mlir-to-llvmir", "-"], lowered)
 
 
 def cross_compile_object(
-    mlir_text: str, *, triple: str, cpu: str = "", features: str = ""
+    mlir_text: str,
+    *,
+    triple: str,
+    cpu: str = "",
+    features: str = "",
+    extra_passes=(),
+    filetype: str = "obj",
 ) -> bytes:
     """Cross-compile MLIR to a relocatable object for `triple` (no host link).
 
     The MCJIT path above is host-only; this is the embedded counterpart —
     emits a `.o` for e.g. thumbv6m (Cortex-M0), thumbv4t (GBA), wasm32 (WASM),
     the same triples the llvmlite production path serves. Uses the same
-    lowering+translate, then retargets `llc`.
+    lowering+translate, then retargets `llc`. `extra_passes` are prepended to the
+    mlir-opt pipeline (e.g. `--convert-vector-to-llvm` for the `rc`-dialect
+    `vector` float kernels); `filetype` is `obj` (returns object bytes) or `asm`
+    (returns the textual assembly bytes — handy to confirm SIMD instructions).
 
-    NOTE: the integer kernel stays scalar — saturating/wrapping quantized
-    arithmetic is non-associative, so SIMD vectorization would break
-    host<->device bit-exactness. `features` (e.g. "+simd128") only selects the
-    target ISA; the kernel is not vectorized.
+    NOTE: the *quantized* integer kernel stays scalar — saturating/wrapping
+    quantized arithmetic is non-associative, so SIMD would break host<->device
+    bit-exactness (`features` then only selects the ISA, not vectorization). The
+    *float* `vector`-dialect kernel, by contrast, is genuinely vectorized: one
+    `rc` dialect -> SIMD on wasm32 (+simd128), aarch64/armv7 (+neon), x86 (+avx).
     """
     missing = [t for t in _CROSS_TOOLS if shutil.which(t) is None]
     if missing:
@@ -162,26 +174,34 @@ def cross_compile_object(
             return r.stdout
 
         (td / "rc.ll.mlir").write_text(
-            run(["mlir-opt", str(td / "rc.mlir"), *_LOWER_PASSES])
+            run(
+                [
+                    "mlir-opt",
+                    str(td / "rc.mlir"),
+                    *extra_passes,
+                    *_LOWER_PASSES,
+                ]
+            )
         )
         (td / "rc.ll").write_text(
             run(["mlir-translate", "--mlir-to-llvmir", str(td / "rc.ll.mlir")])
         )
+        out = td / ("rc.s" if filetype == "asm" else "rc.o")
         llc = [
             "llc",
             "-O2",
             f"-mtriple={triple}",
-            "-filetype=obj",
+            f"-filetype={filetype}",
             str(td / "rc.ll"),
             "-o",
-            str(td / "rc.o"),
+            str(out),
         ]
         if cpu:
             llc.append(f"-mcpu={cpu}")
         if features:
             llc.append(f"-mattr={features}")
         run(llc)
-        return (td / "rc.o").read_bytes()
+        return out.read_bytes()
 
 
 class CompiledMLIRJit:

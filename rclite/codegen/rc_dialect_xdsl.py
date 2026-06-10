@@ -290,10 +290,11 @@ def count_ops(mod: ModuleOp) -> dict:
 # Stage-3 `vector`/`affine` lowering where MLIR auto-vectorisation pays off.
 import io  # noqa: E402
 
-from xdsl.dialects import arith, memref, func  # noqa: E402
+from xdsl.dialects import arith, memref, func, vector  # noqa: E402
 from xdsl.dialects.builtin import (  # noqa: E402
     MemRefType,
     TensorType,
+    VectorType,
     DenseIntOrFPElementsAttr,
     UnitAttr,
     IndexType,
@@ -303,6 +304,64 @@ from xdsl.printer import Printer  # noqa: E402
 from .mlir_xdsl_common import c_idx, for_  # noqa: E402
 
 _IDX = IndexType()
+_ADD_KIND = vector.CombiningKindAttr(vector.CombiningKindFlag.ADD)
+
+
+def _matvec_acc(Wmem, base, hmem, N, vlen, acc0):
+    """`acc0 + sum_{j<N} Wmem[base+j] * hmem[j]`, returns the scalar f64 acc.
+
+    `vlen <= 1`: a plain scalar reduction (IEEE accumulation order — the order
+    LLVM is forced to keep, so it leaves the reduction scalar even at -O3).
+    `vlen > 1`: the inner product is accumulated in a `vector<vlen x f64>` via
+    `vector.fma`, then collapsed with `vector.reduction <add>` plus a scalar tail
+    for `N % vlen`. The vectorised partial sums reassociate the float reduction —
+    exactly what LLVM's auto-vectoriser won't do without fast-math — so this is
+    the Stage-3 structural win over the scalar baseline."""
+    if vlen <= 1:
+
+        def jb(j, args):
+            (a,) = args
+            w = memref.LoadOp.get(Wmem, [arith.AddiOp(base, j).result]).res
+            hv = memref.LoadOp.get(hmem, [j]).res
+            return [arith.AddfOp(a, arith.MulfOp(w, hv).result).result]
+
+        return for_(c_idx(0), c_idx(N), c_idx(1), [acc0], jb)[0]
+
+    Nv = (N // vlen) * vlen
+    vt = VectorType(_F64, [vlen])
+    acc = acc0
+    if Nv > 0:
+        vz = arith.ConstantOp(
+            DenseIntOrFPElementsAttr.from_list(vt, [0.0] * vlen)
+        ).result
+
+        def vbody(jb, args):
+            (va,) = args
+            wv = vector.LoadOp(
+                Wmem, [arith.AddiOp(base, jb).result], vt
+            ).result
+            hv = vector.LoadOp(hmem, [jb], vt).result
+            return [vector.FMAOp(wv, hv, va).res]
+
+        vacc = for_(c_idx(0), c_idx(Nv), c_idx(vlen), [vz], vbody)[0]
+        # NB: xDSL 0.66 vector.ReductionOp.__init__ mis-types the result as the
+        # vector type; build explicitly with the scalar element result and `acc`
+        # as the reduction's start value (= acc + lane-sum).
+        acc = vector.ReductionOp.build(
+            operands=[vacc, acc],
+            result_types=[_F64],
+            properties={"kind": _ADD_KIND},
+        ).results[0]
+    if Nv < N:
+
+        def tb(j, args):
+            (a,) = args
+            w = memref.LoadOp.get(Wmem, [arith.AddiOp(base, j).result]).res
+            hv = memref.LoadOp.get(hmem, [j]).res
+            return [arith.AddfOp(a, arith.MulfOp(w, hv).result).result]
+
+        acc = for_(c_idx(Nv), c_idx(N), c_idx(1), [acc], tb)[0]
+    return acc
 
 
 def _find_fused(mod: ModuleOp):
@@ -332,13 +391,20 @@ def _fglobal(name, arr):
     )
 
 
-def lower_fused_float(mod: ModuleOp, weights: dict) -> str:
+def lower_fused_float(
+    mod: ModuleOp, weights: dict, vlen: int = 1, func_name: str = "rc_predict"
+) -> str:
     """Lower a fused `rc` module (float dense, identity activation) to an
     arith/memref/scf `rc_predict` kernel and return the printed MLIR.
 
     Mirrors the fused float reference: per step, `pre = W_in@u + W_res@h + bias`,
     `h = (1-leak)*h + leak*pre` (identity activation), then the readout reads `h`
-    directly — `y[m] = [bias] + [W_out_in@u] + W_out_state@h`."""
+    directly — `y[m] = [bias] + [W_out_in@u] + W_out_state@h`.
+
+    `vlen` sets the SIMD width of the two N-wide reductions (`W_res@h` and the
+    readout `W_out_state@h`): `vlen=1` is the scalar baseline, `vlen>1` emits the
+    `vector`-dialect reduction (Stage 3). Lower the vector form with the extended
+    pipeline (`mlir_jit` + `--convert-vector-to-llvm`)."""
     op = _find_fused(mod)
     if _get(op, "activation") != "IDENTITY":
         raise NotImplementedError("spike lowering: identity activation only")
@@ -405,16 +471,7 @@ def lower_fused_float(mod: ModuleOp, weights: dict) -> str:
                     return [arith.AddfOp(a, arith.MulfOp(w, x).result).result]
 
                 acc = for_(c0, cK, c1, [biasc], kin)[0]
-
-                def jin(j, args):
-                    (a,) = args
-                    w = memref.LoadOp.get(
-                        Wres, [arith.AddiOp(iN, j).result]
-                    ).res
-                    hv = memref.LoadOp.get(h, [j]).res
-                    return [arith.AddfOp(a, arith.MulfOp(w, hv).result).result]
-
-                acc = for_(c0, cN, c1, [acc], jin)[0]
+                acc = _matvec_acc(Wres, iN, h, N, vlen, acc)
                 memref.StoreOp.get(acc, pre, [i])
                 return []
 
@@ -455,16 +512,8 @@ def lower_fused_float(mod: ModuleOp, weights: dict) -> str:
                         ]
 
                     init = for_(c0, cK, c1, [init], kb)[0]
-                cs = c_idx(off_s)
-
-                def jb(j, args):
-                    (a,) = args
-                    widx = arith.AddiOp(mF, arith.AddiOp(cs, j).result).result
-                    w = memref.LoadOp.get(Wout, [widx]).res
-                    hv = memref.LoadOp.get(h, [j]).res
-                    return [arith.AddfOp(a, arith.MulfOp(w, hv).result).result]
-
-                y = for_(c0, cN, c1, [init], jb)[0]
+                base_s = arith.AddiOp(mF, c_idx(off_s)).result
+                y = _matvec_acc(Wout, base_s, h, N, vlen, init)
                 memref.StoreOp.get(y, Y, [arith.AddiOp(tM, m).result])
                 return []
 
@@ -473,7 +522,7 @@ def lower_fused_float(mod: ModuleOp, weights: dict) -> str:
 
         for_(c0, Ti, c1, [], time_body)
         func.ReturnOp()
-    main = func.FuncOp("rc_predict", ([_I64, dyn, dyn], []), region)
+    main = func.FuncOp(func_name, ([_I64, dyn, dyn], []), region)
     main.attributes["llvm.emit_c_interface"] = UnitAttr()
 
     out = ModuleOp([*globals_, main])
