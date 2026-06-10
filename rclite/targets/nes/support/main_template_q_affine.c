@@ -17,6 +17,7 @@
  *   @@X_LEN@@         — length of the embedded input array  (T * K)
  *   @@Y_LEN@@         — length of the embedded output array (T * M)
  *   @@STORAGE_T@@     — int8_t / int16_t
+ *   @@PREDICT_T@@     — rc_predict T argument type (int32_t / int64_t)
  *   @@LUT_KIND@@      — "direct" / "linear_interp" / "polynomial"
  *   @@TOL@@           — max allowed |Y - Y_ref| (storage units) for TEST_PASS
  *   @@X_VALUES_Q@@    — comma-separated input samples  (at input_scale)
@@ -36,8 +37,9 @@ MAPPER_PRG_RAM_KB(8);
 #define Y_LEN   @@Y_LEN@@
 #define TOL     @@TOL@@
 typedef @@STORAGE_T@@ storage_t;
+typedef @@PREDICT_T@@ predict_t;
 
-extern void rc_predict(int32_t T, const storage_t *X, storage_t *Y);
+extern void rc_predict(predict_t T, const storage_t *X, storage_t *Y);
 
 static const storage_t X_q[X_LEN]           = { @@X_VALUES_Q@@ };
 static const storage_t Y_reference_q[Y_LEN] = { @@Y_VALUES_Q@@ };
@@ -72,7 +74,7 @@ int main(void)
     NES_TEST_SIG[2] = 0x61;
     NES_TEST_STATUS = 0x80;   /* 0x80: test running */
 
-    rc_predict((int32_t)T_STEPS, X_q, Y_out);
+    rc_predict((predict_t)T_STEPS, X_q, Y_out);
 
     for (t = 0; t < Y_LEN; t++) {
         int32_t d  = (int32_t)Y_out[t] - (int32_t)Y_reference_q[t];
