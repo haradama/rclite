@@ -24,10 +24,7 @@ from ..ops import (
     FusedStepReadout,
     TimeLoop,
 )
-from ._ops_utils import iter_reservoir_ops
-
-
-_STRUCTURED = (Topology.DLR, Topology.DLRB, Topology.SCR)
+from ._ops_utils import STRUCTURED_TOPOLOGIES, iter_reservoir_ops
 
 
 class StructuralSpecialize:
@@ -51,14 +48,14 @@ class StructuralSpecialize:
         if isinstance(op, TimeLoop):
             return replace(op, body=tuple(self._fix(o) for o in op.body))
         if isinstance(op, ReservoirStep):
-            if op.topology in _STRUCTURED:
+            if op.topology in STRUCTURED_TOPOLOGIES:
                 _validate_chain_bounds(
                     op.topology, op.chain_weight, op.chain_feedback
                 )
                 if op.W_res_name is not None:
                     return replace(op, W_res_name=None)
         if isinstance(op, FusedStepReadout):
-            if op.topology in _STRUCTURED:
+            if op.topology in STRUCTURED_TOPOLOGIES:
                 _validate_chain_bounds(
                     op.topology, op.chain_weight, op.chain_feedback
                 )

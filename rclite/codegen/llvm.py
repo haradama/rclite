@@ -825,11 +825,6 @@ def emit_quantized_module(
 # Integer (quantized) lowering
 
 
-def _load1d_global(b: ir.IRBuilder, g, idx):
-    """Load element from a 1D global array at i64/i32 index."""
-    return b.load(b.gep(g, [_ci32(0), idx]))
-
-
 class _IntLowerer:
     """Lower an rclite IR module under `dtype` in {'i32', 'i16', 'i8'} to LLVM IR.
 

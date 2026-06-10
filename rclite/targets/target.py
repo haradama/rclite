@@ -51,6 +51,39 @@ def affine_reference_outputs(
     return X_q, Y_ref_q, T
 
 
+def symmetric_reference_outputs(
+    qmodel, test_inputs: np.ndarray, np_storage
+) -> Tuple[np.ndarray, np.ndarray, int]:
+    """Quantize inputs and compute bit-exact symmetric (Q-format) references.
+
+    Pre-processes the float test sequence exactly as
+    `CompiledQuantizedRC.predict` does (input offset/scaling then
+    `quantize_input_array`), then replays it through `QuantizedExecutor` — the
+    path the emitted integer kernel reproduces exactly — and returns
+    ``(X_q, Y_ref_q, n_rows)`` cast to `np_storage`, one output row per step.
+    Shared by the Cortex-M0 and GBA symmetric targets.
+    """
+    from rclite.quant.executor import QuantizedExecutor
+
+    cfg = qmodel.config
+    rc = qmodel.rc
+    u_pre = (test_inputs - rc.input.input_offset) * rc.input.input_scaling
+    X_q = qmodel.target.quantize_input_array(u_pre, cfg).astype(np_storage)
+
+    qexe = QuantizedExecutor(qmodel)
+    T = test_inputs.shape[0]
+    Y_ref_q = np.zeros((T, qmodel.M), dtype=np_storage)
+    for t in range(T):
+        x_row = (
+            X_q[t] if X_q.ndim > 1 else np.array([X_q[t]], dtype=np_storage)
+        )
+        qexe.step_q(x_row.astype(np.int32))
+        Y_ref_q[t] = qexe.predict_one_q(
+            x_row.astype(np.int32), qexe.state_q
+        ).astype(np_storage)
+    return X_q, Y_ref_q, T
+
+
 @dataclass
 class CompiledArtifact:
     """Files produced by `Target.compile()`."""

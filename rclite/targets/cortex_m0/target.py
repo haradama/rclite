@@ -26,7 +26,13 @@ from rclite.codegen.llvm import (
 from rclite.codegen.templating import render_template
 from rclite.ir import sparse_passes
 from rclite.targets.arduino import emit_affine_kernel_c
-from ..target import Target, CompiledArtifact, RunResult
+from ..target import (
+    Target,
+    CompiledArtifact,
+    RunResult,
+    affine_reference_outputs,
+    symmetric_reference_outputs,
+)
 from .boards import CortexM0Board
 
 
@@ -261,28 +267,11 @@ class CortexM0Target(Target):
         with open(out / "rc_predict.s", "w") as f:
             f.write(tm.emit_assembly(mod))
 
-        # Quantize test inputs (matches what CompiledQuantizedRC.predict does)
-        rc = qmodel.rc
-        u_pre = (test_inputs - rc.input.input_offset) * rc.input.input_scaling
-        X_q = qmodel.target.quantize_input_array(u_pre, cfg).astype(np_storage)
-
-        # Reference outputs (bit-exact via Python QuantizedExecutor)
-        from rclite.quant.executor import QuantizedExecutor
-
-        qexe = QuantizedExecutor(qmodel)
-        Y_ref_q = np.zeros((test_inputs.shape[0], qmodel.M), dtype=np_storage)
-        for t in range(test_inputs.shape[0]):
-            x_row = (
-                X_q[t]
-                if X_q.ndim > 1
-                else np.array([X_q[t]], dtype=np_storage)
-            )
-            qexe.step_q(x_row.astype(np.int32))
-            # phi-style readout uses raw input passthrough scaling — match the
-            # kernel's BuildPhi by feeding the (preprocessed-quantized) X_q here.
-            Y_ref_q[t] = qexe.predict_one_q(
-                x_row.astype(np.int32), qexe.state_q
-            ).astype(np_storage)
+        # Quantize test inputs + bit-exact references (Python QuantizedExecutor
+        # reproduces the kernel's integer arithmetic exactly).
+        X_q, Y_ref_q, _ = symmetric_reference_outputs(
+            qmodel, test_inputs, np_storage
+        )
 
         # Render main.c from template
         T = len(X_q)
@@ -534,31 +523,12 @@ class CortexM0Target(Target):
                 f"unknown kernel_backend {kernel_backend!r}; expected 'llvm' or 'c'"
             )
 
-        # Quantize input through the model's input params (mirrors what
-        # CompiledAffineRC.predict does).
-        cfg = qmodel.config
-        X_q = cfg.input.quantize_array(test_inputs).astype(np_storage)
-
-        # Reference outputs: run the Python AffineQuantizedExecutor (which
-        # is bit-exact with the JIT) and emit q_y at the model's output
-        # scale.
-        from rclite.quant.affine.executor import AffineQuantizedExecutor
-
-        qexe = AffineQuantizedExecutor(qmodel)
-        if test_inputs.ndim == 1:
-            test_inputs_2d = test_inputs[:, None]
-        else:
-            test_inputs_2d = test_inputs
-        T = test_inputs_2d.shape[0]
-        Y_ref_q = np.zeros((T, qmodel.M), dtype=np_storage)
-        for t in range(T):
-            x_raw = test_inputs_2d[t]
-            x_raw_q = qexe._quantize_raw_input(x_raw)
-            u_pre_q = qexe._quantize_u_pre(x_raw)
-            qexe.step_q(u_pre_q)
-            Y_ref_q[t] = qexe.predict_one_q(x_raw_q, qexe.state_q).astype(
-                np_storage
-            )
+        # Quantize input + bit-exact references via the affine executor
+        # (bit-exact with the JIT; mirrors CompiledAffineRC.predict).
+        X_q, Y_ref_q, _ = affine_reference_outputs(
+            qmodel, test_inputs, np_storage
+        )
+        T = X_q.shape[0]
 
         # Render the affine main.c
         x_lit = ", ".join(str(int(v)) for v in X_q.ravel())

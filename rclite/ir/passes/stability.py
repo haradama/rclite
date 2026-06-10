@@ -20,27 +20,15 @@ import numpy as np
 from rclite.core.profile import Topology
 
 from ..module import Module
-from ..ops import Op, ReservoirStep, FusedStepReadout, TimeLoop
-
-
-_STRUCTURED = (Topology.DLR, Topology.DLRB, Topology.SCR)
-_DENSE = (Topology.RANDOM, Topology.ESN_STANDARD)
-
-
-def _walk_ops(ops: Iterable[Op]) -> Iterable[Op]:
-    for op in ops:
-        if isinstance(op, TimeLoop):
-            yield from _walk_ops(op.body)
-        else:
-            yield op
+from ..ops import Op
+from ._ops_utils import DENSE_TOPOLOGIES, iter_reservoir_ops
 
 
 def _collect_dense_wres_names(ops: Iterable[Op]) -> Set[str]:
     out: Set[str] = set()
-    for op in _walk_ops(ops):
-        if isinstance(op, (ReservoirStep, FusedStepReadout)):
-            if op.topology in _DENSE and op.W_res_name:
-                out.add(op.W_res_name)
+    for op in iter_reservoir_ops(ops):
+        if op.topology in DENSE_TOPOLOGIES and op.W_res_name:
+            out.add(op.W_res_name)
     return out
 
 
@@ -154,10 +142,7 @@ class VerifyEchoStateConstraint:
         issues: List[str] = []
         weights = module.weights
 
-        for op in _walk_ops(module.ops):
-            if not isinstance(op, (ReservoirStep, FusedStepReadout)):
-                continue
-
+        for op in iter_reservoir_ops(module.ops):
             if op.topology == Topology.DLR:
                 continue
 
@@ -178,7 +163,7 @@ class VerifyEchoStateConstraint:
                     )
                 continue
 
-            if op.topology in _DENSE and op.W_res_name:
+            if op.topology in DENSE_TOPOLOGIES and op.W_res_name:
                 if op.W_res_name not in weights:
                     issues.append(
                         f"Dense topology references missing weight {op.W_res_name!r}"

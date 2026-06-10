@@ -31,6 +31,7 @@ import numpy as np
 from rclite.core.composite import ReservoirComputer
 from rclite.runtime.reference import RCExecutor
 
+from .._ridge import augment_phi, fit_ridge
 from .types import AffineParams, AffineQuantConfig
 from .calibrate import calibrate_from_data
 from .quantize import AffineQuantizedModel, quantize_model_affine
@@ -45,32 +46,6 @@ class AffineSearchResult:
     best_iteration: int
     # (iteration, eval_mse) per round
     history: List[Tuple[int, float]] = field(default_factory=list)
-
-
-def _augment_phi(
-    rc: ReservoirComputer, X: np.ndarray, H: np.ndarray
-) -> np.ndarray:
-    """phi = [1?] ++ [u?] ++ h  for (T, K) input and (T, N) state."""
-    T = H.shape[0]
-    parts = []
-    if rc.readout.include_bias:
-        parts.append(np.ones((T, 1)))
-    if rc.readout.include_input:
-        parts.append(X)
-    parts.append(H)
-    return np.concatenate(parts, axis=1)
-
-
-def _fit_ridge(
-    phi: np.ndarray, Y: np.ndarray, ridge_lambda: float, washout: int
-) -> np.ndarray:
-    """Ridge regression on (T, F) features, (T, M) targets. Returns (M, F)."""
-    phi_w = phi[washout:]
-    Y_w = Y[washout:]
-    F = phi_w.shape[1]
-    A = phi_w.T @ phi_w + ridge_lambda * np.eye(F)
-    B = phi_w.T @ Y_w
-    return np.linalg.solve(A, B).T
 
 
 def _recalibrate_for_new_W_out(
@@ -208,8 +183,8 @@ def search_quantization_affine(
         # W_out blocks + output for the new readout.
         qexe_refit = AffineQuantizedExecutor(qm)
         H_train_q = qexe_refit.collect_states(train_X)
-        phi = _augment_phi(rc, train_X, H_train_q)
-        W_out_new = _fit_ridge(phi, train_Y, ridge_lambda, washout)
+        phi = augment_phi(rc, train_X, H_train_q)
+        W_out_new = fit_ridge(phi, train_Y, ridge_lambda, washout)
         cfg = _recalibrate_for_new_W_out(cfg, rc, W_out_new, train_Y, washout)
         W_out_current = W_out_new
 

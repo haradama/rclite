@@ -22,51 +22,32 @@ from typing import Optional
 import numpy as np
 
 from xdsl.builder import ImplicitBuilder
-from xdsl.ir import Region, Block, SSAValue
-from xdsl.dialects import arith, memref, scf, func
+from xdsl.ir import Region, Block
+from xdsl.dialects import arith, memref, func
 from xdsl.dialects.builtin import (
     ModuleOp,
     IntegerType,
-    IndexType,
     MemRefType,
-    TensorType,
-    DenseIntOrFPElementsAttr,
-    StringAttr,
     UnitAttr,
-    IntegerAttr,
 )
 from xdsl.printer import Printer
 
 from rclite.core.profile import Topology
 from rclite.quant.model import QuantizedModel
 
-_STRUCTURED = (Topology.DLR, Topology.DLRB, Topology.SCR)
-_HEADS = (None, "logits", "classify", "proba")
-_IDX = IndexType()
-_I32 = IntegerType(32)
-_I64 = IntegerType(64)
-
-
-def _np_t(bits):
-    return {8: np.int8, 16: np.int16, 32: np.int32}[bits]
-
-
-def _dense_global(name: str, arr, bits: int) -> memref.GlobalOp:
-    """A `memref.global "private" constant` from a flat integer array."""
-    flat = np.asarray(arr).reshape(-1).astype(_np_t(bits))
-    ty = MemRefType(IntegerType(bits), [int(flat.size)])
-    # initial_value must be a tensor-typed dense attr (mlir-opt requirement);
-    # the global's sym_type stays the memref type.
-    init = DenseIntOrFPElementsAttr.from_list(
-        TensorType(IntegerType(bits), [int(flat.size)]), [int(v) for v in flat]
-    )
-    return memref.GlobalOp.get(
-        StringAttr(name),
-        ty,
-        init,
-        sym_visibility=StringAttr("private"),
-        constant=UnitAttr(),
-    )
+from .mlir_xdsl_common import (
+    _STRUCTURED,
+    _HEADS,
+    _IDX,
+    _I32,
+    _I64,
+    _dense_global,
+    c_i,
+    c_idx,
+    ext,
+    fmul,
+    for_,
+)
 
 
 def emit_symmetric_mlir_xdsl(
@@ -141,33 +122,6 @@ def emit_symmetric_mlir_xdsl(
             sm.prob_frac,
         )
         sm_size = int(np.asarray(sm.lut_q).size)
-
-    # ---- small SSA helpers (created in the current ImplicitBuilder) ----
-    def c_i(v, ty):
-        return arith.ConstantOp.from_int_and_width(int(v), ty).result
-
-    def c_idx(v):
-        return arith.ConstantOp(
-            IntegerAttr.from_index_int_value(int(v))
-        ).result
-
-    def ext(v, ty=_I64):
-        return arith.ExtSIOp(v, ty).result
-
-    def fmul(av, bv, shift):
-        """(sext(a,i64)*sext(b,i64))>>shift, truncated to i32 (wrapping)."""
-        p = arith.MuliOp(ext(av), ext(bv)).result
-        s = arith.ShRSIOp(p, c_i(shift, _I64)).result
-        return arith.TruncIOp(s, _I32).result
-
-    def for_(lb, ub, step, inits, body):
-        """scf.for with iter_args; `body(iv, args)->yields`. Returns results."""
-        arg_tys = [_IDX] + [SSAValue.get(x).type for x in inits]
-        region = Region([Block(arg_types=arg_tys)])
-        with ImplicitBuilder(region.block) as bargs:
-            ys = body(bargs[0], list(bargs[1:]))
-            scf.YieldOp(*ys)
-        return scf.ForOp(lb, ub, step, inits, region).results
 
     # ---- globals ----
     globals_ = [

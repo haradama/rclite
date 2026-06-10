@@ -31,8 +31,6 @@ from typing import Iterable
 
 import numpy as np
 
-from rclite.core.profile import Topology
-
 from ..module import Module
 from ..ops import (
     Op,
@@ -41,11 +39,8 @@ from ..ops import (
     SparseSpec,
     TimeLoop,
 )
-from ._ops_utils import iter_reservoir_ops
+from ._ops_utils import DENSE_TOPOLOGIES, iter_reservoir_ops
 from .structural import StructuralSpecialize
-
-
-_DENSE = (Topology.RANDOM, Topology.ESN_STANDARD)
 
 
 def sparse_passes(sparse, *, include_structural: bool):
@@ -158,7 +153,7 @@ class SparsifyReservoir:
             return replace(op, body=tuple(self._fix(o) for o in op.body))
         if isinstance(op, (ReservoirStep, FusedStepReadout)):
             if (
-                op.topology in _DENSE
+                op.topology in DENSE_TOPOLOGIES
                 and op.W_res_name is not None
                 and op.res_sparse is None
             ):

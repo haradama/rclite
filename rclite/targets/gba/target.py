@@ -33,7 +33,13 @@ from rclite.codegen.llvm import (
 )
 from rclite.codegen.templating import render_template
 from rclite.ir import sparse_passes
-from ..target import Target, CompiledArtifact, RunResult
+from ..target import (
+    Target,
+    CompiledArtifact,
+    RunResult,
+    affine_reference_outputs,
+    symmetric_reference_outputs,
+)
 
 
 _SUPPORT_DIR = pathlib.Path(__file__).parent / "support"
@@ -345,24 +351,9 @@ class GbaTarget(Target):
             out,
         )
 
-        rc = qmodel.rc
-        u_pre = (test_inputs - rc.input.input_offset) * rc.input.input_scaling
-        X_q = qmodel.target.quantize_input_array(u_pre, cfg).astype(np_storage)
-
-        from rclite.quant.executor import QuantizedExecutor
-
-        qexe = QuantizedExecutor(qmodel)
-        Y_ref_q = np.zeros((test_inputs.shape[0], qmodel.M), dtype=np_storage)
-        for t in range(test_inputs.shape[0]):
-            x_row = (
-                X_q[t]
-                if X_q.ndim > 1
-                else np.array([X_q[t]], dtype=np_storage)
-            )
-            qexe.step_q(x_row.astype(np.int32))
-            Y_ref_q[t] = qexe.predict_one_q(
-                x_row.astype(np.int32), qexe.state_q
-            ).astype(np_storage)
+        X_q, Y_ref_q, _ = symmetric_reference_outputs(
+            qmodel, test_inputs, np_storage
+        )
 
         T = len(X_q)
         main_path = out / "main.c"
@@ -441,25 +432,10 @@ class GbaTarget(Target):
             out,
         )
 
-        cfg = qmodel.config
-        X_q = cfg.input.quantize_array(test_inputs).astype(np_storage)
-
-        from rclite.quant.affine.executor import AffineQuantizedExecutor
-
-        qexe = AffineQuantizedExecutor(qmodel)
-        test_inputs_2d = (
-            test_inputs[:, None] if test_inputs.ndim == 1 else test_inputs
+        X_q, Y_ref_q, _ = affine_reference_outputs(
+            qmodel, test_inputs, np_storage
         )
-        T = test_inputs_2d.shape[0]
-        Y_ref_q = np.zeros((T, qmodel.M), dtype=np_storage)
-        for t in range(T):
-            x_raw = test_inputs_2d[t]
-            x_raw_q = qexe._quantize_raw_input(x_raw)
-            u_pre_q = qexe._quantize_u_pre(x_raw)
-            qexe.step_q(u_pre_q)
-            Y_ref_q[t] = qexe.predict_one_q(x_raw_q, qexe.state_q).astype(
-                np_storage
-            )
+        T = X_q.shape[0]
 
         main_path = out / "main.c"
         main_path.write_text(

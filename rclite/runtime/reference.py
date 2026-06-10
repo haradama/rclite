@@ -167,6 +167,24 @@ class RCExecutor:
         scale = self.rc.input.input_scaling
         return (X - offset) * scale
 
+    def _reservoir_step(
+        self, h: "np.ndarray", xp: "np.ndarray", fb=None
+    ) -> "np.ndarray":
+        """One leaky-integrator update from a preprocessed input row `xp`.
+
+        Returns ``(1-leak)*h + leak*act(W_in@xp + W_res@h + bias [+ fb])``.
+        `fb` is an optional additive pre-activation term (e.g. ``W_fb@y_prev``)
+        added after the bias — matching the teacher-forced feedback path in
+        `collect_states` / `_fit_ridge_streaming`. (FORCE keeps its own step:
+        it folds feedback in before the bias, a different summation order.)
+        """
+        r = self.rc.reservoir
+        act = _activation_fn(r.activation)
+        pre = self.W_in @ xp + self.W_res @ h + r.bias
+        if fb is not None:
+            pre = pre + fb
+        return (1.0 - r.leak_rate) * h + r.leak_rate * act(pre)
+
     def _augment(self, X_raw: "np.ndarray", H: "np.ndarray") -> "np.ndarray":
         T = H.shape[0]
         parts = []
@@ -213,9 +231,6 @@ class RCExecutor:
         N = self.rc.reservoir.units
         M = Y.shape[1]
         F = self._feature_dim()
-        act = _activation_fn(self.rc.reservoir.activation)
-        leak = self.rc.reservoir.leak_rate
-        bias = self.rc.reservoir.bias
         washout = max(int(self.rc.readout.washout), 0)
         lam = self.rc.readout.regularization
         use_fb = self.W_fb is not None
@@ -226,11 +241,11 @@ class RCExecutor:
         samples = 0
 
         for t in range(T):
-            pre = self.W_in @ Xp[t] + self.W_res @ h + bias
+            fb = None
             if use_fb:
                 y_prev = Y[t - 1] if t > 0 else np.zeros(M)
-                pre = pre + self.W_fb @ y_prev
-            h = (1.0 - leak) * h + leak * act(pre)
+                fb = self.W_fb @ y_prev
+            h = self._reservoir_step(h, Xp[t], fb)
 
             if t < washout:
                 continue
@@ -252,9 +267,6 @@ class RCExecutor:
     ) -> "np.ndarray":
         T = X.shape[0]
         N = self.rc.reservoir.units
-        act = _activation_fn(self.rc.reservoir.activation)
-        leak = self.rc.reservoir.leak_rate
-        bias = self.rc.reservoir.bias
         use_fb = self.W_fb is not None
         if use_fb and Y_teach is None:
             raise ValueError(
@@ -265,15 +277,15 @@ class RCExecutor:
         H = np.zeros((T, N))
         h = np.zeros(N)
         for t in range(T):
-            pre = self.W_in @ Xp[t] + self.W_res @ h + bias
+            fb = None
             if use_fb:
                 y_prev = (
                     Y_teach[t - 1]
                     if t > 0
                     else np.zeros(self.rc.readout.units)
                 )
-                pre = pre + self.W_fb @ y_prev
-            h = (1.0 - leak) * h + leak * act(pre)
+                fb = self.W_fb @ y_prev
+            h = self._reservoir_step(h, Xp[t], fb)
             H[t] = h
         return H
 
@@ -479,15 +491,10 @@ class RCExecutor:
                 f"free_run requires input dim ({K}) == output dim ({M})"
             )
 
-        act = _activation_fn(self.rc.reservoir.activation)
-        leak = self.rc.reservoir.leak_rate
-        bias = self.rc.reservoir.bias
-
         Xp_seed = self._preprocess(X_seed)
         h = np.zeros(self.rc.reservoir.units)
         for t in range(Xp_seed.shape[0]):
-            pre = self.W_in @ Xp_seed[t] + self.W_res @ h + bias
-            h = (1.0 - leak) * h + leak * act(pre)
+            h = self._reservoir_step(h, Xp_seed[t])
 
         last_x = X_seed[-1].copy()
         preds = np.zeros((n_steps, M))
@@ -495,9 +502,7 @@ class RCExecutor:
             phi = self._augment_one(last_x, h)
             y_hat = self.W_out @ phi
             preds[t] = y_hat
-            xp = self._preprocess(y_hat)
-            pre = self.W_in @ xp + self.W_res @ h + bias
-            h = (1.0 - leak) * h + leak * act(pre)
+            h = self._reservoir_step(h, self._preprocess(y_hat))
             last_x = y_hat
         return preds
 
@@ -566,13 +571,8 @@ class OnlineTrainer:
         pass
 
     def _step_reservoir(self, x: "np.ndarray") -> None:
-        rc = self.executor.rc
-        act = _activation_fn(rc.reservoir.activation)
-        leak = rc.reservoir.leak_rate
-        bias = rc.reservoir.bias
         xp = self.executor._preprocess(x)
-        z = self.executor.W_in @ xp + self.executor.W_res @ self.h + bias
-        self.h = (1.0 - leak) * self.h + leak * act(z)
+        self.h = self.executor._reservoir_step(self.h, xp)
 
     def step(self, x: "np.ndarray", y: "np.ndarray") -> "np.ndarray":
         x = np.atleast_1d(np.asarray(x, dtype=float))
