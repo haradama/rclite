@@ -1617,19 +1617,21 @@ class _AffineLowerer:
     """
 
     def __init__(self, ir_module):
-        from rclite.ir.ops import (
-            Argmax,
-            Softmax,
-            AccumulateState,
-        )
-
         self.ir_module = ir_module
         md = ir_module.metadata
         if md.get("quantization") != "affine":
             raise ValueError(
                 "_AffineLowerer expects metadata['quantization']='affine'"
             )
+        self._init_storage(md)
+        self._init_quant_params(md)
+        self.K, self.N, self.M = ir_module.K, ir_module.N, ir_module.M
+        self._init_function(md)
+        self._init_buffers()
+        self.t = None
 
+    def _init_storage(self, md) -> None:
+        """Storage / accumulator integer types from the quantization width."""
         self.storage_bits = int(md["storage_bits"])
         self.storage_ty = ir.IntType(self.storage_bits)
         if self.storage_bits == 8:
@@ -1642,6 +1644,9 @@ class _AffineLowerer:
                 f"got {self.storage_bits}"
             )
 
+    def _init_quant_params(self, md) -> None:
+        """Parse affine quantization parameters out of metadata: zero points,
+        requantize multipliers, LUT strategy, topology, integer preprocess."""
         # Zero points (Python ints)
         self.zp_input = int(md["zp_input"])
         self.zp_u_pre = int(md["zp_u_pre"])
@@ -1703,10 +1708,17 @@ class _AffineLowerer:
         self.pre_n = int(md.get("pre_n", 0))
         self.pre_const = int(md.get("pre_const", 0))
 
-        self.K, self.N, self.M = ir_module.K, ir_module.N, ir_module.M
+    def _init_function(self, md) -> None:
+        """Create the LLVM module, detect the output head (argmax/softmax/
+        mean-pool), emit the weight globals and declare `rc_predict`."""
+        from rclite.ir.ops import (
+            Argmax,
+            Softmax,
+            AccumulateState,
+        )
 
         self.module = ir.Module(
-            name=f"rc_affine_jit_i{self.storage_bits}_{id(ir_module)}",
+            name=f"rc_affine_jit_i{self.storage_bits}_{id(self.ir_module)}",
         )
         self.module.triple = llvm.get_default_triple()
 
@@ -1731,7 +1743,7 @@ class _AffineLowerer:
 
         # Emit all globals (storage-typed weights + i32 precomputed row sums).
         self.globals = {}
-        for name, arr in ir_module.weights.items():
+        for name, arr in self.ir_module.weights.items():
             self.globals[name] = self._emit_global(name, arr)
 
         # void rc_predict(i64 T, storage_t* X, {storage_t|i32}* Y)
@@ -1745,6 +1757,10 @@ class _AffineLowerer:
         self.X_arg.name = "X"
         self.Y_arg.name = "Y"
 
+    def _init_buffers(self) -> None:
+        """Open the entry block and allocate the per-run scratch buffers
+        (state, pre-activation, logits/exp, u_pre, state-sum), then zero-init
+        the reservoir state to `zp_state`."""
         entry = self.fn.append_basic_block("entry")
         self.b = ir.IRBuilder(entry)
 
@@ -1793,8 +1809,6 @@ class _AffineLowerer:
         # Initialize state to zp_state
         with _loop(self.b, _ci(self.N), "init") as i:
             _store1d(self.b, self.h_buf, i, self._cs(self.zp_state))
-
-        self.t = None
 
     # ------------------------------------------------------------------
     # constants
@@ -2211,8 +2225,20 @@ class _AffineLowerer:
         affine zero-point correction `- zp_state * row_sum_W_res[i]` and the
         requantize are unchanged (row_sum_W_res is preserved by the pass).
         """
-        b, K, N, t = self.b, op.K, op.N, self.t
-        # acc_in
+        rq_in = self._emit_preact_input(op, i, g_Win, g_rs_in)
+        rq_res = self._emit_preact_reservoir(
+            op, i, g_Wres, g_rs_res, spec, i_py
+        )
+        pre_total = self.b.add(
+            self.b.add(self._ci32(self.zp_pre + self.bias_pre), rq_in), rq_res
+        )
+        pre_q = self._emit_saturate_to_storage(pre_total)
+        _store1d(self.b, self.pre_buf, i, pre_q)
+
+    def _emit_preact_input(self, op, i, g_Win, g_rs_in):
+        """W_in·x for row i, minus the `zp_u_pre · row_sum_W_in[i]` affine
+        correction, requantized to i32 (the input pre-activation term)."""
+        b, K, t = self.b, op.K, self.t
         acc_in_var = b.alloca(self.accum_ty, name="acc_in")
         b.store(self._ca(0), acc_in_var)
         with _loop(b, _ci(K), "kin") as k:
@@ -2232,11 +2258,15 @@ class _AffineLowerer:
         acc_in_final = b.sub(
             b.load(acc_in_var), b.mul(self._ca(self.zp_u_pre), rs_in)
         )
-        rq_in = self._emit_requantize_i32(
+        return self._emit_requantize_i32(
             self._clamp_to_i32(acc_in_final), self.M_in_M0, self.M_in_n
         )
 
-        # acc_res
+    def _emit_preact_reservoir(self, op, i, g_Wres, g_rs_res, spec, i_py):
+        """W_res·h for row i — structured chain / unrolled-sparse / CSR /
+        dense — minus the `zp_state · row_sum_W_res[i]` affine correction,
+        requantized to i32 (per-channel `(M0[i], n[i])` when enabled)."""
+        b, N = self.b, op.N
         if self.structured:
             acc_res_i32 = self._emit_chain_contribution(i, N)
         else:
@@ -2271,17 +2301,10 @@ class _AffineLowerer:
             # per-row (M0[i], n[i]) loaded from i32 globals → dynamic shift.
             m0_i = _load1d_global(b, self.globals["M_res_M0"], i)
             n_i = _load1d_global(b, self.globals["M_res_n"], i)
-            rq_res = self._emit_requantize_i32_dynamic(acc_res_i32, m0_i, n_i)
-        else:
-            rq_res = self._emit_requantize_i32(
-                acc_res_i32, self.M_res_M0, self.M_res_n
-            )
-
-        pre_total = b.add(
-            b.add(self._ci32(self.zp_pre + self.bias_pre), rq_in), rq_res
+            return self._emit_requantize_i32_dynamic(acc_res_i32, m0_i, n_i)
+        return self._emit_requantize_i32(
+            acc_res_i32, self.M_res_M0, self.M_res_n
         )
-        pre_q = self._emit_saturate_to_storage(pre_total)
-        _store1d(b, self.pre_buf, i, pre_q)
 
     def _emit_affine_res_csr(self, spec, acc_res_var, i):
         """Accumulate W_res·h over row i's nonzeros (CSR) into acc_res_var."""
