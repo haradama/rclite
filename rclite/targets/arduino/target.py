@@ -32,7 +32,7 @@ from typing import Optional
 
 import numpy as np
 
-from ..target import Target, CompiledArtifact
+from ..target import Target, CompiledArtifact, affine_reference_outputs
 from ...codegen.templating import render_template
 from .emit_c import emit_affine_kernel_c
 
@@ -94,32 +94,10 @@ class ArduinoUnoTarget(Target):
 
         # Quantize test inputs + bit-exact reference outputs via the Python
         # executor (same path the host JIT / C kernel reproduce exactly).
-        from rclite.core.profile import Aggregation
-        from rclite.quant.affine.executor import AffineQuantizedExecutor
-
-        cfg = qmodel.config
-        X = test_inputs
-        if X.ndim == 1:
-            X = X[:, None]
-        X_q = cfg.input.quantize_array(X).astype(np_storage)
-        qexe = AffineQuantizedExecutor(qmodel)
-        T = X.shape[0]
-        pooled = qmodel.rc.readout.aggregation != Aggregation.NONE
-        if pooled:
-            # Sequence-to-label: the kernel pools the whole window and emits a
-            # single readout row.
-            n_rows = 1
-            Y_ref_q = qexe.predict_pooled_q(X)[None, :].astype(np_storage)
-        else:
-            n_rows = T
-            Y_ref_q = np.zeros((T, qmodel.M), dtype=np_storage)
-            for t in range(T):
-                x_raw_q = qexe._quantize_raw_input(X[t])
-                u_pre_q = qexe._quantize_u_pre(X[t])
-                qexe.step_q(u_pre_q)
-                Y_ref_q[t] = qexe.predict_one_q(x_raw_q, qexe.state_q).astype(
-                    np_storage
-                )
+        X_q, Y_ref_q, n_rows = affine_reference_outputs(
+            qmodel, test_inputs, np_storage
+        )
+        T = X_q.shape[0]
 
         # Render sketch.ino
         x_lit = ", ".join(str(int(v)) for v in X_q.ravel())

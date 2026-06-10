@@ -39,7 +39,12 @@ import numpy as np
 from rclite.codegen.llvm import emit_quantized_affine_module
 from rclite.ir import sparse_passes
 
-from ..target import Target, CompiledArtifact, RunResult
+from ..target import (
+    Target,
+    CompiledArtifact,
+    RunResult,
+    affine_reference_outputs,
+)
 from ..arduino.emit_c import emit_affine_kernel_c
 from ...codegen.templating import render_template
 
@@ -169,22 +174,10 @@ class NesTarget(Target):
 
         # Quantize test inputs + bit-exact reference outputs via the affine
         # executor (the same path the C kernel reproduces exactly).
-        from rclite.quant.affine.executor import AffineQuantizedExecutor
-
-        cfg = qmodel.config
-        X = test_inputs[:, None] if test_inputs.ndim == 1 else test_inputs
-        X_q = cfg.input.quantize_array(X).astype(np_storage)
-        qexe = AffineQuantizedExecutor(qmodel)
-        T = X.shape[0]
-        Y_ref_q = np.zeros((T, qmodel.M), dtype=np_storage)
-        for t in range(T):
-            x_raw_q = qexe._quantize_raw_input(X[t])
-            u_pre_q = qexe._quantize_u_pre(X[t])
-            qexe.step_q(u_pre_q)
-            Y_ref_q[t] = qexe.predict_one_q(x_raw_q, qexe.state_q).astype(
-                np_storage
-            )
-
+        X_q, Y_ref_q, _ = affine_reference_outputs(
+            qmodel, test_inputs, np_storage
+        )
+        T = X_q.shape[0]
         x_flat = np.ascontiguousarray(X_q).ravel()
         y_flat = np.ascontiguousarray(Y_ref_q).ravel()
 
