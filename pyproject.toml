@@ -15,6 +15,10 @@ docs = ["pdoc>=14"]
 # Opt-in: the MLIR reference path builds its IR with xDSL (pure-Python).
 # Production codegen stays on llvmlite with zero extra deps.
 mlir = ["xdsl>=0.66"]
+# Opt-in: run the rc-dialect vector float kernel as WASM under wasmtime
+# (tests/rc_dialect_test.py::test_wasm_simd_execution). Test-only; skips when
+# absent. Pair with a `wasm-ld` (LLVM/lld) on PATH for linking.
+wasm = ["wasmtime>=20"]
 
 [build-system]
 requires = ["hatchling"]

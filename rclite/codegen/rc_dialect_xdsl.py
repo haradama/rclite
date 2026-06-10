@@ -37,6 +37,7 @@ from xdsl.dialects.builtin import (
     StringAttr,
     IntegerAttr,
     FloatAttr,
+    Float32Type,
     Float64Type,
     IntegerType,
     ModuleOp,
@@ -58,6 +59,7 @@ from rclite.ir.ops import (
 )
 
 _F64 = Float64Type()
+_F32 = Float32Type()
 _I64 = IntegerType(64)
 
 
@@ -307,12 +309,12 @@ _IDX = IndexType()
 _ADD_KIND = vector.CombiningKindAttr(vector.CombiningKindFlag.ADD)
 
 
-def _matvec_acc(Wmem, base, hmem, N, vlen, acc0):
-    """`acc0 + sum_{j<N} Wmem[base+j] * hmem[j]`, returns the scalar f64 acc.
+def _matvec_acc(Wmem, base, hmem, N, vlen, acc0, ety):
+    """`acc0 + sum_{j<N} Wmem[base+j] * hmem[j]`, returns the scalar acc (`ety`).
 
     `vlen <= 1`: a plain scalar reduction (IEEE accumulation order — the order
     LLVM is forced to keep, so it leaves the reduction scalar even at -O3).
-    `vlen > 1`: the inner product is accumulated in a `vector<vlen x f64>` via
+    `vlen > 1`: the inner product is accumulated in a `vector<vlen x ety>` via
     `vector.fma`, then collapsed with `vector.reduction <add>` plus a scalar tail
     for `N % vlen`. The vectorised partial sums reassociate the float reduction —
     exactly what LLVM's auto-vectoriser won't do without fast-math — so this is
@@ -328,7 +330,7 @@ def _matvec_acc(Wmem, base, hmem, N, vlen, acc0):
         return for_(c_idx(0), c_idx(N), c_idx(1), [acc0], jb)[0]
 
     Nv = (N // vlen) * vlen
-    vt = VectorType(_F64, [vlen])
+    vt = VectorType(ety, [vlen])
     acc = acc0
     if Nv > 0:
         vz = arith.ConstantOp(
@@ -349,7 +351,7 @@ def _matvec_acc(Wmem, base, hmem, N, vlen, acc0):
         # as the reduction's start value (= acc + lane-sum).
         acc = vector.ReductionOp.build(
             operands=[vacc, acc],
-            result_types=[_F64],
+            result_types=[ety],
             properties={"kind": _ADD_KIND},
         ).results[0]
     if Nv < N:
@@ -372,15 +374,16 @@ def _find_fused(mod: ModuleOp):
     return fused
 
 
-def _fconst(v):
-    return arith.ConstantOp(FloatAttr(float(v), _F64)).result
+def _fconst(v, ety):
+    return arith.ConstantOp(FloatAttr(float(v), ety)).result
 
 
-def _fglobal(name, arr):
-    flat = np.asarray(arr, dtype=np.float64).reshape(-1)
-    ty = MemRefType(_F64, [int(flat.size)])
+def _fglobal(name, arr, ety):
+    npty = np.float32 if ety is _F32 else np.float64
+    flat = np.asarray(arr, dtype=npty).reshape(-1)
+    ty = MemRefType(ety, [int(flat.size)])
     init = DenseIntOrFPElementsAttr.from_list(
-        TensorType(_F64, [int(flat.size)]), [float(v) for v in flat]
+        TensorType(ety, [int(flat.size)]), [float(v) for v in flat]
     )
     return memref.GlobalOp.get(
         StringAttr(name),
@@ -392,7 +395,11 @@ def _fglobal(name, arr):
 
 
 def lower_fused_float(
-    mod: ModuleOp, weights: dict, vlen: int = 1, func_name: str = "rc_predict"
+    mod: ModuleOp,
+    weights: dict,
+    vlen: int = 1,
+    func_name: str = "rc_predict",
+    dtype: str = "f64",
 ) -> str:
     """Lower a fused `rc` module (float dense, identity activation) to an
     arith/memref/scf `rc_predict` kernel and return the printed MLIR.
@@ -404,7 +411,12 @@ def lower_fused_float(
     `vlen` sets the SIMD width of the two N-wide reductions (`W_res@h` and the
     readout `W_out_state@h`): `vlen=1` is the scalar baseline, `vlen>1` emits the
     `vector`-dialect reduction (Stage 3). Lower the vector form with the extended
-    pipeline (`mlir_jit` + `--convert-vector-to-llvm`)."""
+    pipeline (`mlir_jit` + `--convert-vector-to-llvm`).
+
+    `dtype` is `f64` or `f32`. f32 packs 4 lanes into a 128-bit SIMD register, so
+    `dtype="f32", vlen=4` is what gets armv7 NEON (no f64 SIMD) and WASM SIMD128
+    to vectorise; the X/Y c-interface arrays are then f32."""
+    ety = _F32 if dtype == "f32" else _F64
     op = _find_fused(mod)
     if _get(op, "activation") != "IDENTITY":
         raise NotImplementedError("spike lowering: identity activation only")
@@ -423,27 +435,27 @@ def lower_fused_float(
     )
 
     globals_ = [
-        _fglobal("W_in", weights[W_in]),
-        _fglobal("W_res", weights[W_res]),
-        _fglobal("W_out", weights[W_out]),
+        _fglobal("W_in", weights[W_in], ety),
+        _fglobal("W_res", weights[W_res], ety),
+        _fglobal("W_out", weights[W_out], ety),
     ]
 
-    dyn = MemRefType(_F64, [memref.DYNAMIC_INDEX])
+    dyn = MemRefType(ety, [memref.DYNAMIC_INDEX])
     region = Region([Block(arg_types=[_I64, dyn, dyn])])
     with ImplicitBuilder(region.block) as (T, X, Y):
         cN, cK, cM, cF = c_idx(N), c_idx(K), c_idx(M), c_idx(F)
         c0, c1 = c_idx(0), c_idx(1)
         Ti = arith.IndexCastOp(T, _IDX).result
-        Win = memref.GetGlobalOp("W_in", MemRefType(_F64, [N * K])).memref
-        Wres = memref.GetGlobalOp("W_res", MemRefType(_F64, [N * N])).memref
-        Wout = memref.GetGlobalOp("W_out", MemRefType(_F64, [M * F])).memref
-        h = memref.AllocaOp.get(_F64, shape=[N]).memref
-        pre = memref.AllocaOp.get(_F64, shape=[N]).memref
+        Win = memref.GetGlobalOp("W_in", MemRefType(ety, [N * K])).memref
+        Wres = memref.GetGlobalOp("W_res", MemRefType(ety, [N * N])).memref
+        Wout = memref.GetGlobalOp("W_out", MemRefType(ety, [M * F])).memref
+        h = memref.AllocaOp.get(ety, shape=[N]).memref
+        pre = memref.AllocaOp.get(ety, shape=[N]).memref
         z, one_ml, leakc, biasc = (
-            _fconst(0.0),
-            _fconst(1.0 - leak),
-            _fconst(leak),
-            _fconst(bias),
+            _fconst(0.0, ety),
+            _fconst(1.0 - leak, ety),
+            _fconst(leak, ety),
+            _fconst(bias, ety),
         )
 
         def init_body(i, _):
@@ -471,7 +483,7 @@ def lower_fused_float(
                     return [arith.AddfOp(a, arith.MulfOp(w, x).result).result]
 
                 acc = for_(c0, cK, c1, [biasc], kin)[0]
-                acc = _matvec_acc(Wres, iN, h, N, vlen, acc)
+                acc = _matvec_acc(Wres, iN, h, N, vlen, acc, ety)
                 memref.StoreOp.get(acc, pre, [i])
                 return []
 
@@ -513,7 +525,7 @@ def lower_fused_float(
 
                     init = for_(c0, cK, c1, [init], kb)[0]
                 base_s = arith.AddiOp(mF, c_idx(off_s)).result
-                y = _matvec_acc(Wout, base_s, h, N, vlen, init)
+                y = _matvec_acc(Wout, base_s, h, N, vlen, init, ety)
                 memref.StoreOp.get(y, Y, [arith.AddiOp(tM, m).result])
                 return []
 

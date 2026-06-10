@@ -12,10 +12,12 @@ vector kernel vectorises and (b) the scalar baseline stays scalar (LLVM keeps
 the float reduction ordered) — the win is the explicit `vector` lowering, cross
 -ISA.
 
-  x86_64  +avx2,+fma    vfmadd...pd  (ymm, 4xf64)
-  wasm32  +simd128      f64x2.mul/add
-  aarch64 +neon         fmla v.2d    (2xf64)
-  armv7   +neon         f64 NEON unsupported on armv7 -> scalar VFP (honest)
+It sweeps both dtypes (128-bit SIMD = 2xf64 or 4xf32):
+
+  x86_64  f64 vfmadd...pd / f32 vfmadd...ps   (AVX)
+  wasm32  f64 f64x2.*     / f32 f32x4.*       (SIMD128)
+  aarch64 f64 *.2d        / f32 *.4s          (NEON)
+  armv7   f64 (none — no f64 NEON) / f32 vmla.f32 q  (NEON; f32 unlocks armv7)
 
 Needs llc with the targets registered (the nix devShell's LLVM-20, or a system
 llvm-20). Usage:
@@ -49,40 +51,78 @@ from rclite.codegen.rc_dialect_xdsl import (
     lower_fused_float,
 )
 
-# (label, triple, features, simd-mnemonic regex, vlen)
+# (label, dtype, triple, features, simd-mnemonic regex, vlen). 128-bit SIMD = 2
+# f64 lanes or 4 f32 lanes; armv7 NEON has no f64 SIMD, so only its f32 row
+# vectorises — the same rc dialect, just dtype/vlen.
 TARGETS = [
     (
-        "x86_64 AVX2",
+        "x86_64 AVX",
+        "f64",
         "x86_64-unknown-linux-gnu",
         "+avx2,+fma",
         r"vfmadd\w*pd|\bmulpd|\baddpd",
         4,
     ),
     (
+        "x86_64 AVX",
+        "f32",
+        "x86_64-unknown-linux-gnu",
+        "+avx2,+fma",
+        r"vfmadd\w*ps|\bmulps|\baddps",
+        8,
+    ),
+    (
         "wasm32 SIMD128",
+        "f64",
         "wasm32-unknown-unknown",
         "+simd128",
         r"f64x2\.(mul|add)",
         2,
     ),
     (
+        "wasm32 SIMD128",
+        "f32",
+        "wasm32-unknown-unknown",
+        "+simd128",
+        r"f32x4\.(mul|add)",
+        4,
+    ),
+    (
         "aarch64 NEON",
+        "f64",
         "aarch64-unknown-linux-gnu",
         "+neon",
-        r"\bfmla\b.*\.2d|\bfmul\b.*\.2d|\bfadd\b.*\.2d",
+        r"\.2d\b",
+        2,
+    ),
+    (
+        "aarch64 NEON",
+        "f32",
+        "aarch64-unknown-linux-gnu",
+        "+neon",
+        r"\.4s\b",
+        4,
+    ),
+    (
+        "armv7 NEON",
+        "f64",
+        "armv7-unknown-linux-gnueabihf",
+        "+neon",
+        r"\.f64\b.*\bq\d",
         2,
     ),
     (
         "armv7 NEON",
+        "f32",
         "armv7-unknown-linux-gnueabihf",
         "+neon",
-        r"\bvfma\.f64\b.*q|f64.*q\d",
-        2,
+        r"\b(vmla|vmul|vfma|vadd)\.f32\b.*\bq\d",
+        4,
     ),
 ]
 
 
-def _kernel_mlir(vlen):
+def _kernel_mlir(vlen, dtype):
     rc = ReservoirComputer(
         input=InputNode(units=4, name="in"),
         reservoir=ReservoirNode(
@@ -115,19 +155,22 @@ def _kernel_mlir(vlen):
     m = build_ir(rc, exe)
     mod = build_rc_module(m)
     fuse_step_readout(mod)
-    return lower_fused_float(mod, m.weights, vlen=vlen)
+    return lower_fused_float(mod, m.weights, vlen=vlen, dtype=dtype)
 
 
-def _simd_count(triple, features, regex, vlen):
+def _simd_count(triple, features, regex, vlen, dtype):
     asm = mlir_jit.cross_compile_object(
-        _kernel_mlir(vlen),
+        _kernel_mlir(vlen, dtype),
         triple=triple,
         features=features,
         extra_passes=["--convert-vector-to-llvm"],
         filetype="asm",
     ).decode()
     asm_s = mlir_jit.cross_compile_object(
-        _kernel_mlir(1), triple=triple, features=features, filetype="asm"
+        _kernel_mlir(1, dtype),
+        triple=triple,
+        features=features,
+        filetype="asm",
     ).decode()
     pat = re.compile(regex)
     n_vec = sum(1 for ln in asm.splitlines() if pat.search(ln))
@@ -143,30 +186,29 @@ def main():
         print("skip: LLVM-20 mlir-opt/llc not on PATH (use the nix devShell)")
         return
     print(
-        "One rc vector dialect -> target SIMD (cross-compile, vlen per ISA)\n"
+        "One rc vector dialect -> target SIMD (cross-compile; 128b = 2xf64 / "
+        "4xf32)\n"
     )
     header = (
-        f"{'target':16} {'features':14} {'vector SIMD':>11} "
-        f"{'scalar SIMD':>11}  verdict"
+        f"{'target':16} {'dtype':5} {'vlen':>4} {'vec SIMD':>9} "
+        f"{'scalar':>7}  verdict"
     )
     print(header)
     print("-" * len(header))
-    for label, triple, feat, regex, vlen in TARGETS:
+    for label, dtype, triple, feat, regex, vlen in TARGETS:
         try:
-            nv, ns = _simd_count(triple, feat, regex, vlen)
-            if nv > ns:
-                v = "VECTORISED" if ns == 0 else f"vectorised (+{nv - ns})"
-            else:
-                v = "scalar (ISA has no f64 SIMD)"
-            print(f"{label:16} {feat:14} {nv:>11} {ns:>11}  {v}")
+            nv, ns = _simd_count(triple, feat, regex, vlen, dtype)
+            v = "VECTORISED" if nv > ns else "scalar (no SIMD for this dtype)"
+            print(f"{label:16} {dtype:5} {vlen:>4} {nv:>9} {ns:>7}  {v}")
         except Exception as e:
-            print(f"{label:16} {feat:14}  FAIL: {type(e).__name__}: {e}")
+            print(f"{label:16} {dtype:5}  FAIL: {type(e).__name__}: {e}")
     print(
-        "\nvector/scalar SIMD = count of the ISA's f64-SIMD mnemonics in the "
-        "vector(vlen) vs scalar(vlen=1) kernel.\nSame rc dialect, one "
-        "--convert-vector-to-llvm; the scalar baseline stays scalar because "
-        "LLVM won't reassociate the float reduction.\narmv7 has no f64 NEON, so "
-        "it correctly falls back to scalar VFP (use f32 for armv7 SIMD)."
+        "\nvec/scalar = ISA SIMD-mnemonic count in the vector(vlen) vs "
+        "scalar(vlen=1) kernel. Same rc dialect, one --convert-vector-to-llvm;\n"
+        "the scalar baseline stays scalar because LLVM won't reassociate the "
+        "float reduction. armv7 NEON has no f64 SIMD -> only its f32 row "
+        "vectorises.\nThe wasm32 kernel also *runs* under wasmtime "
+        "(tests/rc_dialect_test.py::test_wasm_simd_execution)."
     )
 
 

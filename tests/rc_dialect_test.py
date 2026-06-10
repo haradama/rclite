@@ -49,6 +49,17 @@ except ImportError:
 
 HAVE = mlir_jit.tools_available() and _HAVE_XDSL
 
+import shutil  # noqa: E402
+
+try:
+    import wasmtime  # noqa: F401
+
+    _HAVE_WASMTIME = True
+except ImportError:
+    _HAVE_WASMTIME = False
+_WASM_LD = shutil.which("wasm-ld")
+HAVE_WASM = HAVE and _HAVE_WASMTIME and _WASM_LD is not None
+
 
 def _model(units=12, K=2, M=3, activation=Activation.TANH, seed=3):
     rc = ReservoirComputer(
@@ -259,12 +270,126 @@ def test_cross_isa_simd():
     )
 
 
+def test_f32_armv7_neon_simd():
+    """The f32 path packs 4 lanes per 128-bit register, so armv7 NEON (which has
+    no f64 SIMD) vectorises — the same rc dialect, dtype='f32', vlen=4."""
+    if not HAVE:
+        print("  (skip)")
+        return
+    import re
+
+    rc, exe, _ = _model(units=64, activation=Activation.IDENTITY)
+    m = build_ir(rc, exe)
+    mod = build_rc_module(m)
+    fuse_step_readout(mod)
+
+    def simd(vlen, extra):
+        asm = mlir_jit.cross_compile_object(
+            lower_fused_float(mod, m.weights, vlen=vlen, dtype="f32"),
+            triple="armv7-unknown-linux-gnueabihf",
+            features="+neon",
+            extra_passes=extra,
+            filetype="asm",
+        ).decode()
+        return sum(
+            1
+            for ln in asm.splitlines()
+            if re.search(r"\b(vmla|vmul|vfma|vadd)\.f32\b.*\bq\d", ln)
+        )
+
+    try:
+        n_vec = simd(4, ["--convert-vector-to-llvm"])
+        n_scalar = simd(1, [])
+    except RuntimeError:
+        print("  (skip: armv7 target not registered)")
+        return
+    assert n_scalar == 0 and n_vec > 0, (
+        f"armv7 f32 vec={n_vec} scalar={n_scalar}"
+    )
+    print(
+        f"  f32 path -> armv7 NEON SIMD (q-regs): {n_vec} vec, {n_scalar} scalar"
+    )
+
+
+def _wasm_run(mlir_text, X, T, K, M):
+    """Link a wasm32+simd128 kernel and run it under wasmtime; returns Y (T,M)."""
+    import pathlib
+    import subprocess
+    import tempfile
+
+    import wasmtime
+
+    obj = mlir_jit.cross_compile_object(
+        mlir_text,
+        triple="wasm32-unknown-unknown",
+        features="+simd128",
+        extra_passes=["--convert-vector-to-llvm"],
+        filetype="obj",
+    )
+    with tempfile.TemporaryDirectory() as td:
+        td = pathlib.Path(td)
+        (td / "rc.o").write_bytes(obj)
+        subprocess.run(
+            [
+                _WASM_LD,
+                "--no-entry",
+                "--allow-undefined",
+                "--export=rc_predict",
+                "--export=memory",
+                "--export=__heap_base",
+                "--strip-debug",
+                str(td / "rc.o"),
+                "-o",
+                str(td / "rc.wasm"),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        store = wasmtime.Store()
+        mw = wasmtime.Module.from_file(store.engine, str(td / "rc.wasm"))
+        inst = wasmtime.Instance(store, mw, [])
+        ex = inst.exports(store)
+        mem, rcf = ex["memory"], ex["rc_predict"]
+        hb = ex["__heap_base"].value(store)
+        xb = np.ascontiguousarray(X, dtype=np.float32).tobytes()
+        xa = (hb + 15) // 16 * 16
+        ya = (xa + len(xb) + 15) // 16 * 16
+        need = (ya + T * M * 4 + 0xFFFF) // 0x10000
+        if need > mem.size(store):
+            mem.grow(store, need - mem.size(store))
+        mem.write(store, xb, xa)
+        rcf(store, T, xa, xa, 0, T * K, 1, ya, ya, 0, T * M, 1)
+        yb = mem.read(store, ya, ya + T * M * 4)
+    return np.frombuffer(yb, dtype=np.float32).reshape(T, M).astype(np.float64)
+
+
+def test_wasm_simd_execution():
+    """End-to-end: the rc f32 vector kernel cross-compiles to wasm32+simd128,
+    links with wasm-ld, and runs under wasmtime with output matching the f64
+    runtime (to f32 precision). One rc dialect -> running WASM SIMD."""
+    if not HAVE_WASM:
+        print("  (skip: wasmtime / wasm-ld not available)")
+        return
+    rc, exe, X = _model(units=37, activation=Activation.IDENTITY)
+    m = build_ir(rc, exe)
+    mod = build_rc_module(m)
+    fuse_step_readout(mod)
+    txt = lower_fused_float(mod, m.weights, vlen=4, dtype="f32")
+    got = _wasm_run(txt, X, X.shape[0], rc.input.units, rc.readout.units)
+    ref = exe.predict(X)
+    d = float(np.max(np.abs(got - ref)))
+    assert d < 1e-3, f"wasm kernel vs runtime max|diff|={d:.2e}"
+    print(f"  wasm32+simd128 kernel runs under wasmtime (max|diff|={d:.1e})")
+
+
 TESTS = [
     test_dialect_build_and_verify,
     test_fuse_pattern,
     test_lower_fused_float_numeric,
     test_lower_fused_float_vector,
     test_cross_isa_simd,
+    test_f32_armv7_neon_simd,
+    test_wasm_simd_execution,
 ]
 
 
