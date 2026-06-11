@@ -302,6 +302,62 @@ def test_parity_i16_dense():
     _assert_jit_python_parity(qm, X[200:230])
 
 
+def test_parity_vectorized_dense_matvec():
+    """Quantized SIMD in the production (llvmlite) path: vectorizing the dense
+    W_res AND readout W_out_state matvecs (`CompiledAffineRC(vlen=4)`) stays
+    bit-exact with the scalar executor. The i64/i32 integer reduction is
+    associative, so the SIMD lane sums equal the scalar order; the
+    non-associative saturation/requantize stay scalar, per row. i8 accumulates
+    in i32, i16 multiplies in i32 -> i64."""
+    for sb in (8, 16):
+        for units in (64, 37):  # 37 exercises the N % vlen scalar tail
+            _, _, qm, X = _build_and_quant(
+                storage_bits=sb,
+                units=units,
+                topology=Topology.ESN_STANDARD,
+            )
+            Y_vec = CompiledAffineRC(qm, vlen=4).predict(X[200:230])
+            Y_py = AffineQuantizedExecutor(qm).predict(X[200:230])
+            d = float(np.max(np.abs(Y_vec - Y_py)))
+            assert d == 0, f"i{sb} N={units}: vlen=4 vs executor max|diff|={d}"
+        # large-M (readout-heavy) model stresses the W_out_state matvec
+        rc = ReservoirComputer(
+            input=InputNode(units=2, name="in"),
+            reservoir=ReservoirNode(
+                units=48,
+                topology=Topology.ESN_STANDARD,
+                leak_rate=0.3,
+                density=0.5,
+                seed=sb,
+                name="res",
+            ),
+            readout=ReadoutNode(
+                units=32,
+                trainer=Trainer.RIDGE,
+                regularization=1e-6,
+                washout=30,
+                include_bias=True,
+                include_input=True,
+                name="out",
+            ),
+        )
+        exe = RCExecutor(rc)
+        X = np.random.default_rng(sb).standard_normal((300, 2)) * 0.3
+        exe.fit(
+            X[:240],
+            np.stack(
+                [np.sin(np.arange(240) * 0.03 * (k + 1)) for k in range(32)], 1
+            ),
+        )
+        qm = quantize_model_affine(
+            rc, exe, calibrate_from_data(rc, exe, X[:240], storage_bits=sb)
+        )
+        Y_vec = CompiledAffineRC(qm, vlen=4).predict(X[240:262])
+        Y_py = AffineQuantizedExecutor(qm).predict(X[240:262])
+        d = float(np.max(np.abs(Y_vec - Y_py)))
+        assert d == 0, f"i{sb} M=32 readout: vlen=4 vs executor max|diff|={d}"
+
+
 def test_parity_no_bias_no_input():
     """Readout-only path: just the state column block."""
     _, _, qm, X = _build_and_quant(include_bias=False, include_input=False)

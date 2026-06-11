@@ -154,11 +154,15 @@ def cross_compile_object(
     `vector` float kernels); `filetype` is `obj` (returns object bytes) or `asm`
     (returns the textual assembly bytes — handy to confirm SIMD instructions).
 
-    NOTE: the *quantized* integer kernel stays scalar — saturating/wrapping
-    quantized arithmetic is non-associative, so SIMD would break host<->device
-    bit-exactness (`features` then only selects the ISA, not vectorization). The
-    *float* `vector`-dialect kernel, by contrast, is genuinely vectorized: one
-    `rc` dialect -> SIMD on wasm32 (+simd128), aarch64/armv7 (+neon), x86 (+avx).
+    NOTE on quantized SIMD: only the genuinely non-associative parts of the
+    integer kernel (the per-row *saturation* / requantize) must stay scalar. The
+    i64 matvec *reduction* IS associative (no mid-loop saturation, no overflow
+    for realistic sizes), so it vectorizes BIT-EXACT —
+    `emit_affine_mlir_xdsl(..., vlen=N)` emits a `vector` i64 reduction whose
+    integer output is byte-identical to the scalar kernel (verified host + wasm
+    in `tests/mlir_affine_spike_test.py::test_vectorized_matvec_bit_exact`). The
+    float `vector` kernel vectorizes likewise. One `rc`/affine dialect -> SIMD on
+    wasm32 (+simd128), aarch64/armv7 (+neon), x86 (+avx), riscv (+v).
     """
     missing = [t for t in _CROSS_TOOLS if shutil.which(t) is None]
     if missing:
@@ -225,6 +229,7 @@ class CompiledMLIRJit:
         K: int,
         classify: bool = False,
         opt_level: int = 3,
+        extra_passes=(),
     ):
         if storage_bits not in _C_STORAGE:
             raise NotImplementedError(
@@ -236,7 +241,7 @@ class CompiledMLIRJit:
         self._np_in = _NP_STORAGE[storage_bits]
         self._np_out = np.int32 if classify else self._np_in
 
-        ir_text = mlir_to_llvm_ir(mlir_text)
+        ir_text = mlir_to_llvm_ir(mlir_text, extra_passes=extra_passes)
         self._mod = llvm.parse_assembly(ir_text)
         self._mod.verify()
         tm = llvm.Target.from_triple(
@@ -292,15 +297,24 @@ def jit_affine(
     *,
     head: Optional[str] = None,
     sparse: Optional[str] = None,
+    vlen: int = 1,
 ) -> CompiledMLIRJit:
-    """Build the affine MLIR (xDSL constructor) and JIT it via llvmlite."""
+    """Build the affine MLIR (xDSL constructor) and JIT it via llvmlite.
+
+    `vlen > 1` vectorizes the dense W_res i64 matvec reduction (`vector` dialect,
+    `--convert-vector-to-llvm`). The i64 sum is associative, so the output is
+    BIT-EXACT with the scalar kernel — quantized SIMD that keeps host<->device
+    integer equality (verified in `tests/mlir_affine_spike_test.py`)."""
     from rclite.codegen.mlir_affine_xdsl import emit_affine_mlir_xdsl
 
-    mlir_text = emit_affine_mlir_xdsl(qmodel, head=head, sparse=sparse)
+    mlir_text = emit_affine_mlir_xdsl(
+        qmodel, head=head, sparse=sparse, vlen=vlen
+    )
     return CompiledMLIRJit(
         mlir_text,
         storage_bits=qmodel.storage_bits,
         M=qmodel.M,
         K=qmodel.K,
         classify=head == "classify",
+        extra_passes=["--convert-vector-to-llvm"] if vlen > 1 else (),
     )

@@ -54,6 +54,7 @@ from .mlir_quant_xdsl import (
     emit_clip32_func,
     emit_requantize_func,
     emit_requantize_axis_func,
+    int_matvec_acc,
     zp_cross,
     emit_argmax_head,
     emit_softmax_head,
@@ -65,6 +66,7 @@ def emit_affine_mlir_xdsl(
     *,
     head: Optional[str] = None,
     sparse: Optional[str] = None,
+    vlen: int = 1,
 ) -> str:
     if head not in _HEADS:
         raise ValueError(f"head must be one of {_HEADS}, got {head!r}")
@@ -85,6 +87,19 @@ def emit_affine_mlir_xdsl(
     wob = qmodel.w_out_storage_bits
     isb, iwob = IntegerType(sb), IntegerType(wob)
     qmin, qmax = -(1 << (sb - 1)), (1 << (sb - 1)) - 1
+    # Vectorized W_res matvec accumulator width (vlen>1). i8 W*h products are
+    # <= 2^14, so an i32 sum can't overflow for N up to ~131072 -> i32 (native
+    # vpmulld/vpaddd, 8 lanes, FAST). i16 multiplies in i32 (product <= 2^30,
+    # exact) and accumulates in i64; LLVM fuses this to vpmaddwd whose i32
+    # pair-sum stays exact iff |W_res_q| <= 32767 (then |W*h| <= 32767*32768 <
+    # 2^30, pair-sum < 2^31, even if the state saturates). The affine symmetric
+    # quant keeps W_res_q in [-32767, 32767]; guard it so the bit-exactness is
+    # provable, not just empirical, and fall back to scalar otherwise.
+    matvec_acc_bits = 32 if (sb == 8 and N <= (1 << 16)) else 64
+    matvec_vec_safe = sb == 8 or (
+        qmodel.W_res_q is not None
+        and int(np.asarray(qmodel.W_res_q).min()) >= -32767
+    )
     zp_u = cfg.u_pre.zero_point
     zp_state = cfg.state.zero_point
     zp_pre = cfg.pre.zero_point
@@ -96,6 +111,14 @@ def emit_affine_mlir_xdsl(
     )
     off_b, off_i = 0, (1 if inc_b else 0)
     off_s = off_i + (K if inc_i else 0)
+    # Readout W_out_state·h matvec vectorization (vlen>1). W_out is iwob, h is
+    # isb (mixed precision). i32 accumulate only when both are i8; else i64
+    # (i32-multiply -> i64-accumulate). vpmaddwd is safe when W_out is i8
+    # (products tiny) or |W_out_state_q| <= 32767.
+    ro_acc_bits = 32 if (wob == 8 and sb == 8) else 64
+    ro_vec_safe = wob == 8 or (
+        int(np.asarray(qmodel.W_out_q)[:, off_s : off_s + N].min()) >= -32767
+    )
     lut_kind = strat.kind
     lut_size = int(np.asarray(qmodel.lut_q).size)
     int_pre = qmodel.has_integer_preprocess
@@ -424,17 +447,28 @@ def emit_affine_mlir_xdsl(
                     accr = for_(rp0i, rp1i, c1, [z64], pbody)[0]
                 else:
                     iN = arith.MuliOp(i, cN).result
+                    if vlen > 1 and matvec_vec_safe:
+                        # Vectorise the i64 W_res matvec reduction. The i64 sum
+                        # is associative (no mid saturation/overflow), so this is
+                        # BIT-EXACT with the scalar order — quantized SIMD that
+                        # keeps host<->device equality. The non-associative
+                        # zp_cross/requantize below stay scalar (they are per-row,
+                        # after the reduction).
+                        accr = int_matvec_acc(
+                            Wres, iN, h, N, vlen, z64, isb, matvec_acc_bits
+                        )
+                    else:
 
-                    def jbody(j, args):
-                        (ar,) = args
-                        w = memref.LoadOp.get(
-                            Wres, [arith.AddiOp(iN, j).result]
-                        ).res
-                        hv = memref.LoadOp.get(h, [j]).res
-                        pr = arith.MuliOp(ext(w), ext(hv)).result
-                        return [arith.AddiOp(ar, pr).result]
+                        def jbody(j, args):
+                            (ar,) = args
+                            w = memref.LoadOp.get(
+                                Wres, [arith.AddiOp(iN, j).result]
+                            ).res
+                            hv = memref.LoadOp.get(h, [j]).res
+                            pr = arith.MuliOp(ext(w), ext(hv)).result
+                            return [arith.AddiOp(ar, pr).result]
 
-                    accr = for_(c0, cN, c1, [z64], jbody)[0]
+                        accr = for_(c0, cN, c1, [z64], jbody)[0]
                 accres = zp_cross(
                     accr, zp_state, memref.LoadOp.get(rsRes, [i]).res
                 )
@@ -551,19 +585,35 @@ def emit_affine_mlir_xdsl(
                 else:
                     yi = yb
                 cs = c_idx(off_s)
+                if vlen > 1 and ro_vec_safe:
+                    base_s = arith.AddiOp(mF, cs).result
+                    accos = int_matvec_acc(
+                        Wout,
+                        base_s,
+                        h,
+                        N,
+                        vlen,
+                        z64,
+                        iwob,
+                        ro_acc_bits,
+                        h_storage_ty=isb,
+                    )
+                else:
 
-                def jbody(j, args):
-                    (ao,) = args
-                    widx = arith.AddiOp(mF, arith.AddiOp(cs, j).result).result
-                    w = memref.LoadOp.get(Wout, [widx]).res
-                    hv = memref.LoadOp.get(h, [j]).res
-                    return [
-                        arith.AddiOp(
-                            ao, arith.MuliOp(ext(w), ext(hv)).result
+                    def jbody(j, args):
+                        (ao,) = args
+                        widx = arith.AddiOp(
+                            mF, arith.AddiOp(cs, j).result
                         ).result
-                    ]
+                        w = memref.LoadOp.get(Wout, [widx]).res
+                        hv = memref.LoadOp.get(h, [j]).res
+                        return [
+                            arith.AddiOp(
+                                ao, arith.MuliOp(ext(w), ext(hv)).result
+                            ).result
+                        ]
 
-                accos = for_(c0, cN, c1, [z64], jbody)[0]
+                    accos = for_(c0, cN, c1, [z64], jbody)[0]
                 cos = zp_cross(
                     accos, zp_state, memref.LoadOp.get(rsOS, [m]).res
                 )
@@ -610,7 +660,12 @@ def emit_affine_mlir_xdsl(
     main_fn.attributes["llvm.emit_c_interface"] = UnitAttr()
 
     mod = ModuleOp([*globals_, *funcs, main_fn])
-    mod.verify()
+    if vlen <= 1:
+        # xDSL 0.66's arith.extsi IRDL rejects vector operands (stricter than
+        # MLIR, which allows elementwise extsi on vectors). The vlen>1 path emits
+        # vector<vlen x i*> extsi, which is valid MLIR — verified downstream by
+        # mlir-opt — so skip the over-strict in-process verifier for it.
+        mod.verify()
     buf = io.StringIO()
     Printer(stream=buf).print_op(mod)
     return buf.getvalue() + "\n"

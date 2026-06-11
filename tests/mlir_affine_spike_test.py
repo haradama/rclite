@@ -111,7 +111,7 @@ def _logits_ref(qm, X_float):
     return out
 
 
-def _check(qm, Xt, label, head=None, sparse=None):
+def _check(qm, Xt, label, head=None, sparse=None, vlen=1):
     logits = _logits_ref(qm, Xt)
     if head == "classify":
         ref = np.argmax(logits, axis=1).astype(np.int64)
@@ -128,7 +128,9 @@ def _check(qm, Xt, label, head=None, sparse=None):
     else:
         ref = logits
     qx = qm.config.input.quantize_array(Xt)
-    got = mlir_jit.jit_affine(qm, head=head, sparse=sparse).predict_q(qx)
+    got = mlir_jit.jit_affine(
+        qm, head=head, sparse=sparse, vlen=vlen
+    ).predict_q(qx)
     got = got.astype(np.int64)
     d = int(np.max(np.abs(ref.reshape(got.shape) - got)))
     assert d == 0, f"{label}: MLIR vs executor max|diff|={d}"
@@ -251,6 +253,39 @@ def test_per_channel():
     print("  per-channel W_res/W_out/both bit-exact (dense/csr/head, i8/i16)")
 
 
+def test_vectorized_matvec_bit_exact():
+    """Quantized SIMD that stays bit-exact: vectorizing the dense W_res matvec
+    reduction (vlen=4, `vector` dialect) gives byte-identical integer output to
+    the scalar executor. The integer reduction is associative (no mid-loop
+    saturation; i8 accumulates in i32, i16 multiplies in i32 -> accumulates in
+    i64, LLVM fuses to vpmaddwd). Refutes 'quantized arithmetic can't be
+    vectorized' — the non-associative saturation/requantize stays scalar, per
+    row, after the reduction. Larger N stresses many SIMD pairs + the tail."""
+    if not HAVE:
+        print("  (skip)")
+        return
+    for sb in (8, 16):
+        for units in (64, 37, 256):  # 37 exercises the N % vlen scalar tail
+            rc, exe, X = _model(M=4, units=units, seed=units + sb)
+            qm = _qm(rc, exe, X, sb=sb)
+            _check(qm, X[240:262], f"i{sb} N={units}", vlen=4)
+            _check(
+                qm,
+                X[240:262],
+                f"i{sb} N={units} argmax",
+                head="classify",
+                vlen=4,
+            )
+        # large M (readout-heavy) stresses the W_out_state matvec vectorization
+        rc, exe, X = _model(M=32, units=48, seed=sb)
+        _check(
+            _qm(rc, exe, X, sb=sb), X[240:262], f"i{sb} M=32 readout", vlen=4
+        )
+    print(
+        "  vectorized W_res + readout matvec (vlen=4) bit-exact, i8/i16, M<=32"
+    )
+
+
 TESTS = [
     test_dense_logits_matrix,
     test_structured,
@@ -259,6 +294,7 @@ TESTS = [
     test_csr_sparse,
     test_heads,
     test_per_channel,
+    test_vectorized_matvec_bit_exact,
 ]
 
 

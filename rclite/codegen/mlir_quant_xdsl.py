@@ -31,11 +31,18 @@ import numpy as np
 from xdsl.builder import ImplicitBuilder
 from xdsl.ir import Region, Block, ParametrizedAttribute, TypeAttribute
 from xdsl.irdl import irdl_attr_definition
-from xdsl.dialects import arith, memref, func
-from xdsl.dialects.builtin import StringAttr, MemRefType
+from xdsl.dialects import arith, memref, func, vector
+from xdsl.dialects.builtin import (
+    StringAttr,
+    MemRefType,
+    VectorType,
+    DenseIntOrFPElementsAttr,
+)
 from xdsl.printer import Printer
 
-from .mlir_xdsl_common import _I32, _I64, _IDX, c_i, ext, call, for_
+from .mlir_xdsl_common import _I32, _I64, _IDX, c_i, c_idx, ext, call, for_
+
+_ADD_KIND = vector.CombiningKindAttr(vector.CombiningKindFlag.ADD)
 
 
 # ---------------------------------------------------------------------------
@@ -145,6 +152,97 @@ def emit_requantize_axis_func(
         shr = arith.ShRSIOp(biased, nn).result
         func.ReturnOp(arith.TruncIOp(shr, _I32).result)
     return func.FuncOp(name, ([_I32, _IDX], [_I32]), r, visibility="private")
+
+
+# ---------------------------------------------------------------------------
+# Vectorized integer matvec reduction — bit-exact with scalar
+# ---------------------------------------------------------------------------
+def int_matvec_acc(
+    Wmem, base, hmem, N, vlen, acc0, storage_ty, acc_bits=64, h_storage_ty=None
+):
+    """`acc0 + sum_{j<N} sext(Wmem[base+j]) * sext(hmem[j])` (i64 result).
+
+    `h_storage_ty` defaults to `storage_ty`; pass it when W and h differ (the
+    readout's mixed-precision W_out[iwob] * h[isb]).
+
+    `vlen > 1` accumulates the products in a `vector<vlen x i{acc_bits}>` and
+    collapses with `vector.reduction <add>` (plus an i64 scalar tail). The
+    integer sum has NO mid-loop saturation and (within the chosen width) cannot
+    overflow, so it is associative — the vectorised partial sums are *bit-exact*
+    with the scalar order. Quantized SIMD that preserves host<->device equality;
+    the non-associative saturation/requantize happens per-row, AFTER this.
+
+    The *multiply* is always done in i32 (native `vpmulld`): an i8/i16 product
+    is <= 2^30, so it fits i32 exactly — no emulated i64 vector multiply (which
+    is what made the naive i64 path slow on AVX2). `acc_bits` is the *accumulate*
+    width:
+      32 — only when the whole sum provably fits i32 (i8 W*h: |prod| <= 2^14, so
+           N*2^14 < 2^31 for N up to ~131072). Pure i32 (vpmulld + vpaddd, up to
+           8 lanes) — fastest.
+      64 — widen each (exact) i32 product to i64 and accumulate with native
+           vpaddq. Needed for i16 (an i32 *sum* would overflow), still all native
+           — much faster than the emulated-i64-multiply path.
+    Either way the integer value equals the scalar i64 reduction (no overflow in
+    the chosen widths), so the output is BIT-EXACT."""
+    if vlen <= 1:
+
+        def jb(j, args):
+            (a,) = args
+            w = memref.LoadOp.get(Wmem, [arith.AddiOp(base, j).result]).res
+            hv = memref.LoadOp.get(hmem, [j]).res
+            pr = arith.MuliOp(ext(w), ext(hv)).result
+            return [arith.AddiOp(a, pr).result]
+
+        return for_(c_idx(0), c_idx(N), c_idx(1), [acc0], jb)[0]
+
+    Nv = (N // vlen) * vlen
+    acc = acc0
+    acc_ty = _I32 if acc_bits == 32 else _I64
+    if Nv > 0:
+        wvt = VectorType(storage_ty, [vlen])
+        hvt = VectorType(h_storage_ty or storage_ty, [vlen])
+        i32vt = VectorType(_I32, [vlen])
+        acc_vt = VectorType(acc_ty, [vlen])
+        vz = arith.ConstantOp(
+            DenseIntOrFPElementsAttr.from_list(acc_vt, [0] * vlen)
+        ).result
+
+        def vbody(jb, args):
+            (va,) = args
+            wv = arith.ExtSIOp(
+                vector.LoadOp(
+                    Wmem, [arith.AddiOp(base, jb).result], wvt
+                ).result,
+                i32vt,
+            ).result
+            hv = arith.ExtSIOp(
+                vector.LoadOp(hmem, [jb], hvt).result, i32vt
+            ).result
+            # i32 multiply (native); an i8/i16 product fits i32 exactly.
+            prod = arith.MuliOp(wv, hv).result
+            if acc_bits != 32:
+                prod = arith.ExtSIOp(prod, acc_vt).result  # widen i32 -> i64
+            return [arith.AddiOp(va, prod).result]
+
+        vacc = for_(c_idx(0), c_idx(Nv), c_idx(vlen), [vz], vbody)[0]
+        red = vector.ReductionOp.build(
+            operands=[vacc, c_i(0, acc_ty)],
+            result_types=[acc_ty],
+            properties={"kind": _ADD_KIND},
+        ).results[0]
+        red64 = red if acc_bits == 64 else ext(red)
+        acc = arith.AddiOp(acc, red64).result
+    if Nv < N:
+
+        def tb(j, args):
+            (a,) = args
+            w = memref.LoadOp.get(Wmem, [arith.AddiOp(base, j).result]).res
+            hv = memref.LoadOp.get(hmem, [j]).res
+            pr = arith.MuliOp(ext(w), ext(hv)).result
+            return [arith.AddiOp(a, pr).result]
+
+        acc = for_(c_idx(Nv), c_idx(N), c_idx(1), [acc], tb)[0]
+    return acc
 
 
 # ---------------------------------------------------------------------------

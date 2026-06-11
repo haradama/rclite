@@ -1563,7 +1563,7 @@ class _IntLowerer:
 
 
 def emit_quantized_affine_module(
-    qmodel, *, passes=None, head=None
+    qmodel, *, passes=None, head=None, vlen=1
 ) -> ir.Module:
     """Build LLVM IR for the affine integer quantized path (i8 or i16).
 
@@ -1582,7 +1582,31 @@ def emit_quantized_affine_module(
         passes = []
     for p in passes:
         ir_module = p(ir_module)
-    return _AffineLowerer(ir_module).lower()
+    # Guard the i16 dense matvec vectorization: LLVM fuses it to vpmaddwd, whose
+    # i32 pair-sum stays exact iff |W_res_q| <= 32767 (then |W*h| <= 32767*32768
+    # < 2^30, pair-sum < 2^31). i8 accumulates in i32 and is always safe. Fall
+    # back to scalar when the (rare) i16 quant produces -32768.
+    eff_vlen = vlen
+    if (
+        vlen > 1
+        and qmodel.storage_bits == 16
+        and qmodel.W_res_q is not None
+        and int(np.asarray(qmodel.W_res_q).min()) < -32767
+    ):
+        eff_vlen = 1
+    # Readout W_out_state matvec is safe to vectorize when W_out is i8 (tiny
+    # products) or its state block stays in [-32767, 32767] (vpmaddwd guard).
+    ro_vec_safe = True
+    if vlen > 1 and qmodel.w_out_storage_bits == 16:
+        r = qmodel.rc.readout
+        off_s = (1 if r.include_bias else 0) + (
+            qmodel.K if r.include_input else 0
+        )
+        ws = np.asarray(qmodel.W_out_q)[:, off_s : off_s + qmodel.N]
+        ro_vec_safe = int(ws.min()) >= -32767
+    return _AffineLowerer(
+        ir_module, vlen=eff_vlen, ro_vec_safe=ro_vec_safe
+    ).lower()
 
 
 class _AffineLowerer:
@@ -1616,13 +1640,20 @@ class _AffineLowerer:
     Python and JIT agree bit-for-bit.
     """
 
-    def __init__(self, ir_module):
+    def __init__(self, ir_module, vlen: int = 1, ro_vec_safe: bool = True):
         self.ir_module = ir_module
         md = ir_module.metadata
         if md.get("quantization") != "affine":
             raise ValueError(
                 "_AffineLowerer expects metadata['quantization']='affine'"
             )
+        # vlen>1 vectorizes the dense W_res AND readout W_out_state matvec
+        # reductions. The integer reduction is associative (no mid-loop
+        # saturation), so the output is bit-exact with the scalar kernel —
+        # quantized SIMD. Default 1 leaves the emitted IR byte-identical (opt-in).
+        # `ro_vec_safe` gates the readout vectorization's i16 vpmaddwd guard.
+        self.vlen = vlen
+        self.ro_vec_safe = ro_vec_safe
         self._init_storage(md)
         self._init_quant_params(md)
         self.K, self.N, self.M = ir_module.K, ir_module.N, ir_module.M
@@ -2285,7 +2316,9 @@ class _AffineLowerer:
                     b.store(b.add(b.load(acc_res_var), prod), acc_res_var)
             elif spec is not None:  # CSR
                 self._emit_affine_res_csr(spec, acc_res_var, i)
-            else:  # dense
+            elif self.vlen > 1:  # dense, vectorized
+                self._emit_dense_res_vec(g_Wres, i, acc_res_var)
+            else:  # dense, scalar
                 with _loop(b, _ci(N), "jres") as j:
                     w = _load2d_global(b, g_Wres, N, i, j)
                     h = _load1d(b, self.h_buf, j)
@@ -2305,6 +2338,71 @@ class _AffineLowerer:
             return self._emit_requantize_i32_dynamic(acc_res_i32, m0_i, n_i)
         return self._emit_requantize_i32(
             acc_res_i32, self.M_res_M0, self.M_res_n
+        )
+
+    def _vec_reduce_add(self, vec, elem_ty, vlen):
+        """`llvm.vector.reduce.add` -> scalar. Integer add is associative, so the
+        lane reduction equals the linear scalar sum bit-for-bit."""
+        name = f"llvm.vector.reduce.add.v{vlen}i{elem_ty.width}"
+        fn = self.module.globals.get(name)
+        if fn is None:
+            fn = ir.Function(
+                self.module,
+                ir.FunctionType(elem_ty, [ir.VectorType(elem_ty, vlen)]),
+                name,
+            )
+        return self.b.call(fn, [vec])
+
+    def _emit_int_matvec_vec(
+        self, w_base, h_base, N, acc_var, acc_ty, w_sty, h_sty, tag
+    ):
+        """`acc_var += sum_j sext(W[base+j]) * sext(h[j])`, vectorized.
+
+        Multiplies in i32 (an i8/i16 product is <= 2^30, fits i32 exactly) and
+        accumulates in a `<vlen x acc_ty>` lane vector, collapsed with
+        `vector.reduce.add` plus a scalar tail. Bit-exact with the scalar loop
+        (the integer sum is associative). `w_base`/`h_base` are element pointers
+        (W and h may have different storage types — the readout's mixed-precision
+        W_out[iwob]*h[isb]); loads are element-aligned. On i16, LLVM fuses the i32
+        widening-multiply into `vpmaddwd`."""
+        b, vlen = self.b, self.vlen
+        Nv = (N // vlen) * vlen
+        wvt, hvt = ir.VectorType(w_sty, vlen), ir.VectorType(h_sty, vlen)
+        i32vt, accvt = ir.VectorType(_I32, vlen), ir.VectorType(acc_ty, vlen)
+        if Nv > 0:
+            vacc = b.alloca(accvt, name="vacc")
+            b.store(ir.Constant(accvt, None), vacc)
+            with _loop_strided(b, _ci(0), _ci(Nv), _ci(vlen), "v" + tag) as j:
+                wp = b.bitcast(b.gep(w_base, [j]), wvt.as_pointer())
+                hp = b.bitcast(b.gep(h_base, [j]), hvt.as_pointer())
+                wv = b.load(wp, align=w_sty.width // 8)
+                hv = b.load(hp, align=h_sty.width // 8)
+                prod = b.mul(b.sext(wv, i32vt), b.sext(hv, i32vt))
+                if acc_ty != _I32:
+                    prod = b.sext(prod, accvt)
+                b.store(b.add(b.load(vacc), prod), vacc)
+            red = self._vec_reduce_add(b.load(vacc), acc_ty, vlen)
+            b.store(b.add(b.load(acc_var), red), acc_var)
+        if Nv < N:
+            with _loop_strided(b, _ci(Nv), _ci(N), _ci(1), "t" + tag) as j:
+                w = b.load(b.gep(w_base, [j]))
+                h = b.load(b.gep(h_base, [j]))
+                prod = b.mul(b.sext(w, acc_ty), b.sext(h, acc_ty))
+                b.store(b.add(b.load(acc_var), prod), acc_var)
+
+    def _emit_dense_res_vec(self, g_Wres, i, acc_res_var):
+        """Vectorized dense W_res·h for row i (W and h are both the state
+        storage type). &W_res[i*N] is the row base pointer."""
+        w_base = self.b.gep(g_Wres, [_ci32(0), self.b.mul(i, _ci(self.N))])
+        self._emit_int_matvec_vec(
+            w_base,
+            self.h_buf,
+            self.N,
+            acc_res_var,
+            self.accum_ty,
+            self.storage_ty,
+            self.storage_ty,
+            "jres",
         )
 
     def _emit_affine_res_csr(self, spec, acc_res_var, i):
@@ -2580,20 +2678,56 @@ class _AffineLowerer:
                 )
                 self.b.store(self.b.add(self.b.load(y_var), rq_i), y_var)
 
-            acc_var = self.b.alloca(_I64, name="acc_state_ro")
-            self.b.store(self._ci64(0), acc_var)
-            with _loop(self.b, _ci(N), "jst_ro") as j:
-                col = self.b.add(_ci(off_state), j)
-                w = _load2d_global(self.b, g_Wout, F, m, col)
-                h = _load1d(self.b, self.h_buf, j)
-                prod = self.b.mul(self.b.sext(w, _I64), self.b.sext(h, _I64))
-                self.b.store(
-                    self.b.add(self.b.load(acc_var), prod),
-                    acc_var,
+            # State block matvec: vectorize when opt-in + safe. i8 W_out * i8
+            # state accumulates in i32 (fast); else i32-multiply -> i64-accum.
+            w_out_sty = g_Wout.value_type.element
+            use_vec = self.vlen > 1 and self.ro_vec_safe
+            ro_acc_ty = (
+                _I32
+                if (
+                    use_vec and w_out_sty.width == 8 and self.storage_bits == 8
                 )
+                else _I64
+            )
+            acc_var = self.b.alloca(ro_acc_ty, name="acc_state_ro")
+            self.b.store(ir.Constant(ro_acc_ty, 0), acc_var)
+            if use_vec:
+                w_base = self.b.gep(
+                    g_Wout,
+                    [
+                        _ci32(0),
+                        self.b.add(self.b.mul(m, _ci(F)), _ci(off_state)),
+                    ],
+                )
+                self._emit_int_matvec_vec(
+                    w_base,
+                    self.h_buf,
+                    N,
+                    acc_var,
+                    ro_acc_ty,
+                    w_out_sty,
+                    self.storage_ty,
+                    "jst_ro",
+                )
+            else:
+                with _loop(self.b, _ci(N), "jst_ro") as j:
+                    col = self.b.add(_ci(off_state), j)
+                    w = _load2d_global(self.b, g_Wout, F, m, col)
+                    h = _load1d(self.b, self.h_buf, j)
+                    prod = self.b.mul(
+                        self.b.sext(w, _I64), self.b.sext(h, _I64)
+                    )
+                    self.b.store(
+                        self.b.add(self.b.load(acc_var), prod), acc_var
+                    )
+            acc_state_i64 = (
+                self.b.load(acc_var)
+                if ro_acc_ty == _I64
+                else self.b.sext(self.b.load(acc_var), _I64)
+            )
             rs = self.b.sext(_load1d_global(self.b, g_rs_state, m), _I64)
             adj = self.b.sub(
-                self.b.load(acc_var),
+                acc_state_i64,
                 self.b.mul(self._ci64(self.zp_state), rs),
             )
             rq_s = self._rq_out(
@@ -2624,7 +2758,9 @@ class CompiledAffineRC:
 
     name = "llvm-affine"
 
-    def __init__(self, qmodel, opt_level: int = 3, passes=None, head=None):
+    def __init__(
+        self, qmodel, opt_level: int = 3, passes=None, head=None, vlen=1
+    ):
         _ensure_initialized()
         self.qmodel = qmodel
         self.rc = qmodel.rc
@@ -2635,6 +2771,7 @@ class CompiledAffineRC:
                 qmodel,
                 passes=passes,
                 head=head,
+                vlen=vlen,
             )
         )
         self._mod = llvm.parse_assembly(self._ir_text)
