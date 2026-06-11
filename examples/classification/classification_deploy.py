@@ -14,6 +14,7 @@ End-to-end Phase 3 classification path:
 Also exports a `head="proba"` bundle (softmax via exp LUT) emitting
 Q-format class probabilities. Requires gcc on PATH; no MCU toolchain.
 """
+
 from __future__ import annotations
 import pathlib
 import shutil
@@ -26,8 +27,14 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 import numpy as np
 
 from rclite import (
-    InputNode, ReservoirNode, ReadoutNode, ReservoirComputer,
-    Activation, Topology, Trainer, Task,
+    InputNode,
+    ReservoirNode,
+    ReadoutNode,
+    ReservoirComputer,
+    Activation,
+    Topology,
+    Trainer,
+    Task,
 )
 from rclite.runtime import RCExecutor
 from rclite.quant import calibrate_from_data, quantize_model_affine
@@ -45,9 +52,9 @@ def make_dataset(n=1500, seed=0):
     for t in range(1, n):
         u[t] = 0.92 * u[t - 1] + 0.08 * rng.standard_normal()
     X = u[:, None]
-    y = np.ones(n, dtype=int)        # mid
-    y[u > 0.25] = 2                  # high
-    y[u < -0.25] = 0                 # low
+    y = np.ones(n, dtype=int)  # mid
+    y[u > 0.25] = 2  # high
+    y[u < -0.25] = 0  # low
     return X, y
 
 
@@ -56,13 +63,22 @@ def build_and_train():
     rc = ReservoirComputer(
         input=InputNode(units=1, activation=Activation.IDENTITY, name="in"),
         reservoir=ReservoirNode(
-            units=60, activation=Activation.TANH, spectral_radius=0.9,
-            leak_rate=0.3, density=0.2, topology=Topology.RANDOM, seed=7,
+            units=60,
+            activation=Activation.TANH,
+            spectral_radius=0.9,
+            leak_rate=0.3,
+            density=0.2,
+            topology=Topology.RANDOM,
+            seed=7,
             name="res",
         ),
         readout=ReadoutNode(
-            units=3, activation=Activation.IDENTITY, trainer=Trainer.RIDGE,
-            regularization=1e-3, washout=100, task=Task.CLASSIFICATION,
+            units=3,
+            activation=Activation.IDENTITY,
+            trainer=Trainer.RIDGE,
+            regularization=1e-3,
+            washout=100,
+            task=Task.CLASSIFICATION,
             name="out",
         ),
     )
@@ -75,24 +91,39 @@ def build_and_train():
 def compile_and_run_c(bundle_dir, qx_flat, T, out_ctype, n_out):
     """Compile rc_kernel.c + a tiny main against rc_model.h and run it."""
     body = ", ".join(str(int(v)) for v in qx_flat)
-    main = "\n".join([
-        "#include <stdint.h>", "#include <stdio.h>", '#include "rc_model.h"',
-        "int main(void){",
-        f"  rc_storage_t X[{len(qx_flat)}] = {{ {body} }};",
-        f"  {out_ctype} Y[{n_out}];",
-        f"  rc_predict({T}, X, Y);",
-        f"  for (int i=0;i<{n_out};i++) printf(\"%d\\n\", (int)Y[i]);",
-        "  return 0; }",
-    ])
+    main = "\n".join(
+        [
+            "#include <stdint.h>",
+            "#include <stdio.h>",
+            '#include "rc_model.h"',
+            "int main(void){",
+            f"  rc_storage_t X[{len(qx_flat)}] = {{ {body} }};",
+            f"  {out_ctype} Y[{n_out}];",
+            f"  rc_predict({T}, X, Y);",
+            f'  for (int i=0;i<{n_out};i++) printf("%d\\n", (int)Y[i]);',
+            "  return 0; }",
+        ]
+    )
     (bundle_dir / "main.c").write_text(main)
     subprocess.run(
-        ["gcc", "-O2", "-std=c99", "-I", str(bundle_dir),
-         "-o", str(bundle_dir / "a.out"),
-         str(bundle_dir / "main.c"), str(bundle_dir / "rc_kernel.c")],
-        check=True, capture_output=True, text=True,
+        [
+            "gcc",
+            "-O2",
+            "-std=c99",
+            "-I",
+            str(bundle_dir),
+            "-o",
+            str(bundle_dir / "a.out"),
+            str(bundle_dir / "main.c"),
+            str(bundle_dir / "rc_kernel.c"),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
     )
-    out = subprocess.run([str(bundle_dir / "a.out")], capture_output=True,
-                         text=True).stdout
+    out = subprocess.run(
+        [str(bundle_dir / "a.out")], capture_output=True, text=True
+    ).stdout
     return np.array([int(v) for v in out.strip().split("\n")], dtype=np.int64)
 
 
@@ -103,8 +134,10 @@ def main() -> None:
     rc, exe, X, y, n_tr = build_and_train()
     Xte, yte = X[n_tr:], y[n_tr:]
     float_acc = float(np.mean(exe.predict_classes(Xte) == yte))
-    print(f"[1/4] trained 3-class per-step classifier "
-          f"(N={rc.reservoir.units}); float test acc = {float_acc:.3f}")
+    print(
+        f"[1/4] trained 3-class per-step classifier "
+        f"(N={rc.reservoir.units}); float test acc = {float_acc:.3f}"
+    )
 
     cfg = calibrate_from_data(rc, exe, X[:n_tr], storage_bits=8)
     qm = quantize_model_affine(rc, exe, cfg)
@@ -116,33 +149,45 @@ def main() -> None:
     # --- classify bundle: int32 class id per step ---
     jit_cls = CompiledAffineRC(qm, head="classify").predict(Xte)
     with tempfile.TemporaryDirectory() as td:
-        out = export_bundle(qm, pathlib.Path(td) / "clf", name="rc_clf",
-                            head="classify")
+        out = export_bundle(
+            qm, pathlib.Path(td) / "clf", name="rc_clf", head="classify"
+        )
         files = sorted(p.name for p in out.iterdir() if p.is_file())
         kernel_bytes = (out / "rc_kernel.c").stat().st_size
         c_cls = compile_and_run_c(out, qx, T, "int32_t", T)
     c_acc = float(np.mean(c_cls == yte))
     print(f"[3/4] export_bundle(head='classify') → {files}")
     print(f"      rc_kernel.c = {kernel_bytes} bytes")
-    print(f"      C kernel test acc = {c_acc:.3f}  "
-          f"(C == LLVM: {np.array_equal(c_cls, jit_cls)})")
+    print(
+        f"      C kernel test acc = {c_acc:.3f}  "
+        f"(C == LLVM: {np.array_equal(c_cls, jit_cls)})"
+    )
 
     # --- proba bundle: Q-format probabilities per step ---
     pf = min(qm.storage_bits - 1, 15)
-    storage_ctype = {8: "int8_t", 16: "int16_t", 32: "int32_t"}[qm.storage_bits]
+    storage_ctype = {8: "int8_t", 16: "int16_t", 32: "int32_t"}[
+        qm.storage_bits
+    ]
     jit_p = CompiledAffineRC(qm, head="proba").predict(Xte)
     with tempfile.TemporaryDirectory() as td:
-        out = export_bundle(qm, pathlib.Path(td) / "prob", name="rc_prob",
-                            head="proba")
+        out = export_bundle(
+            qm, pathlib.Path(td) / "prob", name="rc_prob", head="proba"
+        )
         c_p = compile_and_run_c(out, qx, T, storage_ctype, T * M).reshape(T, M)
     c_p = c_p.astype(np.float64) / (1 << pf)
-    agree = np.array_equal((jit_p * (1 << pf)).round().astype(int),
-                           (c_p * (1 << pf)).round().astype(int))
+    agree = np.array_equal(
+        (jit_p * (1 << pf)).round().astype(int),
+        (c_p * (1 << pf)).round().astype(int),
+    )
     print(f"[4/4] export_bundle(head='proba') → softmax probabilities (Q{pf})")
-    print(f"      C == LLVM: {agree}; example row: "
-          f"{dict(zip(CLASS_NAMES, np.round(c_p[0], 3)))}")
-    print("\n[ok] the generated rc_predict() emits class ids / probabilities "
-          "on-device with no float or libm in the loop.")
+    print(
+        f"      C == LLVM: {agree}; example row: "
+        f"{dict(zip(CLASS_NAMES, np.round(c_p[0], 3)))}"
+    )
+    print(
+        "\n[ok] the generated rc_predict() emits class ids / probabilities "
+        "on-device with no float or libm in the loop."
+    )
 
 
 if __name__ == "__main__":

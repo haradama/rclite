@@ -23,6 +23,7 @@ Run from the repo root:
 The C-export stage is skipped automatically when `gcc` is not on PATH.
 Artifacts (when gcc is present) land in ./build/ next to this file.
 """
+
 from __future__ import annotations
 import pathlib
 import shutil
@@ -35,13 +36,22 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 import numpy as np
 
 from rclite import (
-    InputNode, ReservoirNode, ReadoutNode, ReservoirComputer,
-    Distribution, Topology, Trainer,
+    InputNode,
+    ReservoirNode,
+    ReadoutNode,
+    ReservoirComputer,
+    Distribution,
+    Topology,
+    Trainer,
 )
 from rclite.runtime import RCExecutor
 from rclite.codegen import compile_rc
 from rclite.quant import (
-    QuantConfig, TanhLUTSpec, I16FixedPoint, quantize_model, QuantizedExecutor,
+    QuantConfig,
+    TanhLUTSpec,
+    I16FixedPoint,
+    quantize_model,
+    QuantizedExecutor,
 )
 from rclite.export import export_bundle, emit_symmetric_kernel_c
 
@@ -65,13 +75,29 @@ def make_data(T: int, seed: int = 0):
 
 def build() -> ReservoirComputer:
     return ReservoirComputer(
-        input=InputNode(units=K, input_scaling=0.5,
-                        input_distribution=Distribution.BERNOULLI, name="in"),
-        reservoir=ReservoirNode(units=N, topology=Topology.SCR, chain_weight=0.9,
-                                leak_rate=0.3, seed=42, name="res"),
-        readout=ReadoutNode(units=M, trainer=Trainer.RIDGE, regularization=1e-6,
-                            washout=50, include_bias=True, include_input=True,
-                            name="out"),
+        input=InputNode(
+            units=K,
+            input_scaling=0.5,
+            input_distribution=Distribution.BERNOULLI,
+            name="in",
+        ),
+        reservoir=ReservoirNode(
+            units=N,
+            topology=Topology.SCR,
+            chain_weight=0.9,
+            leak_rate=0.3,
+            seed=42,
+            name="res",
+        ),
+        readout=ReadoutNode(
+            units=M,
+            trainer=Trainer.RIDGE,
+            regularization=1e-6,
+            washout=50,
+            include_bias=True,
+            include_input=True,
+            name="out",
+        ),
     )
 
 
@@ -92,20 +118,25 @@ def _emit_mimo_c_main(ctype, q_x, T, K, M):
     T, never T*K or T*M.
     """
     body = ", ".join(str(int(v)) for v in q_x.reshape(-1))
-    return "\n".join([
-        "#include <stdint.h>", "#include <stdio.h>",
-        f"#define RC_T {T}", f"#define RC_K {K}", f"#define RC_M {M}",
-        f'extern void rc_predict(int32_t, const {ctype}*, {ctype}*);',
-        f"static const {ctype} X[RC_T * RC_K] = {{ {body} }};",
-        f"static {ctype} Y[RC_T * RC_M];",
-        "int main(void){",
-        "  rc_predict(RC_T, X, Y);",
-        "  for (int t = 0; t < RC_T; t++) {",
-        "    for (int m = 0; m < RC_M; m++)",
-        "      printf(\"%d\\n\", (int)Y[t * RC_M + m]);",
-        "  }",
-        "  return 0; }",
-    ])
+    return "\n".join(
+        [
+            "#include <stdint.h>",
+            "#include <stdio.h>",
+            f"#define RC_T {T}",
+            f"#define RC_K {K}",
+            f"#define RC_M {M}",
+            f"extern void rc_predict(int32_t, const {ctype}*, {ctype}*);",
+            f"static const {ctype} X[RC_T * RC_K] = {{ {body} }};",
+            f"static {ctype} Y[RC_T * RC_M];",
+            "int main(void){",
+            "  rc_predict(RC_T, X, Y);",
+            "  for (int t = 0; t < RC_T; t++) {",
+            "    for (int m = 0; m < RC_M; m++)",
+            '      printf("%d\\n", (int)Y[t * RC_M + m]);',
+            "  }",
+            "  return 0; }",
+        ]
+    )
 
 
 def quantized_reference(qm, cfg, X):
@@ -139,22 +170,29 @@ def main() -> None:
     Y_np = exe.predict(Xte)
     nr = nrmse(Y_np, Yte, washout=50)
     print(f"\n[1] runtime predict shape = {Y_np.shape}")
-    print(f"    per-output NRMSE = "
-          + ", ".join(f"y{m}={nr[m]:.4f}" for m in range(M)))
+    print(
+        f"    per-output NRMSE = "
+        + ", ".join(f"y{m}={nr[m]:.4f}" for m in range(M))
+    )
 
     # 2. LLVM JIT codegen, bit-exact with runtime
     Y_jit = compile_rc(rc, exe).predict(Xte)
     jit_diff = float(np.max(np.abs(Y_jit - Y_np)))
-    print(f"\n[2] JIT predict shape = {Y_jit.shape}, "
-          f"max|JIT - runtime| = {jit_diff:.2e}")
+    print(
+        f"\n[2] JIT predict shape = {Y_jit.shape}, "
+        f"max|JIT - runtime| = {jit_diff:.2e}"
+    )
 
     # 3. quantize (symmetric i16) + export C, compile with gcc, bit-exact
     cfg = QuantConfig(state_frac=10, input_frac=8, weight_frac=8)
-    qm = quantize_model(rc, exe, cfg, target=I16FixedPoint(),
-                        lut=TanhLUTSpec(n=256))
+    qm = quantize_model(
+        rc, exe, cfg, target=I16FixedPoint(), lut=TanhLUTSpec(n=256)
+    )
     qx, qy_ref = quantized_reference(qm, cfg, Xte)
-    print(f"\n[3] quantized i16: qm.K={qm.K}, qm.M={qm.M}, "
-          f"q_y shape = {qy_ref.shape}")
+    print(
+        f"\n[3] quantized i16: qm.K={qm.K}, qm.M={qm.M}, "
+        f"q_y shape = {qy_ref.shape}"
+    )
 
     if shutil.which("gcc") is None:
         print("    (skipping C export: gcc not on PATH)")
@@ -163,36 +201,54 @@ def main() -> None:
     build_dir = HERE / "build"
     build_dir.mkdir(parents=True, exist_ok=True)
     export_bundle(qm, build_dir, name="mimo_rc")
-    print(f"    export_bundle -> {build_dir.relative_to(REPO)}/ "
-          "(rc_kernel.c, mimo_rc.h, Cargo crate)")
+    print(
+        f"    export_bundle -> {build_dir.relative_to(REPO)}/ "
+        "(rc_kernel.c, mimo_rc.h, Cargo crate)"
+    )
 
     with tempfile.TemporaryDirectory() as td:
         td = pathlib.Path(td)
         (td / "kernel.c").write_text(emit_symmetric_kernel_c(qm))
         (td / "main.c").write_text(
-            _emit_mimo_c_main("int16_t", qx, Xte.shape[0], qm.K, qm.M))
+            _emit_mimo_c_main("int16_t", qx, Xte.shape[0], qm.K, qm.M)
+        )
         r = subprocess.run(
-            ["gcc", "-O2", "-std=c99", "-o", str(td / "a.out"),
-             str(td / "main.c"), str(td / "kernel.c")],
-            capture_output=True, text=True)
+            [
+                "gcc",
+                "-O2",
+                "-std=c99",
+                "-o",
+                str(td / "a.out"),
+                str(td / "main.c"),
+                str(td / "kernel.c"),
+            ],
+            capture_output=True,
+            text=True,
+        )
         if r.returncode != 0:
             sys.exit("gcc failed:\n" + r.stderr)
-        out = subprocess.run([str(td / "a.out")], capture_output=True,
-                             text=True, check=True).stdout
-    qy_c = np.array([int(v) for v in out.strip().split("\n")],
-                    dtype=np.int64).reshape(Xte.shape[0], M)
+        out = subprocess.run(
+            [str(td / "a.out")], capture_output=True, text=True, check=True
+        ).stdout
+    qy_c = np.array(
+        [int(v) for v in out.strip().split("\n")], dtype=np.int64
+    ).reshape(Xte.shape[0], M)
     c_diff = int(np.max(np.abs(qy_c - qy_ref)))
-    print(f"    C kernel q_y shape = {qy_c.shape}, "
-          f"max|C - quant executor| = {c_diff}  "
-          f"({'bit-exact' if c_diff == 0 else 'MISMATCH'})")
+    print(
+        f"    C kernel q_y shape = {qy_c.shape}, "
+        f"max|C - quant executor| = {c_diff}  "
+        f"({'bit-exact' if c_diff == 0 else 'MISMATCH'})"
+    )
 
     # First few decoded steps, both output channels.
     scale = 1 << cfg.state_frac
     print("\n      t |        y0 (C / ref)        |        y1 (C / ref)")
     print("    ----+----------------------------+---------------------------")
     for t in range(5):
-        print(f"    {t:3d} | {qy_c[t,0]/scale:9.5f} / {qy_ref[t,0]/scale:9.5f}"
-              f"      | {qy_c[t,1]/scale:9.5f} / {qy_ref[t,1]/scale:9.5f}")
+        print(
+            f"    {t:3d} | {qy_c[t, 0] / scale:9.5f} / {qy_ref[t, 0] / scale:9.5f}"
+            f"      | {qy_c[t, 1] / scale:9.5f} / {qy_ref[t, 1] / scale:9.5f}"
+        )
 
 
 if __name__ == "__main__":

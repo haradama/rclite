@@ -10,6 +10,7 @@ Pipeline:
 
 Artifacts land in ./build/ relative to this file.
 """
+
 from __future__ import annotations
 import pathlib
 import shutil
@@ -22,8 +23,13 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 import numpy as np
 
 from rclite import (
-    InputNode, ReservoirNode, ReadoutNode, ReservoirComputer,
-    Activation, Topology, Trainer,
+    InputNode,
+    ReservoirNode,
+    ReadoutNode,
+    ReservoirComputer,
+    Activation,
+    Topology,
+    Trainer,
 )
 from rclite.runtime import RCExecutor
 from rclite.targets import HostTarget
@@ -42,19 +48,32 @@ def train_esn() -> tuple[ReservoirComputer, RCExecutor, np.ndarray]:
     input_offset = float(X[:n_train].mean())
 
     rc = ReservoirComputer(
-        input=InputNode(units=1, input_scaling=1.0,
-                        input_offset=input_offset, name="in"),
-        reservoir=ReservoirNode(units=200, activation=Activation.TANH,
-                                 topology=Topology.SCR, chain_weight=0.9,
-                                 leak_rate=0.3, seed=42, name="res"),
-        readout=ReadoutNode(units=1, activation=Activation.IDENTITY,
-                             trainer=Trainer.RIDGE, regularization=1e-6,
-                             washout=200, include_bias=True, include_input=True,
-                             name="out"),
+        input=InputNode(
+            units=1, input_scaling=1.0, input_offset=input_offset, name="in"
+        ),
+        reservoir=ReservoirNode(
+            units=200,
+            activation=Activation.TANH,
+            topology=Topology.SCR,
+            chain_weight=0.9,
+            leak_rate=0.3,
+            seed=42,
+            name="res",
+        ),
+        readout=ReadoutNode(
+            units=1,
+            activation=Activation.IDENTITY,
+            trainer=Trainer.RIDGE,
+            regularization=1e-6,
+            washout=200,
+            include_bias=True,
+            include_input=True,
+            name="out",
+        ),
     )
     exe = RCExecutor(rc)
     exe.fit(X[:n_train], Y[:n_train])
-    return rc, exe, X[n_train:n_train + 10]
+    return rc, exe, X[n_train : n_train + 10]
 
 
 def main() -> None:
@@ -73,13 +92,20 @@ def main() -> None:
 
     Y_ref = artifact.metadata["jit"].predict(sample_X)
 
-    print(f"[1/4] emit shared library      -> {lib_path.relative_to(HERE.parents[1])}")
-    print(f"[2/4] emit C header            -> {hdr_path.relative_to(HERE.parents[1])}")
+    print(
+        f"[1/4] emit shared library      -> {lib_path.relative_to(HERE.parents[1])}"
+    )
+    print(
+        f"[2/4] emit C header            -> {hdr_path.relative_to(HERE.parents[1])}"
+    )
 
-    print(f"[3/4] write sample C program   -> {src_path.relative_to(HERE.parents[1])}")
+    print(
+        f"[3/4] write sample C program   -> {src_path.relative_to(HERE.parents[1])}"
+    )
     flat = sample_X.ravel()
     x_literals = ",\n        ".join(f"{v:.17g}" for v in flat)
-    src_path.write_text(textwrap.dedent(f"""\
+    src_path.write_text(
+        textwrap.dedent(f"""\
         /* Minimal demo for the compiled ReservoirComputer.
          * Build:
          *   gcc -O2 -o rc_demo rc_demo.c -L. -lrc -Wl,-rpath,'$ORIGIN' -lm
@@ -105,13 +131,24 @@ def main() -> None:
             }}
             return 0;
         }}
-        """))
+        """)
+    )
 
-    print(f"[4/4] gcc compile + link       -> {exe_path.relative_to(HERE.parents[1])}")
+    print(
+        f"[4/4] gcc compile + link       -> {exe_path.relative_to(HERE.parents[1])}"
+    )
     cmd = [
-        "gcc", "-O2", "-Wall", "-o", str(exe_path), str(src_path),
-        "-L", str(BUILD), "-lrc",
-        f"-Wl,-rpath,{BUILD}", "-lm",
+        "gcc",
+        "-O2",
+        "-Wall",
+        "-o",
+        str(exe_path),
+        str(src_path),
+        "-L",
+        str(BUILD),
+        "-lrc",
+        f"-Wl,-rpath,{BUILD}",
+        "-lm",
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
@@ -121,9 +158,12 @@ def main() -> None:
     for t in range(len(sample_X)):
         print(f"   t={t:2d}  x={sample_X[t, 0]:10.5f}  y={Y_ref[t, 0]:12.6f}")
 
-    print(f"\n--- C demo output (./{exe_path.relative_to(HERE.parents[1])}) ---")
-    out = subprocess.run([str(exe_path)], capture_output=True, text=True,
-                          check=True)
+    print(
+        f"\n--- C demo output (./{exe_path.relative_to(HERE.parents[1])}) ---"
+    )
+    out = subprocess.run(
+        [str(exe_path)], capture_output=True, text=True, check=True
+    )
     print(out.stdout)
 
 

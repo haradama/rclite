@@ -64,8 +64,8 @@ description = "Run host benchmarks inside the nix devShell"
 run = "nix --extra-experimental-features 'nix-command flakes' develop -c uv run python benchmarks/compare_host_full.py"
 
 # --- Pre-commit: fast, staged-files-only quality gate ---------------------
-# Checks ONLY the Python files staged for this commit (the repo isn't fully
-# ruff-formatted yet, so a whole-repo check would block every commit). Runs
+# Checks ONLY the Python files staged for this commit so the local hook stays
+# fast; the CI `lint` job enforces the same checks whole-repo. Runs
 # ruff format --check + unused-import/redefinition lint. `uvx` fetches ruff
 # ephemerally — no project dependency. Fix failures with `mise run fmt`.
 [tasks.pre-commit]

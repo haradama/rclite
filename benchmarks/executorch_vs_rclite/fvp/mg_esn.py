@@ -4,6 +4,7 @@
 Reads the float ESN params exported by
 benchmarks/tflm_vs_rclite/export_esn_params.py.
 """
+
 import pathlib
 import sys
 
@@ -24,8 +25,12 @@ class ESNCell(nn.Module):
         leak = float(p["leak"])
         self.register_buffer("leak_v", torch.full((1, N), leak))
         self.register_buffer("oml_v", torch.full((1, N), 1.0 - leak))
-        self.register_buffer("off_v", torch.full((1, K), float(p["input_offset"])))
-        self.register_buffer("scal_v", torch.full((1, K), float(p["input_scaling"])))
+        self.register_buffer(
+            "off_v", torch.full((1, K), float(p["input_offset"]))
+        )
+        self.register_buffer(
+            "scal_v", torch.full((1, K), float(p["input_scaling"]))
+        )
         self.pre = nn.Linear(K + N, N)
         self.yout = nn.Linear(K + N, int(p["M"]))
         with torch.no_grad():
@@ -39,8 +44,11 @@ class ESNCell(nn.Module):
                 wy[:, :K] = p["W_out_input"]
             wy[:, K:] = p["W_out_state"]
             self.yout.weight.copy_(torch.tensor(wy))
-            yb = (p["W_out_bias"].reshape(-1) if p["W_out_bias"].size
-                  else np.zeros(int(p["M"]), np.float32))
+            yb = (
+                p["W_out_bias"].reshape(-1)
+                if p["W_out_bias"].size
+                else np.zeros(int(p["M"]), np.float32)
+            )
             self.yout.bias.copy_(torch.tensor(yb.astype(np.float32)))
 
     def forward(self, x, h_prev):

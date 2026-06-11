@@ -10,6 +10,7 @@ firmware/rclite_<v>/ with:
 Run with the rclite venv:
     .venv/bin/python benchmarks/tflm_vs_rclite/gen_rclite_fw.py
 """
+
 from __future__ import annotations
 import pathlib
 import sys
@@ -24,15 +25,17 @@ from eval_rclite import build_rc  # noqa: E402
 
 from rclite.runtime import RCExecutor  # noqa: E402
 from rclite.quant import (  # noqa: E402
-    search_quantization_affine, AffineQuantizedExecutor, LUTStrategy,
+    search_quantization_affine,
+    AffineQuantizedExecutor,
+    LUTStrategy,
 )
 from rclite.targets.arduino import emit_affine_kernel_c  # noqa: E402
 
 HERE = pathlib.Path(__file__).resolve().parent
 FW = HERE / "firmware"
 
-T_FW = 200          # firmware test-sequence length
-START = common.TRAIN_END   # start the test sequence in the held-out region
+T_FW = 200  # firmware test-sequence length
+START = common.TRAIN_END  # start the test sequence in the held-out region
 
 
 def _c_type(bits: int) -> str:
@@ -50,7 +53,7 @@ def emit_variant(name: str, qm):
 
     s = common.series().astype(np.float64)
     X = s[:-1, None]
-    x_seq = X[START:START + T_FW]
+    x_seq = X[START : START + T_FW]
     Xq = cfg.input.quantize_array(x_seq).astype(np_t)
 
     qexe = AffineQuantizedExecutor(qm)
@@ -63,20 +66,24 @@ def emit_variant(name: str, qm):
         Yref[t] = qexe.predict_one_q(x_raw_q, qexe.state_q).astype(np_t)
 
     ct = _c_type(sb)
-    h = "\n".join([
-        "#ifndef RC_DATA_H_",
-        "#define RC_DATA_H_",
-        f"typedef {ct} rc_fw_storage_t;",
-        f"#define RC_FW_T {T_FW}",
-        f"#define RC_FW_K {qm.K}",
-        f"#define RC_FW_M {qm.M}",
-        f"static const rc_fw_storage_t g_x[{T_FW * qm.K}] = {{ "
-        + ",".join(str(int(v)) for v in Xq.ravel()) + " };",
-        f"static const rc_fw_storage_t g_y_ref[{T_FW * qm.M}] = {{ "
-        + ",".join(str(int(v)) for v in Yref.ravel()) + " };",
-        "#endif",
-        "",
-    ])
+    h = "\n".join(
+        [
+            "#ifndef RC_DATA_H_",
+            "#define RC_DATA_H_",
+            f"typedef {ct} rc_fw_storage_t;",
+            f"#define RC_FW_T {T_FW}",
+            f"#define RC_FW_K {qm.K}",
+            f"#define RC_FW_M {qm.M}",
+            f"static const rc_fw_storage_t g_x[{T_FW * qm.K}] = {{ "
+            + ",".join(str(int(v)) for v in Xq.ravel())
+            + " };",
+            f"static const rc_fw_storage_t g_y_ref[{T_FW * qm.M}] = {{ "
+            + ",".join(str(int(v)) for v in Yref.ravel())
+            + " };",
+            "#endif",
+            "",
+        ]
+    )
     (out / "rc_data.h").write_text(h)
     print(f"  wrote {out}/rc_kernel.c + rc_data.h  (storage=i{sb}, T={T_FW})")
 
@@ -92,14 +99,30 @@ def main() -> int:
 
     print("QAT i8 ...")
     r8 = search_quantization_affine(
-        rc, exe, X[:n_fit], Y[:n_fit], X[:n_fit], Y[:n_fit],
-        storage_bits=8, lut_strategy=LUTStrategy.linear_interp(64), n_iterations=3)
+        rc,
+        exe,
+        X[:n_fit],
+        Y[:n_fit],
+        X[:n_fit],
+        Y[:n_fit],
+        storage_bits=8,
+        lut_strategy=LUTStrategy.linear_interp(64),
+        n_iterations=3,
+    )
     emit_variant("i8", r8.best_qmodel)
 
     print("QAT i16 ...")
     r16 = search_quantization_affine(
-        rc, exe, X[:n_fit], Y[:n_fit], X[:n_fit], Y[:n_fit],
-        storage_bits=16, lut_strategy=LUTStrategy.linear_interp(64), n_iterations=3)
+        rc,
+        exe,
+        X[:n_fit],
+        Y[:n_fit],
+        X[:n_fit],
+        Y[:n_fit],
+        storage_bits=16,
+        lut_strategy=LUTStrategy.linear_interp(64),
+        n_iterations=3,
+    )
     emit_variant("i16", r16.best_qmodel)
     return 0
 

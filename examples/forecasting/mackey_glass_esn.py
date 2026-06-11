@@ -6,6 +6,7 @@ Mirrors the SysML v2 example `Examples::MackeyGlassESN`, augmented with:
   - direct input pass-through via ReadoutNode.include_input
   - one-step and free-running (autoregressive) evaluation
 """
+
 from __future__ import annotations
 import sys
 import pathlib
@@ -27,19 +28,26 @@ from rclite import (
 from rclite.runtime import RCExecutor
 
 
-def mackey_glass(n: int = 3000, tau: int = 17, beta: float = 0.2,
-                 gamma: float = 0.1, n_init: int = 500) -> np.ndarray:
+def mackey_glass(
+    n: int = 3000,
+    tau: int = 17,
+    beta: float = 0.2,
+    gamma: float = 0.1,
+    n_init: int = 500,
+) -> np.ndarray:
     rng = np.random.default_rng(0)
     L = n + n_init
     x = np.zeros(L)
-    x[:tau + 1] = 1.2 + 0.05 * rng.standard_normal(tau + 1)
+    x[: tau + 1] = 1.2 + 0.05 * rng.standard_normal(tau + 1)
     for t in range(tau + 1, L):
         x_tau = x[t - tau]
-        x[t] = x[t - 1] + beta * x_tau / (1.0 + x_tau ** 10) - gamma * x[t - 1]
+        x[t] = x[t - 1] + beta * x_tau / (1.0 + x_tau**10) - gamma * x[t - 1]
     return x[n_init:]
 
 
-def build_esn(input_offset: float, input_scaling: float = 1.0) -> ReservoirComputer:
+def build_esn(
+    input_offset: float, input_scaling: float = 1.0
+) -> ReservoirComputer:
     """SysML2: part esn : ReservoirComputer { ... }"""
     return ReservoirComputer(
         input=InputNode(
@@ -95,8 +103,10 @@ def main() -> None:
     WellPosedReservoir(esn.reservoir).check()
     print(f"[ok] WellPosedReservoir satisfied")
     print(f"     input_offset = {input_offset:.4f} (train mean)")
-    print(f"     readout features: bias={esn.readout.include_bias}, "
-          f"input={esn.readout.include_input}, state(N={esn.reservoir.units})")
+    print(
+        f"     readout features: bias={esn.readout.include_bias}, "
+        f"input={esn.readout.include_input}, state(N={esn.reservoir.units})"
+    )
 
     exe = RCExecutor(esn)
     exe.fit(X_tr, Y_tr)
@@ -109,8 +119,8 @@ def main() -> None:
 
     seed_len = 200
     horizon = 200
-    seed = X[n_train - seed_len: n_train]
-    target = series[n_train: n_train + horizon][:, None]
+    seed = X[n_train - seed_len : n_train]
+    target = series[n_train : n_train + horizon][:, None]
     free = exe.free_run(seed, n_steps=horizon)
     fr_rmse = rmse(free, target)
     fr_nrmse = nrmse(free, target)

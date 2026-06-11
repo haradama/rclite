@@ -11,6 +11,7 @@ W_res is necessarily a dense 80x80 (SCR structure can't be expressed).
 Run with the TF venv (after export_esn_params.py):
     /tmp/tfenv/bin/python benchmarks/tflm_vs_rclite/train_tf_esn.py
 """
+
 from __future__ import annotations
 import json
 import os
@@ -27,7 +28,7 @@ import tensorflow as tf  # noqa: E402
 HERE = pathlib.Path(__file__).resolve().parent
 OUT = HERE / "out"
 FW = HERE / "firmware"
-T_FW = 200          # firmware test-sequence length
+T_FW = 200  # firmware test-sequence length
 
 
 def build_cell(p):
@@ -40,24 +41,26 @@ def build_cell(p):
     """
     N, K, M = int(p["N"]), int(p["K"]), int(p["M"])
     leak = float(p["leak"])
-    W_in, W_res = p["W_in"], p["W_res"]                  # (N,K), (N,N)
+    W_in, W_res = p["W_in"], p["W_res"]  # (N,K), (N,N)
     res_bias = float(p["res_bias"])
     W_out_input, W_out_state = p["W_out_input"], p["W_out_state"]
     W_out_bias = p["W_out_bias"]
     off, scaling = float(p["input_offset"]), float(p["input_scaling"])
 
-    x = tf.keras.Input(shape=(K,), name="x")            # raw input
+    x = tf.keras.Input(shape=(K,), name="x")  # raw input
     h_prev = tf.keras.Input(shape=(N,), name="h_prev")
     # u = (x - off) * scaling  == x*scaling + (-off*scaling)
     u = tf.keras.layers.Rescaling(scaling, offset=-off * scaling)(x)
-    z = tf.keras.layers.Concatenate()([u, h_prev])      # (K+N,)
+    z = tf.keras.layers.Concatenate()([u, h_prev])  # (K+N,)
     pre = tf.keras.layers.Dense(N, name="pre")(z)
     act = tf.keras.layers.Activation("tanh")(pre)
-    h_t = tf.keras.layers.Add(name="h")([
-        tf.keras.layers.Rescaling(1.0 - leak)(h_prev),
-        tf.keras.layers.Rescaling(leak)(act),
-    ])
-    z2 = tf.keras.layers.Concatenate()([x, h_t])        # RAW x for readout
+    h_t = tf.keras.layers.Add(name="h")(
+        [
+            tf.keras.layers.Rescaling(1.0 - leak)(h_prev),
+            tf.keras.layers.Rescaling(leak)(act),
+        ]
+    )
+    z2 = tf.keras.layers.Concatenate()([x, h_t])  # RAW x for readout
     y = tf.keras.layers.Dense(M, name="yout")(z2)
     model = tf.keras.Model([x, h_prev], [h_t, y])
 
@@ -65,15 +68,19 @@ def build_cell(p):
     pre_kernel = np.zeros((K + N, N), np.float32)
     pre_kernel[:K, :] = W_in.T
     pre_kernel[K:, :] = W_res.T
-    model.get_layer("pre").set_weights([pre_kernel,
-                                        np.full(N, res_bias, np.float32)])
+    model.get_layer("pre").set_weights(
+        [pre_kernel, np.full(N, res_bias, np.float32)]
+    )
     # yout kernel (K+N, M): rows 0..K-1 = W_out_input^T, rows K.. = W_out_state^T
     yk = np.zeros((K + N, M), np.float32)
     if W_out_input.shape[1] == K:
         yk[:K, :] = W_out_input.T
     yk[K:, :] = W_out_state.T
-    ybias = (W_out_bias.reshape(-1).astype(np.float32)
-             if W_out_bias.size else np.zeros(M, np.float32))
+    ybias = (
+        W_out_bias.reshape(-1).astype(np.float32)
+        if W_out_bias.size
+        else np.zeros(M, np.float32)
+    )
     model.get_layer("yout").set_weights([yk, ybias])
     return model, N, K, M
 
@@ -84,7 +91,7 @@ def run_float(model, X, N):
     h = np.zeros((1, N), np.float32)
     preds = []
     for t in range(T):
-        h, y = model([X[t:t + 1].astype(np.float32), h], training=False)
+        h, y = model([X[t : t + 1].astype(np.float32), h], training=False)
         h = h.numpy()
         preds.append(float(np.asarray(y).ravel()[0]))
     return np.array(preds)
@@ -95,7 +102,7 @@ def main() -> int:
     model, N, K, M = build_cell(p)
 
     s = common.series().astype(np.float32)
-    Xseq = s[:-1, None]                   # RAW input; the cell centers internally
+    Xseq = s[:-1, None]  # RAW input; the cell centers internally
     train_t, test_t = common.target_indices()
     n_fit = common.TRAIN_END
 
@@ -103,15 +110,17 @@ def main() -> int:
     h = np.zeros((1, N), np.float32)
     rep_x, rep_h = [], []
     for t in range(n_fit):
-        rep_x.append(Xseq[t:t + 1].copy())
+        rep_x.append(Xseq[t : t + 1].copy())
         rep_h.append(h.copy())
-        h, _ = model([Xseq[t:t + 1].astype(np.float32), h], training=False)
+        h, _ = model([Xseq[t : t + 1].astype(np.float32), h], training=False)
         h = h.numpy()
 
     def representative():
         for i in range(0, n_fit, 4):
-            yield {"x": rep_x[i].astype(np.float32),
-                   "h_prev": rep_h[i].astype(np.float32)}
+            yield {
+                "x": rep_x[i].astype(np.float32),
+                "h_prev": rep_h[i].astype(np.float32),
+            }
 
     # float accuracy (sanity)
     pred_f = run_float(model, Xseq, N)
@@ -129,8 +138,12 @@ def main() -> int:
     nrmse_q, pred_q, h0 = _run_tflite_loop(tflite, Xseq, N, test_t, s)
 
     # emit model C array + firmware test data (with the warmed-up start state)
-    _emit_c_array(tflite, OUT / "model_esn_data.cc", OUT / "model_esn_data.h",
-                  "g_esn_model")
+    _emit_c_array(
+        tflite,
+        OUT / "model_esn_data.cc",
+        OUT / "model_esn_data.h",
+        "g_esn_model",
+    )
     _emit_fw_testdata(tflite, Xseq, N, pred_q, h0)
 
     result = {
@@ -138,7 +151,9 @@ def main() -> int:
         "tflite_bytes": len(tflite),
         "nrmse_float_test": float(nrmse_f),
         "nrmse_int8_test": float(nrmse_q),
-        "N": N, "K": K, "M": M,
+        "N": N,
+        "K": K,
+        "M": M,
     }
     (OUT / "esn_tf_result.json").write_text(json.dumps(result, indent=2))
     print(json.dumps(result, indent=2))
@@ -148,14 +163,16 @@ def main() -> int:
 def _io(interp):
     ins = {d["name"].split(":")[0]: d for d in interp.get_input_details()}
     # name may be "serving_default_x:0" etc; fall back to shape (x is len-K)
-    xin = None; hin = None
+    xin = None
+    hin = None
     for d in interp.get_input_details():
         if d["shape"][-1] == 1:
             xin = d
         else:
             hin = d
     outs = interp.get_output_details()
-    yout = None; hout = None
+    yout = None
+    hout = None
     for d in outs:
         if d["shape"][-1] == 1:
             yout = d
@@ -170,7 +187,8 @@ def _run_tflite_loop(tflite, Xseq, N, test_t, s):
     # per-step kernel differences compound over the feedback loop.
     interp = tf.lite.Interpreter(
         model_content=tflite,
-        experimental_op_resolver_type=tf.lite.experimental.OpResolverType.BUILTIN_REF)
+        experimental_op_resolver_type=tf.lite.experimental.OpResolverType.BUILTIN_REF,
+    )
     interp.allocate_tensors()
     xin, hin, yout, hout = _io(interp)
     T = Xseq.shape[0]
@@ -179,8 +197,8 @@ def _run_tflite_loop(tflite, Xseq, N, test_t, s):
     h0 = None
     for t in range(T):
         if t == common.TRAIN_END:
-            h0 = h.copy().ravel()           # warmed-up state at the FW start
-        interp.set_tensor(xin["index"], Xseq[t:t + 1].astype(np.float32))
+            h0 = h.copy().ravel()  # warmed-up state at the FW start
+        interp.set_tensor(xin["index"], Xseq[t : t + 1].astype(np.float32))
         interp.set_tensor(hin["index"], h.astype(np.float32))
         interp.invoke()
         h = interp.get_tensor(hout["index"]).astype(np.float32)
@@ -193,38 +211,45 @@ def _emit_fw_testdata(tflite, Xseq, N, pred_host, h0):
     host int8 reference y (scaled int) so the device replays from the same
     state and can be checked bit-for-bit."""
     start = common.TRAIN_END
-    xs = Xseq[start:start + T_FW, 0]
-    ys = pred_host[start:start + T_FW]
+    xs = Xseq[start : start + T_FW, 0]
+    ys = pred_host[start : start + T_FW]
     yscale = 10000
     yq = np.round(ys * yscale).astype(np.int32)
-    h = "\n".join([
-        "#ifndef ESN_TEST_DATA_H_",
-        "#define ESN_TEST_DATA_H_",
-        f"#define ESN_T {T_FW}",
-        f"#define ESN_N {N}",
-        f"#define ESN_YSCALE {yscale}",
-        "#ifdef __cplusplus",
-        'extern "C" {',
-        "#endif",
-        f"extern const float g_esn_x[{T_FW}];",
-        f"extern const float g_esn_h0[{N}];",
-        f"extern const int g_esn_yref_scaled[{T_FW}];",
-        "#ifdef __cplusplus",
-        "}",
-        "#endif",
-        "#endif",
-        "",
-    ])
-    cc = "\n".join([
-        '#include "esn_test_data.h"',
-        f"const float g_esn_x[{T_FW}] = {{ "
-        + ",".join(f"{v:.7g}f" for v in xs) + " };",
-        f"const float g_esn_h0[{N}] = {{ "
-        + ",".join(f"{v:.9g}f" for v in h0) + " };",
-        f"const int g_esn_yref_scaled[{T_FW}] = {{ "
-        + ",".join(str(int(v)) for v in yq) + " };",
-        "",
-    ])
+    h = "\n".join(
+        [
+            "#ifndef ESN_TEST_DATA_H_",
+            "#define ESN_TEST_DATA_H_",
+            f"#define ESN_T {T_FW}",
+            f"#define ESN_N {N}",
+            f"#define ESN_YSCALE {yscale}",
+            "#ifdef __cplusplus",
+            'extern "C" {',
+            "#endif",
+            f"extern const float g_esn_x[{T_FW}];",
+            f"extern const float g_esn_h0[{N}];",
+            f"extern const int g_esn_yref_scaled[{T_FW}];",
+            "#ifdef __cplusplus",
+            "}",
+            "#endif",
+            "#endif",
+            "",
+        ]
+    )
+    cc = "\n".join(
+        [
+            '#include "esn_test_data.h"',
+            f"const float g_esn_x[{T_FW}] = {{ "
+            + ",".join(f"{v:.7g}f" for v in xs)
+            + " };",
+            f"const float g_esn_h0[{N}] = {{ "
+            + ",".join(f"{v:.9g}f" for v in h0)
+            + " };",
+            f"const int g_esn_yref_scaled[{T_FW}] = {{ "
+            + ",".join(str(int(v)) for v in yq)
+            + " };",
+            "",
+        ]
+    )
     (FW / "esn_test_data.h").write_text(h)
     (FW / "esn_test_data.cc").write_text(cc)
 
@@ -234,13 +259,15 @@ def _emit_c_array(data, cc_path, h_path, sym):
     cc_path.write_text(
         f'#include "{h_path.name}"\n'
         f"alignas(16) const unsigned char {sym}[] = {{\n{body}\n}};\n"
-        f"const unsigned int {sym}_len = {len(data)};\n")
+        f"const unsigned int {sym}_len = {len(data)};\n"
+    )
     h_path.write_text(
         "#ifndef ESN_MODEL_DATA_H_\n#define ESN_MODEL_DATA_H_\n"
         '#ifdef __cplusplus\nextern "C" {\n#endif\n'
         f"extern const unsigned char {sym}[];\n"
         f"extern const unsigned int {sym}_len;\n"
-        "#ifdef __cplusplus\n}\n#endif\n#endif\n")
+        "#ifdef __cplusplus\n}\n#endif\n#endif\n"
+    )
 
 
 if __name__ == "__main__":

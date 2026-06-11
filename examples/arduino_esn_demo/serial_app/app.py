@@ -11,6 +11,7 @@ Two modes (sidebar):
 Draw a curve (preset + sliders, or freehand with the mouse), watch it render,
 then classify it into one of: rising / falling / peak / valley / sine.
 """
+
 from __future__ import annotations
 import pathlib
 import sys
@@ -22,8 +23,11 @@ import streamlit as st
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import shape_serial as ss
 
-st.set_page_config(page_title="rclite • Arduino shape classifier",
-                   page_icon="〰️", layout="wide")
+st.set_page_config(
+    page_title="rclite • Arduino shape classifier",
+    page_icon="〰️",
+    layout="wide",
+)
 
 
 @st.cache_resource(show_spinner="Training + quantizing the shape model …")
@@ -37,14 +41,16 @@ model = get_model()
 # sidebar — connection + firmware
 # --------------------------------------------------------------------------
 st.sidebar.title("rclite shape classifier")
-st.sidebar.caption("Echo State Network · i8 reservoir + i16 readout · MEAN "
-                   "pooling · runs on an ATmega328P")
+st.sidebar.caption(
+    "Echo State Network · i8 reservoir + i16 readout · MEAN "
+    "pooling · runs on an ATmega328P"
+)
 
 mode = st.sidebar.radio(
     "Inference backend",
     ["Simulate (bit-exact device model)", "Serial device"],
     help="Simulate runs the same integer kernel in Python — identical output "
-         "to the chip. Serial sends the window to a real Arduino.",
+    "to the chip. Serial sends the window to a real Arduino.",
 )
 serial_mode = mode.startswith("Serial")
 
@@ -55,11 +61,15 @@ if serial_mode:
     port = cols[0].selectbox("Port", ports or ["(none found)"])
     if cols[1].button("↻", help="rescan ports"):
         st.rerun()
-    st.sidebar.caption(f"{ss.BAUD} baud · 8N1 · flash the firmware below first")
+    st.sidebar.caption(
+        f"{ss.BAUD} baud · 8N1 · flash the firmware below first"
+    )
 
 with st.sidebar.expander("⚙️ Build / flash firmware"):
-    st.write("Generate the serial-server sketch and compile it for "
-             "`arduino:avr:uno`.")
+    st.write(
+        "Generate the serial-server sketch and compile it for "
+        "`arduino:avr:uno`."
+    )
     out_dir = pathlib.Path("build/arduino_shape_serial")
     if st.button("Build firmware"):
         with st.spinner("arduino-cli compile …"):
@@ -68,11 +78,15 @@ with st.sidebar.expander("⚙️ Build / flash firmware"):
             fb, sram = info.get("flash_bytes"), info.get("sram_bytes")
             st.success(f"Built ✓  Flash {fb}/32768 · SRAM {sram}/2048")
         elif "log" in info:
-            st.error("Compile failed"); st.code(info["log"][-1500:])
+            st.error("Compile failed")
+            st.code(info["log"][-1500:])
         else:
             st.warning("arduino-cli not found — sketch written, not compiled.")
-        st.code(f"arduino-cli upload -p <PORT> --fqbn arduino:avr:uno "
-                f"{info['sketch_dir']}", language="bash")
+        st.code(
+            f"arduino-cli upload -p <PORT> --fqbn arduino:avr:uno "
+            f"{info['sketch_dir']}",
+            language="bash",
+        )
 
 st.sidebar.divider()
 st.sidebar.metric("Reservoir units", ss.N_UNITS)
@@ -92,22 +106,30 @@ with tab_preset:
     kind = ss.SHAPE_CLASSES.index(c1.selectbox("Shape", ss.SHAPE_CLASSES))
     amp = c1.slider("Amplitude", 0.2, 1.5, 1.0, 0.05)
     jitter = c2.slider("Noise", 0.0, 0.4, 0.06, 0.01)
-    phase = c2.slider("Phase (sine)", 0.0, 6.28, 0.0, 0.05,
-                      disabled=(kind != 4))
+    phase = c2.slider(
+        "Phase (sine)", 0.0, 6.28, 0.0, 0.05, disabled=(kind != 4)
+    )
     seed = c2.number_input("Noise seed", 0, 9999, 0, 1)
-    preset_window = ss.shape_window(kind, jitter=jitter, amp=amp,
-                                    phase=phase, seed=int(seed))
+    preset_window = ss.shape_window(
+        kind, jitter=jitter, amp=amp, phase=phase, seed=int(seed)
+    )
 
 with tab_free:
     try:
         from streamlit_drawable_canvas import st_canvas
-        st.caption("Draw a left-to-right curve; it is resampled to "
-                   f"{model.T} points.")
+
+        st.caption(
+            f"Draw a left-to-right curve; it is resampled to {model.T} points."
+        )
         W, H = 560, 220
         canvas = st_canvas(
-            stroke_width=3, stroke_color="#1f77b4",
-            background_color="#0e1117", height=H, width=W,
-            drawing_mode="freedraw", key="canvas",
+            stroke_width=3,
+            stroke_color="#1f77b4",
+            background_color="#0e1117",
+            height=H,
+            width=W,
+            drawing_mode="freedraw",
+            key="canvas",
         )
         free_window = None
         if canvas.json_data is not None:
@@ -117,21 +139,35 @@ with tab_free:
                 left, top = obj.get("left", 0), obj.get("top", 0)
                 for seg in path:
                     for i in range(1, len(seg) - 1, 2):
-                        xs.append(left + seg[i]); ys.append(top + seg[i + 1])
+                        xs.append(left + seg[i])
+                        ys.append(top + seg[i + 1])
             if len(xs) >= 2:
                 order = np.argsort(xs)
                 y = np.array(ys)[order]
-                y = 1.0 - 2.0 * (y - y.min()) / (np.ptp(y) + 1e-9)  # screen→[-1,1]
+                y = 1.0 - 2.0 * (y - y.min()) / (
+                    np.ptp(y) + 1e-9
+                )  # screen→[-1,1]
                 free_window = ss.resample_to_window(y)
     except ModuleNotFoundError:
         free_window = None
-        st.info("Freehand needs `streamlit-drawable-canvas`:\n\n"
-                "`pip install streamlit-drawable-canvas`")
+        st.info(
+            "Freehand needs `streamlit-drawable-canvas`:\n\n"
+            "`pip install streamlit-drawable-canvas`"
+        )
 
-use_free = st.radio("Input", ["Preset", "Freehand"], horizontal=True,
-                    label_visibility="collapsed")
-window = (free_window if use_free == "Freehand" and 'free_window' in dir()
-          and free_window is not None else preset_window)
+use_free = st.radio(
+    "Input",
+    ["Preset", "Freehand"],
+    horizontal=True,
+    label_visibility="collapsed",
+)
+window = (
+    free_window
+    if use_free == "Freehand"
+    and "free_window" in dir()
+    and free_window is not None
+    else preset_window
+)
 
 # --------------------------------------------------------------------------
 # render + classify
@@ -166,19 +202,24 @@ with right:
 
         st.metric("Shape", res["label"].upper())
         st.caption(f"source: {src}")
-        df = pd.DataFrame({
-            "class": model.classes,
-            "logit (q)": res["logits_q"],
-            "probability": res["proba"],
-        }).set_index("class")
+        df = pd.DataFrame(
+            {
+                "class": model.classes,
+                "logit (q)": res["logits_q"],
+                "probability": res["proba"],
+            }
+        ).set_index("class")
         st.bar_chart(df["logit (q)"], height=180)
         st.dataframe(
-            df.style.format({"probability": "{:.3f}"})
-              .highlight_max(subset=["logit (q)"], color="#2ca02c"),
+            df.style.format({"probability": "{:.3f}"}).highlight_max(
+                subset=["logit (q)"], color="#2ca02c"
+            ),
             width="stretch",
         )
     else:
         st.info("Pick / draw a shape, then **Classify**.")
 
-st.caption("rclite · the same quantized ESN runs in this browser tab and on "
-           "the microcontroller — bit-for-bit identical outputs.")
+st.caption(
+    "rclite · the same quantized ESN runs in this browser tab and on "
+    "the microcontroller — bit-for-bit identical outputs."
+)

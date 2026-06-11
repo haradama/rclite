@@ -12,6 +12,7 @@ Requires the wasmtime Python bindings (separate from rclite's deps)::
     python examples/wasm_pages_demo/build.py            # produce dist/
     python examples/wasm_pages_demo/validate.py
 """
+
 from __future__ import annotations
 import ctypes
 import math
@@ -72,8 +73,13 @@ def _softmax(z):
 
 
 def main() -> int:
-    if not (DIST / "forecast.wasm").exists() or not (DIST / "shape.wasm").exists():
-        print("dist/ not found (or stale) -- run build.py first", file=sys.stderr)
+    if (
+        not (DIST / "forecast.wasm").exists()
+        or not (DIST / "shape.wasm").exists()
+    ):
+        print(
+            "dist/ not found (or stale) -- run build.py first", file=sys.stderr
+        )
         return 2
 
     ok = True
@@ -84,7 +90,9 @@ def main() -> int:
     yw = _predict(store, ex, inp)
     yh = exe_f.predict(inp[:, None]).ravel().astype(np.float32)
     d = float(np.max(np.abs(yw - yh)))
-    print(f"forecast.wasm vs host:  max|diff|={d:.2e}  corr={np.corrcoef(yw, yh)[0,1]:.6f}")
+    print(
+        f"forecast.wasm vs host:  max|diff|={d:.2e}  corr={np.corrcoef(yw, yh)[0, 1]:.6f}"
+    )
     ok &= d < 1e-3
 
     _, exe_d, info_d = demo.build_dream_model()
@@ -93,18 +101,27 @@ def main() -> int:
     yw2 = _predict(store2, ex2, seed)
     yh2 = exe_d.predict(seed[:, None]).ravel().astype(np.float32)
     d2 = float(np.max(np.abs(yw2 - yh2)))
-    print(f"dream.wasm    vs host:  max|diff|={d2:.2e}  corr={np.corrcoef(yw2, yh2)[0,1]:.6f}")
+    print(
+        f"dream.wasm    vs host:  max|diff|={d2:.2e}  corr={np.corrcoef(yw2, yh2)[0, 1]:.6f}"
+    )
     ok &= d2 < 1e-3
 
-    buf = seed.copy(); gen = []
+    buf = seed.copy()
+    gen = []
     for _ in range(800):
         y = _predict(store2, ex2, buf)
         gen.append(float(y[-1]))
         buf = np.concatenate([buf[1:], [y[-1]]]).astype(np.float32)
     gen = np.array(gen)
-    stable = bool(np.all(np.isfinite(gen))) and gen.std() > 0.05 and np.abs(gen).max() < 2
-    print(f"dream autoregression:   range=[{gen.min():.3f},{gen.max():.3f}] "
-          f"std={gen.std():.3f} stable={stable}")
+    stable = (
+        bool(np.all(np.isfinite(gen)))
+        and gen.std() > 0.05
+        and np.abs(gen).max() < 2
+    )
+    print(
+        f"dream autoregression:   range=[{gen.min():.3f},{gen.max():.3f}] "
+        f"std={gen.std():.3f} stable={stable}"
+    )
     ok &= stable
 
     # --- shape classifier (MEAN aggregation, M classes): first row == logits -
@@ -112,17 +129,23 @@ def main() -> int:
     M_s = len(demo.SHAPE_CLASSES)
     store3, ex3 = _load(DIST / "shape.wasm")
     rng = np.random.default_rng(123)
-    agree = 0; max_pdiff = 0.0; n = 0
+    agree = 0
+    max_pdiff = 0.0
+    n = 0
     for kind in range(M_s):
         w = demo._shape_window(kind, rng)
         out = _predict(store3, ex3, w.ravel().astype(np.float32), M_s)
-        p_js = _softmax(out[0]); c_js = int(np.argmax(out[0]))
+        p_js = _softmax(out[0])
+        c_js = int(np.argmax(out[0]))
         p_host = exe_s.predict_proba_sequences([w])[0]
         c_host = int(exe_s.predict_sequences([w])[0])
         max_pdiff = max(max_pdiff, float(np.max(np.abs(p_js - p_host))))
-        agree += (c_js == c_host); n += 1
-    print(f"shape.wasm    vs host:  class agreement={agree}/{n}  "
-          f"max|softmax diff|={max_pdiff:.2e}")
+        agree += c_js == c_host
+        n += 1
+    print(
+        f"shape.wasm    vs host:  class agreement={agree}/{n}  "
+        f"max|softmax diff|={max_pdiff:.2e}"
+    )
     ok &= (agree == n) and (max_pdiff < 1e-3)
 
     # --- trend classifier (NONE aggregation, per-step): argmax matches host ---
@@ -136,8 +159,10 @@ def main() -> int:
     w0 = demo.TREND_WASHOUT
     match = float(np.mean(cls_js[w0:] == cls_host[w0:]))
     truth = float(np.mean(cls_js[w0:] == yt[w0:]))
-    print(f"trend.wasm    vs host:  per-step argmax match={match:.4f} "
-          f"(post-washout)  vs-truth acc={truth:.3f}")
+    print(
+        f"trend.wasm    vs host:  per-step argmax match={match:.4f} "
+        f"(post-washout)  vs-truth acc={truth:.3f}"
+    )
     ok &= match > 0.999
 
     print("\n" + ("PASS" if ok else "FAIL"))

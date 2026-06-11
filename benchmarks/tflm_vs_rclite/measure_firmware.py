@@ -13,6 +13,7 @@ instruction estimate (NOT silicon cycles) — median of several runs.
 Run after train_tf_esn.py + gen_rclite_fw.py:
     .venv/bin/python benchmarks/tflm_vs_rclite/measure_firmware.py
 """
+
 from __future__ import annotations
 import json
 import pathlib
@@ -25,9 +26,10 @@ FW = HERE / "firmware"
 OUT = HERE / "out"
 OUT.mkdir(exist_ok=True)
 GCCBIN = pathlib.Path(
-    "/tmp/tflite-micro/tensorflow/lite/micro/tools/make/downloads/gcc_embedded/bin")
+    "/tmp/tflite-micro/tensorflow/lite/micro/tools/make/downloads/gcc_embedded/bin"
+)
 SIZE = str(GCCBIN / "arm-none-eabi-size")
-TFLM_ESN_ARENA = 3584        # ESN cell: minimum that allocates (arena_used = 2688)
+TFLM_ESN_ARENA = 3584  # ESN cell: minimum that allocates (arena_used = 2688)
 N_LAT = 5
 
 
@@ -38,13 +40,30 @@ def sh(cmd, **kw):
 def elf_sizes(elf: pathlib.Path) -> dict:
     out = sh([SIZE, str(elf)]).stdout.strip().splitlines()[-1].split()
     text, data, bss = int(out[0]), int(out[1]), int(out[2])
-    return {"text": text, "data": data, "bss": bss,
-            "flash": text + data, "ram": data + bss}
+    return {
+        "text": text,
+        "data": data,
+        "bss": bss,
+        "flash": text + data,
+        "ram": data + bss,
+    }
 
 
 def qemu_run(elf: pathlib.Path) -> str:
-    cp = sh(["qemu-system-arm", "-M", "microbit", "-nographic", "-semihosting",
-             "-icount", "shift=0", "-kernel", str(elf)], timeout=90)
+    cp = sh(
+        [
+            "qemu-system-arm",
+            "-M",
+            "microbit",
+            "-nographic",
+            "-semihosting",
+            "-icount",
+            "shift=0",
+            "-kernel",
+            str(elf),
+        ],
+        timeout=90,
+    )
     return cp.stdout + cp.stderr
 
 
@@ -64,19 +83,23 @@ def latency_median(elf: pathlib.Path, key: str) -> int:
 
 def measure_tflm_esn() -> dict:
     """The SAME reservoir as rclite, deployed as a TFLM single-step cell."""
-    sh(["bash", str(FW / "build_tflm_esn.sh")],
-       env={**__import__("os").environ, "ARENA_SIZE": str(TFLM_ESN_ARENA)})
+    sh(
+        ["bash", str(FW / "build_tflm_esn.sh")],
+        env={**__import__("os").environ, "ARENA_SIZE": str(TFLM_ESN_ARENA)},
+    )
     elf = FW / "build" / "tflm_esn.elf"
     out = qemu_run(elf)
     d = elf_sizes(elf)
-    d.update({
-        "name": "TFLM ESN cell (same reservoir)",
-        "arena_size": TFLM_ESN_ARENA,
-        "arena_used": _grep_int(out, "arena_used_bytes"),
-        "functional_match": "FUNCTIONAL_MATCH" in out,
-        "max_abs_diff_scaled": _grep_int(out, "max_abs_diff_scaled"),
-        "instr_per_inference": latency_median(elf, "instr_per_step"),
-    })
+    d.update(
+        {
+            "name": "TFLM ESN cell (same reservoir)",
+            "arena_size": TFLM_ESN_ARENA,
+            "arena_used": _grep_int(out, "arena_used_bytes"),
+            "functional_match": "FUNCTIONAL_MATCH" in out,
+            "max_abs_diff_scaled": _grep_int(out, "max_abs_diff_scaled"),
+            "instr_per_inference": latency_median(elf, "instr_per_step"),
+        }
+    )
     return d
 
 
@@ -85,11 +108,13 @@ def measure_rclite(variant: str) -> dict:
     elf = FW / "build" / f"rclite_{variant}.elf"
     out = qemu_run(elf)
     d = elf_sizes(elf)
-    d.update({
-        "name": f"rclite reservoir affine {variant}",
-        "parity_ok": "PARITY_OK" in out,
-        "instr_per_inference": latency_median(elf, "instr_per_step"),
-    })
+    d.update(
+        {
+            "name": f"rclite reservoir affine {variant}",
+            "parity_ok": "PARITY_OK" in out,
+            "instr_per_inference": latency_median(elf, "instr_per_step"),
+        }
+    )
     return d
 
 

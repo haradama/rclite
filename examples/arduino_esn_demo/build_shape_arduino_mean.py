@@ -24,6 +24,7 @@ Usage::
 
     python examples/arduino_esn_demo/build_shape_arduino_mean.py
 """
+
 from __future__ import annotations
 import pathlib
 import subprocess
@@ -33,15 +34,32 @@ import numpy as np
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 
-from rclite import (InputNode, ReservoirNode, ReadoutNode, ReservoirComputer,
-                    Activation, Distribution, Topology, Trainer, Task,
-                    Aggregation)
+from rclite import (
+    InputNode,
+    ReservoirNode,
+    ReadoutNode,
+    ReservoirComputer,
+    Activation,
+    Distribution,
+    Topology,
+    Trainer,
+    Task,
+    Aggregation,
+)
 from rclite.runtime import RCExecutor
-from rclite.quant import (calibrate_from_data, quantize_model_affine,
-                          AffineQuantizedExecutor, LUTStrategy)
+from rclite.quant import (
+    calibrate_from_data,
+    quantize_model_affine,
+    AffineQuantizedExecutor,
+    LUTStrategy,
+)
 from rclite.targets import ArduinoUnoTarget
 
-BUILD = pathlib.Path(__file__).resolve().parents[2] / "build" / "arduino_shape_mean"
+BUILD = (
+    pathlib.Path(__file__).resolve().parents[2]
+    / "build"
+    / "arduino_shape_mean"
+)
 
 SHAPE_W = 80
 SHAPE_CLASSES = ["rising", "falling", "peak", "valley", "sine"]
@@ -140,9 +158,13 @@ def _write_sketch(qm, cfg, sketch_dir, window):
     storage_t = "int8_t" if qm.storage_bits == 8 else "int16_t"
     X = window if window.ndim == 2 else window[:, None]
     X_q = cfg.input.quantize_array(X).astype(np_storage)
-    Y_ref_q = AffineQuantizedExecutor(qm).predict_pooled_q(X).astype(np_storage)
+    Y_ref_q = (
+        AffineQuantizedExecutor(qm).predict_pooled_q(X).astype(np_storage)
+    )
     subst = {
-        "T": X.shape[0], "M": qm.M, "STORAGE_T": storage_t,
+        "T": X.shape[0],
+        "M": qm.M,
+        "STORAGE_T": storage_t,
         "X_VALUES": ", ".join(str(int(v)) for v in X_q.ravel()),
         "Y_VALUES": ", ".join(str(int(v)) for v in Y_ref_q.ravel()),
     }
@@ -158,18 +180,36 @@ def main() -> None:
     tr_s, tr_y = seqs[:n_tr], labels[:n_tr]
     te_s, te_y = seqs[n_tr:], labels[n_tr:]
 
-    print(f"[1/4] train MEAN SCR classifier (N={N_UNITS}, {N_CLASSES} classes)")
+    print(
+        f"[1/4] train MEAN SCR classifier (N={N_UNITS}, {N_CLASSES} classes)"
+    )
     rc = ReservoirComputer(
-        input=InputNode(units=1, activation=Activation.IDENTITY,
-                        input_distribution=Distribution.BERNOULLI, name="in"),
-        reservoir=ReservoirNode(units=N_UNITS, activation=Activation.TANH,
-                                 topology=Topology.SCR, chain_weight=0.9,
-                                 leak_rate=0.30, seed=9, name="res"),
-        readout=ReadoutNode(units=N_CLASSES, activation=Activation.IDENTITY,
-                            trainer=Trainer.RIDGE, regularization=1e-2,
-                            washout=WASHOUT, include_bias=True,
-                            task=Task.CLASSIFICATION,
-                            aggregation=Aggregation.MEAN, name="out"),
+        input=InputNode(
+            units=1,
+            activation=Activation.IDENTITY,
+            input_distribution=Distribution.BERNOULLI,
+            name="in",
+        ),
+        reservoir=ReservoirNode(
+            units=N_UNITS,
+            activation=Activation.TANH,
+            topology=Topology.SCR,
+            chain_weight=0.9,
+            leak_rate=0.30,
+            seed=9,
+            name="res",
+        ),
+        readout=ReadoutNode(
+            units=N_CLASSES,
+            activation=Activation.IDENTITY,
+            trainer=Trainer.RIDGE,
+            regularization=1e-2,
+            washout=WASHOUT,
+            include_bias=True,
+            task=Task.CLASSIFICATION,
+            aggregation=Aggregation.MEAN,
+            name="out",
+        ),
     )
     exe = RCExecutor(rc)
     exe.fit_sequences(tr_s, tr_y)
@@ -177,30 +217,52 @@ def main() -> None:
     print(f"      float window acc = {acc_f:.3f}")
 
     print("[2/4] affine quantize (i8 reservoir + i16 W_out, direct tanh LUT)")
-    cfg = calibrate_from_data(rc, exe, np.concatenate(tr_s[:60], axis=0),
-                              storage_bits=8, w_out_storage_bits=16)
+    cfg = calibrate_from_data(
+        rc,
+        exe,
+        np.concatenate(tr_s[:60], axis=0),
+        storage_bits=8,
+        w_out_storage_bits=16,
+    )
     qm = quantize_model_affine(rc, exe, cfg, lut_strategy=LUTStrategy.direct())
     qexe = AffineQuantizedExecutor(qm)
-    acc_q = float(np.mean(
-        [int(np.argmax(qexe.predict_pooled_q(X))) == y
-         for X, y in zip(te_s, te_y)]))
+    acc_q = float(
+        np.mean(
+            [
+                int(np.argmax(qexe.predict_pooled_q(X))) == y
+                for X, y in zip(te_s, te_y)
+            ]
+        )
+    )
     print(f"      quantized window acc = {acc_q:.3f}")
 
     print("[3/4] emit + compile Arduino sketch (arduino:avr:uno)")
     demo_kind = 2  # "peak"
     window = _shape_window(demo_kind, np.random.default_rng(0), jitter=0.0)
     target = ArduinoUnoTarget()
-    art = target.compile_affine_quantized(qm, output_dir=BUILD,
-                                          test_inputs=window, build=False)
+    art = target.compile_affine_quantized(
+        qm, output_dir=BUILD, test_inputs=window, build=False
+    )
     sketch_dir = BUILD / "sketch"
     _write_sketch(qm, cfg, sketch_dir, window)
     cp = subprocess.run(
-        ["arduino-cli", "compile", "--fqbn", "arduino:avr:uno",
-         "--output-dir", str(BUILD / "build"), str(sketch_dir)],
-        capture_output=True, text=True)
+        [
+            "arduino-cli",
+            "compile",
+            "--fqbn",
+            "arduino:avr:uno",
+            "--output-dir",
+            str(BUILD / "build"),
+            str(sketch_dir),
+        ],
+        capture_output=True,
+        text=True,
+    )
     md = art.metadata
-    print(f"      storage={md['dtype']}  W_out={md['w_out_dtype']}  "
-          f"topology={md['topology']}  lut={md['lut_kind']}  agg=MEAN")
+    print(
+        f"      storage={md['dtype']}  W_out={md['w_out_dtype']}  "
+        f"topology={md['topology']}  lut={md['lut_kind']}  agg=MEAN"
+    )
     if cp.returncode != 0:
         print("      arduino-cli compile FAILED:\n" + cp.stderr)
         sys.exit(1)
@@ -213,10 +275,14 @@ def main() -> None:
 
     print("[4/4] device demo")
     pred = int(np.argmax(qexe.predict_pooled_q(window)))
-    print(f"      embedded window is '{SHAPE_CLASSES[demo_kind]}'; "
-          f"kernel predicts '{SHAPE_CLASSES[pred]}'")
-    print(f"\n[ok] flash with:  arduino-cli upload -p <PORT> "
-          f"--fqbn arduino:avr:uno {sketch_dir}")
+    print(
+        f"      embedded window is '{SHAPE_CLASSES[demo_kind]}'; "
+        f"kernel predicts '{SHAPE_CLASSES[pred]}'"
+    )
+    print(
+        f"\n[ok] flash with:  arduino-cli upload -p <PORT> "
+        f"--fqbn arduino:avr:uno {sketch_dir}"
+    )
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ lives in fvp/ — this script is the host-side AOT + accuracy counterpart.
 Run with the PyTorch/ExecuTorch venv:
     /tmp/ptenv/bin/python benchmarks/executorch_vs_rclite/executorch_demo.py
 """
+
 from __future__ import annotations
 import json
 import os
@@ -34,9 +35,12 @@ import torch.nn as nn  # noqa: E402
 from torch.export import export  # noqa: E402
 from torchao.quantization.pt2e.quantize_pt2e import prepare_pt2e, convert_pt2e  # noqa: E402
 from executorch.backends.xnnpack.quantizer.xnnpack_quantizer import (  # noqa: E402
-    XNNPACKQuantizer, get_symmetric_quantization_config)
+    XNNPACKQuantizer,
+    get_symmetric_quantization_config,
+)
 from executorch.backends.xnnpack.partition.xnnpack_partitioner import (  # noqa: E402
-    XnnpackPartitioner)
+    XnnpackPartitioner,
+)
 from executorch.exir import to_edge_transform_and_lower  # noqa: E402
 from executorch.runtime import Runtime  # noqa: E402
 
@@ -51,7 +55,8 @@ def pt2e_int8(model, example, calib):
     """PT2E symmetric-int8 quantize; returns the converted (int8) module."""
     gm = export(model.eval(), example).module()
     qz = XNNPACKQuantizer().set_global(
-        get_symmetric_quantization_config(is_per_channel=False))
+        get_symmetric_quantization_config(is_per_channel=False)
+    )
     prep = prepare_pt2e(gm, qz)
     for args in calib:
         prep(*args)
@@ -66,11 +71,15 @@ def pte_bytes(model, example, *, xnnpack: bool):
     try:
         ep = export(model, example)
         parts = [XnnpackPartitioner()] if xnnpack else None
-        prog = to_edge_transform_and_lower(ep, partitioner=parts).to_executorch()
+        prog = to_edge_transform_and_lower(
+            ep, partitioner=parts
+        ).to_executorch()
         return prog.buffer
-    except Exception as e:                                   # noqa: BLE001
-        print(f"  .pte export ({'xnnpack' if xnnpack else 'portable'}) "
-              f"failed: {type(e).__name__}: {str(e)[:80]}")
+    except Exception as e:  # noqa: BLE001
+        print(
+            f"  .pte export ({'xnnpack' if xnnpack else 'portable'}) "
+            f"failed: {type(e).__name__}: {str(e)[:80]}"
+        )
         return None
 
 
@@ -103,8 +112,12 @@ class ESNCell(nn.Module):
         # broadcast yields a 0-stride tensor that ExecuTorch's lowering rejects.
         self.register_buffer("leak_v", torch.full((1, N), leak))
         self.register_buffer("oml_v", torch.full((1, N), 1.0 - leak))
-        self.register_buffer("off_v", torch.full((1, K), float(p["input_offset"])))
-        self.register_buffer("scal_v", torch.full((1, K), float(p["input_scaling"])))
+        self.register_buffer(
+            "off_v", torch.full((1, K), float(p["input_offset"]))
+        )
+        self.register_buffer(
+            "scal_v", torch.full((1, K), float(p["input_scaling"]))
+        )
         self.pre = nn.Linear(K + N, N)
         self.yout = nn.Linear(K + N, int(p["M"]))
         with torch.no_grad():
@@ -118,8 +131,11 @@ class ESNCell(nn.Module):
                 wy[:, :K] = p["W_out_input"]
             wy[:, K:] = p["W_out_state"]
             self.yout.weight.copy_(torch.tensor(wy))
-            yb = (p["W_out_bias"].reshape(-1) if p["W_out_bias"].size
-                  else np.zeros(int(p["M"]), np.float32))
+            yb = (
+                p["W_out_bias"].reshape(-1)
+                if p["W_out_bias"].size
+                else np.zeros(int(p["M"]), np.float32)
+            )
             self.yout.bias.copy_(torch.tensor(yb.astype(np.float32)))
 
     def forward(self, x, h_prev):
@@ -137,7 +153,7 @@ def _esn_loop(cell, Xseq, N):
     with torch.no_grad():
         for t in range(len(Xseq)):
             hist.append(h.clone())
-            h, y = cell(Xseq[t:t + 1], h)
+            h, y = cell(Xseq[t : t + 1], h)
             preds[t] = float(y.ravel()[0])
     return preds, hist
 
@@ -146,7 +162,8 @@ def run_esn():
     if not ESN_PARAMS.exists():
         raise SystemExit(
             f"missing {ESN_PARAMS}; run "
-            "benchmarks/tflm_vs_rclite/export_esn_params.py first")
+            "benchmarks/tflm_vs_rclite/export_esn_params.py first"
+        )
     p = np.load(ESN_PARAMS)
     N = int(p["N"])
     cell = ESNCell(p).eval()
@@ -160,8 +177,10 @@ def run_esn():
     n_fit = common.TRAIN_END
     # contiguous calibration/example tensors — slicing views (Xseq[i:i+1]) can
     # carry strides that make ExecuTorch's lowering hit its 0-stride check.
-    calib = [(Xseq[i:i + 1].contiguous(), hist[i].contiguous())
-             for i in range(0, n_fit, 4)]
+    calib = [
+        (Xseq[i : i + 1].contiguous(), hist[i].contiguous())
+        for i in range(0, n_fit, 4)
+    ]
     ex = (torch.zeros(1, 1), torch.zeros(1, N))
     qm = pt2e_int8(cell, ex, calib)
 
@@ -170,7 +189,7 @@ def run_esn():
     pq = np.zeros(len(Xseq))
     with torch.no_grad():
         for t in range(len(Xseq)):
-            h, y = qm(Xseq[t:t + 1], h)
+            h, y = qm(Xseq[t : t + 1], h)
             pq[t] = float(y.ravel()[0])
     nrmse_q = common.nrmse(pq[te], s[te + 1])
 
@@ -195,9 +214,11 @@ def main() -> int:
     res = {
         "framework": "PyTorch + ExecuTorch",
         "torch": torch.__version__,
-        "note": ("Host AOT for the SAME ESN as rclite. The on-target run is on "
-                 "the Corstone-300 FVP (Cortex-M55 + Ethos-U55); see fvp/. .pte = "
-                 "model program only; the ExecuTorch C++ runtime adds ~418 KB."),
+        "note": (
+            "Host AOT for the SAME ESN as rclite. The on-target run is on "
+            "the Corstone-300 FVP (Cortex-M55 + Ethos-U55); see fvp/. .pte = "
+            "model program only; the ExecuTorch C++ runtime adds ~418 KB."
+        ),
         "esn": run_esn(),
     }
     (OUT / "pt_result.json").write_text(json.dumps(res, indent=2))

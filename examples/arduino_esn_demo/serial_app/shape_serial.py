@@ -18,6 +18,7 @@ The samples are the *quantized* input (the kernel reads X directly as the
 reservoir input), produced by `cfg.input.quantize_array` — identical to what
 `ArduinoUnoTarget` embeds and what the Python reference quantizes internally.
 """
+
 from __future__ import annotations
 import pathlib
 import struct
@@ -29,12 +30,25 @@ import numpy as np
 # Allow `import rclite` when run from anywhere in the repo.
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3]))
 
-from rclite import (InputNode, ReservoirNode, ReadoutNode, ReservoirComputer,
-                    Activation, Distribution, Topology, Trainer, Task,
-                    Aggregation)
+from rclite import (
+    InputNode,
+    ReservoirNode,
+    ReadoutNode,
+    ReservoirComputer,
+    Activation,
+    Distribution,
+    Topology,
+    Trainer,
+    Task,
+    Aggregation,
+)
 from rclite.runtime import RCExecutor
-from rclite.quant import (calibrate_from_data, quantize_model_affine,
-                          AffineQuantizedExecutor, LUTStrategy)
+from rclite.quant import (
+    calibrate_from_data,
+    quantize_model_affine,
+    AffineQuantizedExecutor,
+    LUTStrategy,
+)
 from rclite.targets.arduino import emit_affine_kernel_c
 
 SHAPE_W = 80
@@ -48,20 +62,27 @@ BAUD = 115200
 # --------------------------------------------------------------------------
 # shapes
 
-def shape_window(kind: int, *, jitter: float = 0.0, amp: float = 1.0,
-                 phase: float = 0.0, seed: int = 0) -> np.ndarray:
+
+def shape_window(
+    kind: int,
+    *,
+    jitter: float = 0.0,
+    amp: float = 1.0,
+    phase: float = 0.0,
+    seed: int = 0,
+) -> np.ndarray:
     """One labelled curve == one (SHAPE_W, 1) sequence (matches the wasm demo)."""
     rng = np.random.default_rng(seed)
     t = np.linspace(0.0, 1.0, SHAPE_W)
-    if kind == 0:                      # rising ramp
+    if kind == 0:  # rising ramp
         s = -1.0 + 2.0 * t
-    elif kind == 1:                    # falling ramp
+    elif kind == 1:  # falling ramp
         s = 1.0 - 2.0 * t
-    elif kind == 2:                    # peak (triangle)
+    elif kind == 2:  # peak (triangle)
         s = 1.0 - 4.0 * np.abs(t - 0.5)
-    elif kind == 3:                    # valley (V)
+    elif kind == 3:  # valley (V)
         s = -1.0 + 4.0 * np.abs(t - 0.5)
-    else:                              # one sine cycle
+    else:  # one sine cycle
         s = np.sin(2.0 * np.pi * t + phase)
     s = amp * s + jitter * rng.standard_normal(SHAPE_W)
     return s[:, None]
@@ -79,6 +100,7 @@ def resample_to_window(y: np.ndarray) -> np.ndarray:
 
 # --------------------------------------------------------------------------
 # model
+
 
 class ShapeModel:
     """Trained + quantized shape classifier bundle."""
@@ -105,8 +127,11 @@ def build_model(seed: int = 5) -> ShapeModel:
     seqs, labels = [], []
     for kind in range(N_CLASSES):
         for _ in range(80):
-            seqs.append(shape_window(kind, jitter=0.06,
-                                     seed=int(rng.integers(1 << 30))))
+            seqs.append(
+                shape_window(
+                    kind, jitter=0.06, seed=int(rng.integers(1 << 30))
+                )
+            )
             labels.append(kind)
     idx = rng.permutation(len(seqs))
     seqs = [seqs[i] for i in idx]
@@ -114,27 +139,51 @@ def build_model(seed: int = 5) -> ShapeModel:
     n_tr = int(0.7 * len(seqs))
 
     rc = ReservoirComputer(
-        input=InputNode(units=1, activation=Activation.IDENTITY,
-                        input_distribution=Distribution.BERNOULLI, name="in"),
-        reservoir=ReservoirNode(units=N_UNITS, activation=Activation.TANH,
-                                 topology=Topology.SCR, chain_weight=0.9,
-                                 leak_rate=0.30, seed=9, name="res"),
-        readout=ReadoutNode(units=N_CLASSES, activation=Activation.IDENTITY,
-                            trainer=Trainer.RIDGE, regularization=1e-2,
-                            washout=WASHOUT, include_bias=True,
-                            task=Task.CLASSIFICATION,
-                            aggregation=Aggregation.MEAN, name="out"),
+        input=InputNode(
+            units=1,
+            activation=Activation.IDENTITY,
+            input_distribution=Distribution.BERNOULLI,
+            name="in",
+        ),
+        reservoir=ReservoirNode(
+            units=N_UNITS,
+            activation=Activation.TANH,
+            topology=Topology.SCR,
+            chain_weight=0.9,
+            leak_rate=0.30,
+            seed=9,
+            name="res",
+        ),
+        readout=ReadoutNode(
+            units=N_CLASSES,
+            activation=Activation.IDENTITY,
+            trainer=Trainer.RIDGE,
+            regularization=1e-2,
+            washout=WASHOUT,
+            include_bias=True,
+            task=Task.CLASSIFICATION,
+            aggregation=Aggregation.MEAN,
+            name="out",
+        ),
     )
     exe = RCExecutor(rc)
     exe.fit_sequences(seqs[:n_tr], labels[:n_tr])
-    cfg = calibrate_from_data(rc, exe, np.concatenate(seqs[:60], axis=0),
-                              storage_bits=8, w_out_storage_bits=16)
+    cfg = calibrate_from_data(
+        rc,
+        exe,
+        np.concatenate(seqs[:60], axis=0),
+        storage_bits=8,
+        w_out_storage_bits=16,
+    )
     qm = quantize_model_affine(rc, exe, cfg, lut_strategy=LUTStrategy.direct())
-    return ShapeModel(rc=rc, exe=exe, qm=qm, cfg=cfg, classes=list(SHAPE_CLASSES))
+    return ShapeModel(
+        rc=rc, exe=exe, qm=qm, cfg=cfg, classes=list(SHAPE_CLASSES)
+    )
 
 
 # --------------------------------------------------------------------------
 # quantize / predict
+
 
 def quantize_window(model: ShapeModel, window: np.ndarray) -> np.ndarray:
     """Float window (T,1) -> int8 samples (T,), exactly as the kernel expects."""
@@ -154,13 +203,18 @@ def predict_simulated(model: ShapeModel, window: np.ndarray) -> dict:
     q_logits = AffineQuantizedExecutor(model.qm).predict_pooled_q(window)
     deq = model.cfg.output.dequantize_array(q_logits[None, :])[0]
     best = int(np.argmax(q_logits))
-    return {"best": best, "label": model.classes[best],
-            "logits_q": q_logits.astype(int).tolist(),
-            "logits": deq.tolist(), "proba": softmax(deq).tolist()}
+    return {
+        "best": best,
+        "label": model.classes[best],
+        "logits_q": q_logits.astype(int).tolist(),
+        "logits": deq.tolist(),
+        "proba": softmax(deq).tolist(),
+    }
 
 
 # --------------------------------------------------------------------------
 # serial protocol
+
 
 def encode_request(samples_i8: np.ndarray) -> bytes:
     """b'S' + uint16-LE T + T signed int8 samples."""
@@ -175,20 +229,28 @@ def parse_response(line: str, M: int) -> dict | None:
         return None
     try:
         best = int(parts[1])
-        logits_q = [int(v) for v in parts[2:2 + M]]
+        logits_q = [int(v) for v in parts[2 : 2 + M]]
     except ValueError:
         return None
     return {"best": best, "logits_q": logits_q}
 
 
-def predict_serial(model: ShapeModel, window: np.ndarray, *, port: str,
-                   baud: int = BAUD, timeout: float = 2.0) -> dict:
+def predict_serial(
+    model: ShapeModel,
+    window: np.ndarray,
+    *,
+    port: str,
+    baud: int = BAUD,
+    timeout: float = 2.0,
+) -> dict:
     """Send the window to a connected Arduino and read back its prediction."""
     import serial  # pyserial; imported lazily so simulation needs no hardware
+
     samples = quantize_window(model, window)
     with serial.Serial(port, baud, timeout=timeout) as ser:
         # Arduino resets on open; give the bootloader a moment, then flush.
         import time
+
         time.sleep(2.0)
         ser.reset_input_buffer()
         ser.write(encode_request(samples))
@@ -201,11 +263,16 @@ def predict_serial(model: ShapeModel, window: np.ndarray, *, port: str,
                 break
         else:
             raise TimeoutError("no valid 'OK ...' reply from device")
-    deq = model.cfg.output.dequantize_array(
-        np.array(r["logits_q"])[None, :])[0]
-    return {"best": r["best"], "label": model.classes[r["best"]],
-            "logits_q": r["logits_q"], "logits": deq.tolist(),
-            "proba": softmax(deq).tolist()}
+    deq = model.cfg.output.dequantize_array(np.array(r["logits_q"])[None, :])[
+        0
+    ]
+    return {
+        "best": r["best"],
+        "label": model.classes[r["best"]],
+        "logits_q": r["logits_q"],
+        "logits": deq.tolist(),
+        "proba": softmax(deq).tolist(),
+    }
 
 
 # --------------------------------------------------------------------------
@@ -262,25 +329,38 @@ def emit_firmware(model: ShapeModel, out_dir, *, maxt: int = 256) -> dict:
     Returns a dict with sketch path and (when compiled) Flash/SRAM bytes.
     """
     import shutil
+
     out = pathlib.Path(out_dir)
     sketch_dir = out / "sketch"
     sketch_dir.mkdir(parents=True, exist_ok=True)
     (sketch_dir / "rc_kernel.c").write_text(emit_affine_kernel_c(model.qm))
-    (sketch_dir / "sketch.ino").write_text(_SERVER_INO % {
-        "BAUD": BAUD, "M": model.M, "MM1": model.M - 1, "MAXT": maxt})
+    (sketch_dir / "sketch.ino").write_text(
+        _SERVER_INO
+        % {"BAUD": BAUD, "M": model.M, "MM1": model.M - 1, "MAXT": maxt}
+    )
 
     info = {"sketch_dir": str(sketch_dir)}
     if shutil.which("arduino-cli") is None:
         info["compiled"] = False
         return info
     cp = subprocess.run(
-        ["arduino-cli", "compile", "--fqbn", "arduino:avr:uno",
-         "--output-dir", str(out / "build"), str(sketch_dir)],
-        capture_output=True, text=True)
+        [
+            "arduino-cli",
+            "compile",
+            "--fqbn",
+            "arduino:avr:uno",
+            "--output-dir",
+            str(out / "build"),
+            str(sketch_dir),
+        ],
+        capture_output=True,
+        text=True,
+    )
     info["compiled"] = cp.returncode == 0
     info["log"] = cp.stdout + cp.stderr
     if cp.returncode == 0:
         from rclite.targets.arduino import ArduinoUnoTarget
+
         info.update(ArduinoUnoTarget._parse_sizes(cp.stdout))
     return info
 
@@ -289,6 +369,7 @@ def list_serial_ports() -> list:
     """Return candidate serial port device names (best-effort)."""
     try:
         from serial.tools import list_ports
+
         return [p.device for p in list_ports.comports()]
     except Exception:
         return []

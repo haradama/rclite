@@ -11,6 +11,7 @@ Requires arm-none-eabi-gcc (+ binutils) and mGBA (`mgba` / `mgba-sdl`).
 
     python benchmarks/gba_arm7tdmi/bench_gba.py [--json o.json] [--md o.md]
 """
+
 from __future__ import annotations
 import argparse
 import json
@@ -43,9 +44,15 @@ _MGBA = shutil.which("mgba") or shutil.which("mgba-sdl") or "/usr/games/mgba"
 
 
 def _have_tools():
-    return (shutil.which("arm-none-eabi-gcc") and shutil.which(SIZE)
-            and (shutil.which("mgba") or shutil.which("mgba-sdl")
-                 or os.path.exists("/usr/games/mgba")))
+    return (
+        shutil.which("arm-none-eabi-gcc")
+        and shutil.which(SIZE)
+        and (
+            shutil.which("mgba")
+            or shutil.which("mgba-sdl")
+            or os.path.exists("/usr/games/mgba")
+        )
+    )
 
 
 def _run_mgba(gba_path, timeout=10.0):
@@ -55,17 +62,22 @@ def _run_mgba(gba_path, timeout=10.0):
     forever); a hard deadline bounds the wait if the verdict never shows."""
     # mGBA block-buffers its debug log; stdbuf -oL line-buffers it so the
     # firmware's lines reach us before we kill the (otherwise-spinning) ROM.
-    cmd = (["stdbuf", "-oL", "-eL"] if shutil.which("stdbuf") else [])
+    cmd = ["stdbuf", "-oL", "-eL"] if shutil.which("stdbuf") else []
     cmd += [_MGBA, "-l", "15", str(gba_path)]
     env = dict(os.environ)
     env.setdefault("SDL_VIDEODRIVER", "dummy")
     env.setdefault("SDL_AUDIODRIVER", "dummy")
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, start_new_session=True,
-                            env=env)
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+        env=env,
+    )
     fd = proc.stdout.fileno()
-    fcntl.fcntl(fd, fcntl.F_SETFL,
-                fcntl.fcntl(fd, fcntl.F_GETFL) | os.O_NONBLOCK)
+    fcntl.fcntl(
+        fd, fcntl.F_SETFL, fcntl.fcntl(fd, fcntl.F_GETFL) | os.O_NONBLOCK
+    )
     buf, deadline = b"", time.monotonic() + timeout
     try:
         while time.monotonic() < deadline:
@@ -75,8 +87,9 @@ def _run_mgba(gba_path, timeout=10.0):
                 chunk = b""
             if chunk:
                 buf += chunk
-                if (b"ticks_per_step:" in buf
-                        and (b"PARITY_OK" in buf or b"PARITY_FAIL" in buf)):
+                if b"ticks_per_step:" in buf and (
+                    b"PARITY_OK" in buf or b"PARITY_FAIL" in buf
+                ):
                     break
             elif proc.poll() is not None:
                 break
@@ -93,18 +106,30 @@ def _run_mgba(gba_path, timeout=10.0):
 
 def _build_and_run(gba, dtype, src, x_seq, sparse, workdir):
     workdir.mkdir(parents=True, exist_ok=True)
-    rc_o = K.build_object(dtype, src, sparse, triple=TRIPLE, cpu=CPU,
-                          out_path=workdir / "rc_predict.o")
+    rc_o = K.build_object(
+        dtype,
+        src,
+        sparse,
+        triple=TRIPLE,
+        cpu=CPU,
+        out_path=workdir / "rc_predict.o",
+    )
     data_h, _ = K.emit_c_data_h(dtype, src, x_seq)
     (workdir / "rc_data.h").write_text(data_h)
     shutil.copy(_SUPPORT_DIR / "mgba_log.h", workdir / "mgba_log.h")
     shutil.copy(HARNESS, workdir / "main_bench.c")
-    gba._build_rom(workdir, rc_o, workdir / "main_bench.c",
-                   with_float=(dtype == "float"))
+    gba._build_rom(
+        workdir, rc_o, workdir / "main_bench.c", with_float=(dtype == "float")
+    )
 
     elf = workdir / "rc.elf"
-    sz = subprocess.run([SIZE, str(elf)], check=True, capture_output=True,
-                        text=True).stdout.splitlines()[1].split()
+    sz = (
+        subprocess.run(
+            [SIZE, str(elf)], check=True, capture_output=True, text=True
+        )
+        .stdout.splitlines()[1]
+        .split()
+    )
     text, data, bss = int(sz[0]), int(sz[1]), int(sz[2])
     log = _run_mgba(workdir / "rc.gba")
     m = re.search(r"ticks_per_step:\s*(-?\d+)", log)
@@ -121,7 +146,9 @@ def run(sizes):
         rc, exe, x_seq, y_true, x_cal = K.train_model(units, density, T_SEQ)
         N = rc.reservoir.units
         nnz = int(np.count_nonzero(exe.W_res))
-        qms = {b: K.quant_model(b, rc, exe, x_cal) for b in ("i8", "i16", "i32")}
+        qms = {
+            b: K.quant_model(b, rc, exe, x_cal) for b in ("i8", "i16", "i32")
+        }
         with tempfile.TemporaryDirectory() as td:
             td = pathlib.Path(td)
             for dtype in S.DTYPES:
@@ -130,20 +157,45 @@ def run(sizes):
                 for kernel in S.KERNELS:
                     try:
                         fl, ram, ticks, par = _build_and_run(
-                            gba, dtype, src, x_seq, K.KERNEL_SPARSE[kernel],
-                            td / f"{dtype}_{kernel}")
+                            gba,
+                            dtype,
+                            src,
+                            x_seq,
+                            K.KERNEL_SPARSE[kernel],
+                            td / f"{dtype}_{kernel}",
+                        )
                     except Exception as e:
-                        print(f"  (blank {dtype}/{kernel}: {type(e).__name__})")
-                        rows.append(S.row(N=N, density=density, nnz=nnz,
-                                          dtype=dtype, kernel=kernel, mse=mse))
+                        print(
+                            f"  (blank {dtype}/{kernel}: {type(e).__name__})"
+                        )
+                        rows.append(
+                            S.row(
+                                N=N,
+                                density=density,
+                                nnz=nnz,
+                                dtype=dtype,
+                                kernel=kernel,
+                                mse=mse,
+                            )
+                        )
                         continue
-                    rows.append(S.row(
-                        N=N, density=density, nnz=nnz, dtype=dtype,
-                        kernel=kernel,
-                        ops_per_step=(ticks if ticks > 0 else None),
-                        parity=par, flash_B=fl, ram_B=ram, mse=mse,
-                        wres_B=K.wres_bytes(dtype, src,
-                                            K.KERNEL_SPARSE[kernel], N)))
+                    rows.append(
+                        S.row(
+                            N=N,
+                            density=density,
+                            nnz=nnz,
+                            dtype=dtype,
+                            kernel=kernel,
+                            ops_per_step=(ticks if ticks > 0 else None),
+                            parity=par,
+                            flash_B=fl,
+                            ram_B=ram,
+                            mse=mse,
+                            wres_B=K.wres_bytes(
+                                dtype, src, K.KERNEL_SPARSE[kernel], N
+                            ),
+                        )
+                    )
     return rows
 
 
@@ -165,17 +217,23 @@ def main():
     print(S.fmt_text(TARGET, rows, unit="GBA timer ticks (mGBA)"))
 
     if args.md:
-        args.md.write_text(S.fmt_md(
-            TARGET, rows, unit="GBA timer ticks (mGBA)",
-            note="Quant scheme: i8/i16 = affine, i32 = symmetric. Code runs "
-                 "from cartridge ROM (with GBA waitstates)."))
+        args.md.write_text(
+            S.fmt_md(
+                TARGET,
+                rows,
+                unit="GBA timer ticks (mGBA)",
+                note="Quant scheme: i8/i16 = affine, i32 = symmetric. Code runs "
+                "from cartridge ROM (with GBA waitstates).",
+            )
+        )
         print(f"\nwrote {args.md}")
     ok = S.all_parity_ok(rows)
     if not ok:
         print("\nERROR: a variant failed on-device parity.")
     if args.json:
-        args.json.write_text(json.dumps(
-            dict(target="gba-arm7tdmi", rows=rows), indent=2))
+        args.json.write_text(
+            json.dumps(dict(target="gba-arm7tdmi", rows=rows), indent=2)
+        )
         print(f"wrote {args.json}")
     return 0 if ok else 1
 

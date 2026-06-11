@@ -12,6 +12,7 @@ Python package.
 
     .venv/bin/python benchmarks/wasm_target/bench_wasm.py [--json o.json] [--md o.md]
 """
+
 from __future__ import annotations
 import argparse
 import json
@@ -31,7 +32,7 @@ import _perf_schema as S
 HERE = pathlib.Path(__file__).resolve().parent
 HARNESS = HERE / "bench_fuel.rs"
 T_SEQ = 64
-R1, R2 = 5, 25           # two-point repeat counts (diff = 20)
+R1, R2 = 5, 25  # two-point repeat counts (diff = 20)
 
 
 def _lit(arr, dtype):
@@ -43,13 +44,16 @@ def _lit(arr, dtype):
 def _render(dtype, qm_or_rcexe, x_seq, workdir):
     X, Y, eps, npd, Kk, M, T = K.reference_data(dtype, qm_or_rcexe, x_seq)
     storage = "f32" if dtype == "float" else dtype
-    src = (HARNESS.read_text()
-           .replace("@@T@@", str(T)).replace("@@K@@", str(Kk))
-           .replace("@@M@@", str(M))
-           .replace("@@STORAGE_T@@", storage)
-           .replace("@@EPS@@", repr(float(eps)))
-           .replace("@@X_VALUES@@", _lit(X, dtype))
-           .replace("@@Y_VALUES@@", _lit(Y, dtype)))
+    src = (
+        HARNESS.read_text()
+        .replace("@@T@@", str(T))
+        .replace("@@K@@", str(Kk))
+        .replace("@@M@@", str(M))
+        .replace("@@STORAGE_T@@", storage)
+        .replace("@@EPS@@", repr(float(eps)))
+        .replace("@@X_VALUES@@", _lit(X, dtype))
+        .replace("@@Y_VALUES@@", _lit(Y, dtype))
+    )
     p = workdir / "bench_fuel.rs"
     p.write_text(src)
     return p, T
@@ -57,11 +61,12 @@ def _render(dtype, qm_or_rcexe, x_seq, workdir):
 
 def _measure_fuel(wasm_path, reps, stdout_path):
     import wasmtime
+
     cfg = wasmtime.Config()
     cfg.consume_fuel = True
     engine = wasmtime.Engine(cfg)
     store = wasmtime.Store(engine)
-    INIT = 10 ** 16
+    INIT = 10**16
     store.set_fuel(INIT)
     wasi = wasmtime.WasiConfig()
     wasi.argv = ["bench", str(reps)]
@@ -78,16 +83,24 @@ def _measure_fuel(wasm_path, reps, stdout_path):
             raise
     used = INIT - store.get_fuel()
     txt = pathlib.Path(stdout_path).read_text()
-    parity = "OK" if "parity=OK" in txt else (
-        "FAIL" if "parity=FAIL" in txt else "NA")
+    parity = (
+        "OK"
+        if "parity=OK" in txt
+        else ("FAIL" if "parity=FAIL" in txt else "NA")
+    )
     return used, parity
 
 
 def _build_and_run(target, dtype, qm_or_rcexe, x_seq, sparse, workdir):
     workdir.mkdir(parents=True, exist_ok=True)
-    rc_o = K.build_object(dtype, qm_or_rcexe, sparse,
-                          triple="wasm32-wasip1", cpu="",
-                          out_path=workdir / "rc_predict.o")
+    rc_o = K.build_object(
+        dtype,
+        qm_or_rcexe,
+        sparse,
+        triple="wasm32-wasip1",
+        cpu="",
+        out_path=workdir / "rc_predict.o",
+    )
     main_rs, T = _render(dtype, qm_or_rcexe, x_seq, workdir)
     wasm = workdir / "bench.wasm"
     target._link_rustc(main_rs, rc_o, wasm)
@@ -105,7 +118,9 @@ def run(sizes):
         rc, exe, x_seq, y_true, x_cal = K.train_model(units, density, T_SEQ)
         N = rc.reservoir.units
         nnz = int(np.count_nonzero(exe.W_res))
-        qms = {b: K.quant_model(b, rc, exe, x_cal) for b in ("i8", "i16", "i32")}
+        qms = {
+            b: K.quant_model(b, rc, exe, x_cal) for b in ("i8", "i16", "i32")
+        }
         with tempfile.TemporaryDirectory() as td:
             td = pathlib.Path(td)
             for dtype in S.DTYPES:
@@ -114,14 +129,24 @@ def run(sizes):
                 for kernel in S.KERNELS:
                     wd = td / f"{dtype}_{kernel}"
                     wb, fps, par = _build_and_run(
-                        target, dtype, src, x_seq,
-                        K.KERNEL_SPARSE[kernel], wd)
-                    rows.append(S.row(
-                        N=N, density=density, nnz=nnz, dtype=dtype,
-                        kernel=kernel, ops_per_step=fps, parity=par,
-                        wasm_B=wb, mse=mse,
-                        wres_B=K.wres_bytes(dtype, src,
-                                            K.KERNEL_SPARSE[kernel], N)))
+                        target, dtype, src, x_seq, K.KERNEL_SPARSE[kernel], wd
+                    )
+                    rows.append(
+                        S.row(
+                            N=N,
+                            density=density,
+                            nnz=nnz,
+                            dtype=dtype,
+                            kernel=kernel,
+                            ops_per_step=fps,
+                            parity=par,
+                            wasm_B=wb,
+                            mse=mse,
+                            wres_B=K.wres_bytes(
+                                dtype, src, K.KERNEL_SPARSE[kernel], N
+                            ),
+                        )
+                    )
     return rows
 
 
@@ -145,19 +170,25 @@ def main():
     print(S.fmt_text(TARGET, rows, unit="wasmtime fuel"))
 
     if args.md:
-        args.md.write_text(S.fmt_md(
-            TARGET, rows, unit="wasmtime fuel",
-            note="Quant scheme: i8/i16 = affine (calibrated), i32 = symmetric "
-                 "(affine i32 overflows the i64 requantize). wasm B = full "
-                 "module bytes (dominated by the Rust std/WASI runtime; only "
-                 "variant-to-variant deltas reflect the kernel)."))
+        args.md.write_text(
+            S.fmt_md(
+                TARGET,
+                rows,
+                unit="wasmtime fuel",
+                note="Quant scheme: i8/i16 = affine (calibrated), i32 = symmetric "
+                "(affine i32 overflows the i64 requantize). wasm B = full "
+                "module bytes (dominated by the Rust std/WASI runtime; only "
+                "variant-to-variant deltas reflect the kernel).",
+            )
+        )
         print(f"\nwrote {args.md}")
     ok = S.all_parity_ok(rows)
     if not ok:
         print("\nERROR: a variant failed parity.")
     if args.json:
-        args.json.write_text(json.dumps(
-            dict(target="wasm32-wasip1", rows=rows), indent=2))
+        args.json.write_text(
+            json.dumps(dict(target="wasm32-wasip1", rows=rows), indent=2)
+        )
         print(f"wrote {args.json}")
     return 0 if ok else 1
 

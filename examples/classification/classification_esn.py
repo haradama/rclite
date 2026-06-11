@@ -12,6 +12,7 @@ probabilities via argmax / softmax. Two task shapes are demonstrated:
        Each timestep gets a class — the existing per-step readout with an
        argmax / softmax head.
 """
+
 from __future__ import annotations
 import sys
 import pathlib
@@ -42,11 +43,11 @@ from rclite.runtime import RCExecutor
 
 def make_waveform(kind: int, length: int, rng) -> np.ndarray:
     t = np.linspace(0.0, 1.0, length)
-    if kind == 0:        # rising ramp
+    if kind == 0:  # rising ramp
         s = -1.0 + 2.0 * t
-    elif kind == 1:      # falling ramp
+    elif kind == 1:  # falling ramp
         s = 1.0 - 2.0 * t
-    else:                # triangle: rise then fall
+    else:  # triangle: rise then fall
         s = 1.0 - 4.0 * np.abs(t - 0.5)
     return (s + 0.05 * rng.standard_normal(length))[:, None]
 
@@ -72,14 +73,23 @@ def run_sequence_classification() -> None:
     rc = ReservoirComputer(
         input=InputNode(units=1, activation=Activation.IDENTITY, name="input"),
         reservoir=ReservoirNode(
-            units=120, activation=Activation.TANH, spectral_radius=0.9,
-            leak_rate=0.3, density=0.1, topology=Topology.RANDOM, seed=9,
+            units=120,
+            activation=Activation.TANH,
+            spectral_radius=0.9,
+            leak_rate=0.3,
+            density=0.1,
+            topology=Topology.RANDOM,
+            seed=9,
             name="reservoir",
         ),
         readout=ReadoutNode(
-            units=3, activation=Activation.IDENTITY, trainer=Trainer.RIDGE,
-            regularization=1e-3, washout=10,
-            task=Task.CLASSIFICATION, aggregation=Aggregation.MEAN,
+            units=3,
+            activation=Activation.IDENTITY,
+            trainer=Trainer.RIDGE,
+            regularization=1e-3,
+            washout=10,
+            task=Task.CLASSIFICATION,
+            aggregation=Aggregation.MEAN,
             name="readout",
         ),
     )
@@ -97,9 +107,13 @@ def run_sequence_classification() -> None:
     print(f"  accuracy       : {acc:.3f}")
     print("  sample predictions:")
     for i in range(3):
-        probs = ", ".join(f"{CLASS_NAMES[c]}={proba[i, c]:.2f}" for c in range(3))
-        print(f"    true={CLASS_NAMES[y_te[i]]:8s} pred={CLASS_NAMES[pred[i]]:8s}"
-              f"  [{probs}]")
+        probs = ", ".join(
+            f"{CLASS_NAMES[c]}={proba[i, c]:.2f}" for c in range(3)
+        )
+        print(
+            f"    true={CLASS_NAMES[y_te[i]]:8s} pred={CLASS_NAMES[pred[i]]:8s}"
+            f"  [{probs}]"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -121,14 +135,24 @@ def run_per_step_classification() -> None:
     rc = ReservoirComputer(
         input=InputNode(units=1, activation=Activation.IDENTITY, name="input"),
         reservoir=ReservoirNode(
-            units=80, activation=Activation.TANH, spectral_radius=0.9,
-            leak_rate=0.3, density=0.1, topology=Topology.RANDOM, seed=3,
+            units=80,
+            activation=Activation.TANH,
+            spectral_radius=0.9,
+            leak_rate=0.3,
+            density=0.1,
+            topology=Topology.RANDOM,
+            seed=3,
             name="reservoir",
         ),
         readout=ReadoutNode(
-            units=2, activation=Activation.IDENTITY, trainer=Trainer.RIDGE,
-            regularization=1e-4, washout=100, include_input=True,
-            task=Task.CLASSIFICATION, aggregation=Aggregation.NONE,
+            units=2,
+            activation=Activation.IDENTITY,
+            trainer=Trainer.RIDGE,
+            regularization=1e-4,
+            washout=100,
+            include_input=True,
+            task=Task.CLASSIFICATION,
+            aggregation=Aggregation.NONE,
             name="readout",
         ),
     )
