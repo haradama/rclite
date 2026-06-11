@@ -61,14 +61,22 @@ _WASM_LD = shutil.which("wasm-ld")
 HAVE_WASM = HAVE and _HAVE_WASMTIME and _WASM_LD is not None
 
 
-def _model(units=12, K=2, M=3, activation=Activation.TANH, seed=3):
+def _model(
+    units=12,
+    K=2,
+    M=3,
+    activation=Activation.TANH,
+    seed=3,
+    topology=Topology.ESN_STANDARD,
+    density=0.3,
+):
     rc = ReservoirComputer(
         input=InputNode(units=K, name="in"),
         reservoir=ReservoirNode(
             units=units,
-            topology=Topology.ESN_STANDARD,
+            topology=topology,
             leak_rate=0.3,
-            density=0.3,
+            density=density,
             seed=seed,
             activation=activation,
             name="res",
@@ -199,6 +207,137 @@ def test_lower_fused_float_vector():
     assert d < 1e-9, f"vectorized rc kernel vs runtime max|diff|={d:.2e}"
     print(
         f"  vectorized rc -> arith kernel matches runtime (max|diff|={d:.1e})"
+    )
+
+
+def test_lower_fused_tanh_numeric():
+    """The default ESN activation (tanh) lowers through the rc dialect and the
+    JITed kernel matches the runtime — the dialect handles real (non-identity)
+    reservoirs, not just the identity spike case. tanh declares an external libm
+    scalar that the MLIR func->llvm lowering + JIT resolve."""
+    if not HAVE:
+        print("  (skip)")
+        return
+    rc, exe, X = _model(activation=Activation.TANH)
+    m = build_ir(rc, exe)
+    mod = build_rc_module(m)
+    fuse_step_readout(mod)
+    txt = lower_fused_float(mod, m.weights, func_name="rc_predict_tanh")
+    got = _jit_float(txt, X, rc.readout.units, "rc_predict_tanh")
+    ref = exe.predict(X)
+    d = float(np.max(np.abs(got - ref)))
+    assert d < 1e-9, f"tanh rc-dialect kernel vs runtime max|diff|={d:.2e}"
+    print(f"  tanh rc -> arith kernel matches runtime (max|diff|={d:.1e})")
+
+
+def test_lower_fused_relu_sigmoid_numeric():
+    """relu (libm-free: cmpf+select) and sigmoid (external exp) both lower and
+    match the runtime — covers the inline and the libm activation paths."""
+    if not HAVE:
+        print("  (skip)")
+        return
+    for act in (Activation.RELU, Activation.SIGMOID):
+        rc, exe, X = _model(activation=act)
+        m = build_ir(rc, exe)
+        mod = build_rc_module(m)
+        fuse_step_readout(mod)
+        fn = f"rc_predict_{act.name.lower()}"
+        txt = lower_fused_float(mod, m.weights, func_name=fn)
+        got = _jit_float(txt, X, rc.readout.units, fn)
+        ref = exe.predict(X)
+        d = float(np.max(np.abs(got - ref)))
+        assert d < 1e-9, f"{act.name} rc kernel vs runtime max|diff|={d:.2e}"
+    print("  relu + sigmoid rc -> arith kernels match runtime (<1e-9)")
+
+
+def test_lower_fused_tanh_vector():
+    """The Stage-3 SIMD reductions still apply with a real activation: tanh +
+    vlen=4 vectorises the N-wide W_res/W_out reductions (the per-element tanh
+    stays scalar) and the result still matches the runtime."""
+    if not HAVE:
+        print("  (skip)")
+        return
+    rc, exe, X = _model(units=40, activation=Activation.TANH)
+    m = build_ir(rc, exe)
+    mod = build_rc_module(m)
+    fuse_step_readout(mod)
+    txt = lower_fused_float(
+        mod, m.weights, vlen=4, func_name="rc_predict_tanh_vec"
+    )
+    got = _jit_float(
+        txt,
+        X,
+        rc.readout.units,
+        "rc_predict_tanh_vec",
+        extra_passes=["--convert-vector-to-llvm"],
+    )
+    ref = exe.predict(X)
+    d = float(np.max(np.abs(got - ref)))
+    assert d < 1e-9, f"vectorized tanh rc kernel vs runtime max|diff|={d:.2e}"
+    print(
+        f"  vectorized tanh rc -> arith kernel matches runtime (max|diff|={d:.1e})"
+    )
+
+
+def test_lower_fused_structured_topologies():
+    """Structured reservoirs (DLR/SCR/DLRB) lower through the rc dialect: the
+    O(N) chain kernel (chain_weight*h[i-1], etc.) replaces the dense matvec and
+    needs no W_res global, matching the runtime. The recurrent term is now
+    topology-aware in one declarative lowering."""
+    if not HAVE:
+        print("  (skip)")
+        return
+    from rclite.ir.passes import StructuralSpecialize
+
+    for topo in (Topology.DLR, Topology.SCR, Topology.DLRB):
+        rc, exe, X = _model(units=24, topology=topo)
+        m = StructuralSpecialize()(build_ir(rc, exe))
+        mod = build_rc_module(m)
+        fuse_step_readout(mod)
+        fn = f"rc_predict_{topo.name.lower()}"
+        txt = lower_fused_float(mod, m.weights, func_name=fn)
+        got = _jit_float(txt, X, rc.readout.units, fn)
+        ref = exe.predict(X)
+        d = float(np.max(np.abs(got - ref)))
+        assert d < 1e-9, f"{topo.name} rc kernel vs runtime max|diff|={d:.2e}"
+    print("  DLR/SCR/DLRB chains -> rc arith kernels match runtime (<1e-9)")
+
+
+def test_lower_fused_csr_sparse():
+    """A CSR-sparsified reservoir (SparsifyReservoir) lowers through the rc
+    dialect: the dense W_res matvec becomes a CSR gather over each row's
+    nonzeros (val + i32 col/rowptr globals), matching the runtime. The readout
+    W_out_state@h reduction still vectorises at vlen=4 alongside the scalar CSR
+    reservoir kernel — the SparsifyReservoir knowledge now lives in the dialect
+    lowering, not a hand-written emitter branch."""
+    if not HAVE:
+        print("  (skip)")
+        return
+    from rclite.ir.passes import SparsifyReservoir
+
+    rc, exe, X = _model(units=48, density=0.2)
+    m = SparsifyReservoir(strategy="csr")(build_ir(rc, exe))
+    mod = build_rc_module(m)
+    fuse_step_readout(mod)
+    txt = lower_fused_float(mod, m.weights, func_name="rc_predict_csr")
+    got = _jit_float(txt, X, rc.readout.units, "rc_predict_csr")
+    ref = exe.predict(X)
+    d = float(np.max(np.abs(got - ref)))
+    assert d < 1e-9, f"CSR rc kernel vs runtime max|diff|={d:.2e}"
+    txtv = lower_fused_float(
+        mod, m.weights, vlen=4, func_name="rc_predict_csr_vec"
+    )
+    gotv = _jit_float(
+        txtv,
+        X,
+        rc.readout.units,
+        "rc_predict_csr_vec",
+        extra_passes=["--convert-vector-to-llvm"],
+    )
+    dv = float(np.max(np.abs(gotv - ref)))
+    assert dv < 1e-9, f"vectorized CSR rc kernel vs runtime max|diff|={dv:.2e}"
+    print(
+        f"  CSR-sparse reservoir -> rc arith kernel match (max|diff|={d:.1e})"
     )
 
 
@@ -629,6 +768,11 @@ TESTS = [
     test_fuse_pattern,
     test_lower_fused_float_numeric,
     test_lower_fused_float_vector,
+    test_lower_fused_tanh_numeric,
+    test_lower_fused_relu_sigmoid_numeric,
+    test_lower_fused_tanh_vector,
+    test_lower_fused_structured_topologies,
+    test_lower_fused_csr_sparse,
     test_cross_isa_simd,
     test_f32_armv7_neon_simd,
     test_wasm_simd_execution,

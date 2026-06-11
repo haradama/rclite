@@ -10,8 +10,8 @@ declarative, verifiable, composable MLIR passes:
     build_rc_module(ir_module)        rclite IR Module -> `rc` dialect ModuleOp
     fuse_step_readout(mod)            xDSL RewritePattern: step;build_phi;readout
                                       -> rc.fused_step_readout  (3 ops -> 1)
-    lower_fused_float(...)            rc.fused_step_readout (float dense, identity
-                                      activation) -> arith/memref/scf rc_predict
+    lower_fused_float(...)            rc.fused_step_readout (float; any activation;
+                                      dense/structured/CSR) -> arith/memref/scf
 
 The dialect ops are *marker* ops carrying their parameters in a single
 `DictionaryAttr` and sequenced inside an `rc.time_loop` region — enough to make
@@ -162,6 +162,25 @@ def _emit_time_loop(loop: TimeLoop) -> None:
     )
 
 
+def _sparse_kw(op) -> dict:
+    """`res_*` param fields carrying an rclite op's optional `SparseSpec`.
+
+    The CSR plan (val/col/rowptr global names) rides along in the marker op so
+    the lowering can pick the sparse W_res kernel; dense/structured carry empty
+    strings. `unroll` is carried verbatim so the lowering guard rejects it
+    explicitly rather than mis-routing to the (absent) dense W_res global.
+    """
+    s = op.res_sparse
+    if s is None:
+        return dict(res_kind="", res_val="", res_col="", res_rowptr="")
+    return dict(
+        res_kind=s.kind,
+        res_val=s.val_name,
+        res_col=s.col_name,
+        res_rowptr=s.rowptr_name,
+    )
+
+
 def _emit_body_op(op) -> None:
     if isinstance(op, ReservoirStep):
         ReservoirStepOp(
@@ -177,6 +196,7 @@ def _emit_body_op(op) -> None:
                     chain_feedback=op.chain_feedback,
                     W_in=op.W_in_name,
                     W_res=op.W_res_name or "",
+                    **_sparse_kw(op),
                 )
             }
         )
@@ -218,6 +238,7 @@ def _fused_params_from(op: FusedStepReadout) -> DictionaryAttr:
         W_in=op.W_in_name,
         W_res=op.W_res_name or "",
         W_out=op.W_out_name,
+        **_sparse_kw(op),
     )
 
 
@@ -258,6 +279,10 @@ class FuseStepReadoutPattern(RewritePattern):
             W_in=_get(step, "W_in"),
             W_res=_get(step, "W_res"),
             W_out=_get(ro, "W_out"),
+            res_kind=_get(step, "res_kind"),
+            res_val=_get(step, "res_val"),
+            res_col=_get(step, "res_col"),
+            res_rowptr=_get(step, "res_rowptr"),
         )
         rw.erase_op(ro)
         rw.erase_op(phi)
@@ -283,13 +308,15 @@ def count_ops(mod: ModuleOp) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Lowering: rc.fused_step_readout (float dense, identity activation) -> arith
+# Lowering: rc.fused_step_readout (float; any activation; dense/CSR/structured)
 # ---------------------------------------------------------------------------
 # This is the genuine dialect -> MLIR -> executable leg of the spike. It lowers
 # the *fused* op to an arith/memref/scf `rc_predict` kernel (no phi buffer; the
-# readout reads `h` directly), runnable via the existing mlir_jit pipeline. The
-# float/identity case keeps the spike libm-free and is the substrate for the
-# Stage-3 `vector`/`affine` lowering where MLIR auto-vectorisation pays off.
+# readout reads `h` directly), runnable via the existing mlir_jit pipeline. All
+# four activations are supported: relu/identity stay libm-free (import-free on
+# WASM / FPU-less cores), tanh/sigmoid declare an external libm scalar. The
+# N-wide reductions are the substrate for the Stage-3 `vector` lowering where
+# MLIR auto-vectorisation pays off (the scalar activation does not block it).
 import io  # noqa: E402
 
 from xdsl.dialects import arith, memref, func, vector  # noqa: E402
@@ -303,9 +330,10 @@ from xdsl.dialects.builtin import (  # noqa: E402
 )
 from xdsl.printer import Printer  # noqa: E402
 
-from .mlir_xdsl_common import c_idx, for_  # noqa: E402
+from .mlir_xdsl_common import c_idx, call, for_, _dense_global  # noqa: E402
 
 _IDX = IndexType()
+_I32 = IntegerType(32)
 _ADD_KIND = vector.CombiningKindAttr(vector.CombiningKindFlag.ADD)
 
 
@@ -366,6 +394,66 @@ def _matvec_acc(Wmem, base, hmem, N, vlen, acc0, ety):
     return acc
 
 
+def _res_contrib_dlr(acc, i, hmem, chain_weight, ety):
+    """DLR: `+ chain_weight*h[i-1]` for i>0 (else +0). Mirrors the float lowerer."""
+    z, one = c_idx(0), c_idx(1)
+    is_pos = arith.CmpiOp(i, z, "sgt").result
+    i_safe = arith.SelectOp(is_pos, arith.SubiOp(i, one).result, z).result
+    val = memref.LoadOp.get(hmem, [i_safe]).res
+    prod = arith.MulfOp(_fconst(chain_weight, ety), val).result
+    contrib = arith.SelectOp(is_pos, prod, _fconst(0.0, ety)).result
+    return arith.AddfOp(acc, contrib).result
+
+
+def _res_contrib_scr(acc, i, N, hmem, chain_weight, ety):
+    """SCR (ring): `+ chain_weight*h[(i-1) mod N]`."""
+    z, one, nm1 = c_idx(0), c_idx(1), c_idx(N - 1)
+    is_zero = arith.CmpiOp(i, z, "eq").result
+    i_prev = arith.SelectOp(is_zero, nm1, arith.SubiOp(i, one).result).result
+    val = memref.LoadOp.get(hmem, [i_prev]).res
+    return arith.AddfOp(
+        acc, arith.MulfOp(_fconst(chain_weight, ety), val).result
+    ).result
+
+
+def _res_contrib_dlrb(acc, i, N, hmem, chain_weight, chain_feedback, ety):
+    """DLRB: `+ chain_weight*h[i-1] (i>0) + chain_feedback*h[i+1] (i<N-1)`."""
+    z, one, nm1 = c_idx(0), c_idx(1), c_idx(N - 1)
+    zf = _fconst(0.0, ety)
+    is_pos = arith.CmpiOp(i, z, "sgt").result
+    i_back = arith.SelectOp(is_pos, arith.SubiOp(i, one).result, z).result
+    vb = memref.LoadOp.get(hmem, [i_back]).res
+    cb = arith.SelectOp(
+        is_pos, arith.MulfOp(_fconst(chain_weight, ety), vb).result, zf
+    ).result
+    is_lt = arith.CmpiOp(i, nm1, "slt").result
+    i_fwd = arith.SelectOp(is_lt, arith.AddiOp(i, one).result, nm1).result
+    vf = memref.LoadOp.get(hmem, [i_fwd]).res
+    cf = arith.SelectOp(
+        is_lt, arith.MulfOp(_fconst(chain_feedback, ety), vf).result, zf
+    ).result
+    return arith.AddfOp(arith.AddfOp(acc, cb).result, cf).result
+
+
+def _res_contrib_csr(acc, i, vmem, cmem, rpmem, hmem, ety):
+    """CSR: `+ sum_{p in [rowptr[i], rowptr[i+1])} val[p]*h[col[p]]`.
+
+    col/rowptr are i32 globals (index-cast per access); the ascending-p loop
+    keeps the float accumulation order the executor uses (ascending column)."""
+    start = arith.IndexCastOp(memref.LoadOp.get(rpmem, [i]).res, _IDX).result
+    ip1 = arith.AddiOp(i, c_idx(1)).result
+    end = arith.IndexCastOp(memref.LoadOp.get(rpmem, [ip1]).res, _IDX).result
+
+    def pbody(p, args):
+        (a,) = args
+        j = arith.IndexCastOp(memref.LoadOp.get(cmem, [p]).res, _IDX).result
+        w = memref.LoadOp.get(vmem, [p]).res
+        hv = memref.LoadOp.get(hmem, [j]).res
+        return [arith.AddfOp(a, arith.MulfOp(w, hv).result).result]
+
+    return for_(start, end, c_idx(1), [acc], pbody)[0]
+
+
 def _find_fused(mod: ModuleOp):
     loop = next(o for o in mod.walk() if isinstance(o, TimeLoopOp))
     fused = next(
@@ -394,6 +482,53 @@ def _fglobal(name, arr, ety):
     )
 
 
+def _libm_name(base: str, ety) -> str:
+    """libm scalar name for the element type: ``tanh`` -> ``tanhf`` in f32."""
+    return base + ("f" if ety is _F32 else "")
+
+
+def _libm_for(activation: str) -> tuple:
+    """libm symbols an activation pulls in (declared once at module scope).
+
+    relu/identity are emitted inline (libm-free, so they stay import-free on
+    WASM / FPU-less cores); tanh/sigmoid need a scalar libm import.
+    """
+    if activation == "TANH":
+        return ("tanh",)
+    if activation == "SIGMOID":
+        return ("exp",)
+    return ()
+
+
+def _emit_activation(pre_val, activation: str, ety):
+    """Apply the reservoir activation f to a pre-activation scalar ``pre_val``.
+
+    Mirrors `rclite.runtime.reference._ACTIVATIONS` and the LLVM float lowerer
+    (`rclite.codegen._llvm_float`):
+      identity -> x ; relu -> max(0, x) (cmpf+select, libm-free) ;
+      tanh -> @tanh[f](x) ; sigmoid -> 1 / (1 + @exp[f](-x)).
+    Emits into the active `ImplicitBuilder`; the libm calls resolve against the
+    external declarations `lower_fused_float` adds at module scope.
+    """
+    if activation == "IDENTITY":
+        return pre_val
+    if activation == "RELU":
+        z = _fconst(0.0, ety)
+        gt = arith.CmpfOp(pre_val, z, "ogt").result
+        return arith.SelectOp(gt, pre_val, z).result
+    if activation == "TANH":
+        return call(_libm_name("tanh", ety), [pre_val], ety)
+    if activation == "SIGMOID":
+        one = _fconst(1.0, ety)
+        zero = _fconst(0.0, ety)
+        neg = arith.SubfOp(zero, pre_val).result
+        e = call(_libm_name("exp", ety), [neg], ety)
+        return arith.DivfOp(one, arith.AddfOp(one, e).result).result
+    raise NotImplementedError(
+        f"rc dialect lowering: unsupported activation {activation!r}"
+    )
+
+
 def lower_fused_float(
     mod: ModuleOp,
     weights: dict,
@@ -401,27 +536,50 @@ def lower_fused_float(
     func_name: str = "rc_predict",
     dtype: str = "f64",
 ) -> str:
-    """Lower a fused `rc` module (float dense, identity activation) to an
-    arith/memref/scf `rc_predict` kernel and return the printed MLIR.
+    """Lower a fused `rc` module (float; any activation; dense / structured /
+    CSR-sparse reservoir) to an arith/memref/scf `rc_predict` kernel and return
+    the printed MLIR.
 
     Mirrors the fused float reference: per step, `pre = W_in@u + W_res@h + bias`,
-    `h = (1-leak)*h + leak*pre` (identity activation), then the readout reads `h`
-    directly — `y[m] = [bias] + [W_out_in@u] + W_out_state@h`.
+    `h = (1-leak)*h + leak*act(pre)` where `act` is tanh / sigmoid / relu /
+    identity, then the readout reads `h` directly — `y[m] = [bias] +
+    [W_out_in@u] + W_out_state@h`.
 
-    `vlen` sets the SIMD width of the two N-wide reductions (`W_res@h` and the
-    readout `W_out_state@h`): `vlen=1` is the scalar baseline, `vlen>1` emits the
-    `vector`-dialect reduction (Stage 3). Lower the vector form with the extended
-    pipeline (`mlir_jit` + `--convert-vector-to-llvm`).
+    The recurrent `W_res@h` term is lowered per the op's topology: a dense N×N
+    matvec (RANDOM/ESN_STANDARD, vectorisable via `vlen`), a CSR gather when the
+    op carries a `csr` sparse plan, or an O(N) chain for the structured
+    topologies (DLR/SCR/DLRB) — the same three kernels the hand-written LLVM
+    lowerer emits, consolidated here as one declarative dialect lowering.
+
+    `vlen` sets the SIMD width of the N-wide reductions: the readout
+    `W_out_state@h` always, and the dense `W_res@h` matvec (the structured/CSR
+    reservoir kernels stay scalar — they have no dense reduction to widen).
+    `vlen=1` is the scalar baseline, `vlen>1` emits the `vector`-dialect
+    reduction (Stage 3). Lower the vector form with the extended pipeline
+    (`mlir_jit` + `--convert-vector-to-llvm`).
 
     `dtype` is `f64` or `f32`. f32 packs 4 lanes into a 128-bit SIMD register, so
     `dtype="f32", vlen=4` is what gets armv7 NEON (no f64 SIMD) and WASM SIMD128
     to vectorise; the X/Y c-interface arrays are then f32."""
     ety = _F32 if dtype == "f32" else _F64
     op = _find_fused(mod)
-    if _get(op, "activation") != "IDENTITY":
-        raise NotImplementedError("spike lowering: identity activation only")
-    if _get(op, "topology") not in ("ESN_STANDARD", "RANDOM"):
-        raise NotImplementedError("spike lowering: dense topology only")
+    activation = _get(op, "activation")
+    topology = _get(op, "topology")
+    res_kind = _get(op, "res_kind")
+    chain_weight = _get(op, "chain_weight")
+    chain_feedback = _get(op, "chain_feedback")
+    if res_kind not in ("", "csr"):
+        raise NotImplementedError(
+            f"rc lowering: res_sparse kind {res_kind!r} (csr / dense only)"
+        )
+    if res_kind == "" and topology not in (
+        "ESN_STANDARD",
+        "RANDOM",
+        "DLR",
+        "SCR",
+        "DLRB",
+    ):
+        raise NotImplementedError(f"rc lowering: topology {topology!r}")
     N, K, M, F = (_get(op, k) for k in ("N", "K", "M", "F"))
     leak, bias = _get(op, "leak"), _get(op, "bias")
     inc_b = bool(_get(op, "include_bias_phi"))
@@ -434,11 +592,27 @@ def lower_fused_float(
         _get(op, "W_out"),
     )
 
+    # W_in / W_out are always dense globals; the reservoir term's global(s)
+    # depend on the topology: a dense W_res, the CSR (val/col/rowptr) triple,
+    # or nothing for the structured chains (they read h via chain_weight).
+    dense = res_kind == "" and topology in ("ESN_STANDARD", "RANDOM")
     globals_ = [
         _fglobal("W_in", weights[W_in], ety),
-        _fglobal("W_res", weights[W_res], ety),
         _fglobal("W_out", weights[W_out], ety),
     ]
+    if dense:
+        globals_.append(_fglobal("W_res", weights[W_res], ety))
+    elif res_kind == "csr":
+        v = _get(op, "res_val")
+        c = _get(op, "res_col")
+        rp = _get(op, "res_rowptr")
+        nnz = int(np.asarray(weights[v]).size)
+        nrp = int(np.asarray(weights[rp]).size)
+        globals_ += [
+            _fglobal(v, weights[v], ety),
+            _dense_global(c, weights[c], 32),
+            _dense_global(rp, weights[rp], 32),
+        ]
 
     dyn = MemRefType(ety, [memref.DYNAMIC_INDEX])
     region = Region([Block(arg_types=[_I64, dyn, dyn])])
@@ -447,8 +621,14 @@ def lower_fused_float(
         c0, c1 = c_idx(0), c_idx(1)
         Ti = arith.IndexCastOp(T, _IDX).result
         Win = memref.GetGlobalOp("W_in", MemRefType(ety, [N * K])).memref
-        Wres = memref.GetGlobalOp("W_res", MemRefType(ety, [N * N])).memref
         Wout = memref.GetGlobalOp("W_out", MemRefType(ety, [M * F])).memref
+        Wres = Wval = Wcol = Wrowptr = None
+        if dense:
+            Wres = memref.GetGlobalOp("W_res", MemRefType(ety, [N * N])).memref
+        elif res_kind == "csr":
+            Wval = memref.GetGlobalOp(v, MemRefType(ety, [nnz])).memref
+            Wcol = memref.GetGlobalOp(c, MemRefType(_I32, [nnz])).memref
+            Wrowptr = memref.GetGlobalOp(rp, MemRefType(_I32, [nrp])).memref
         h = memref.AllocaOp.get(ety, shape=[N]).memref
         pre = memref.AllocaOp.get(ety, shape=[N]).memref
         z, one_ml, leakc, biasc = (
@@ -469,10 +649,7 @@ def lower_fused_float(
             tM = arith.MuliOp(t, cM).result
 
             def pre_body(i, _):
-                iK, iN = (
-                    arith.MuliOp(i, cK).result,
-                    arith.MuliOp(i, cN).result,
-                )
+                iK = arith.MuliOp(i, cK).result
 
                 def kin(k, args):
                     (a,) = args
@@ -483,7 +660,21 @@ def lower_fused_float(
                     return [arith.AddfOp(a, arith.MulfOp(w, x).result).result]
 
                 acc = for_(c0, cK, c1, [biasc], kin)[0]
-                acc = _matvec_acc(Wres, iN, h, N, vlen, acc, ety)
+                # Recurrent W_res@h term: dense matvec (vectorisable via vlen),
+                # CSR gather, or an O(N) structured chain (DLR/SCR/DLRB).
+                if res_kind == "csr":
+                    acc = _res_contrib_csr(acc, i, Wval, Wcol, Wrowptr, h, ety)
+                elif topology == "DLR":
+                    acc = _res_contrib_dlr(acc, i, h, chain_weight, ety)
+                elif topology == "SCR":
+                    acc = _res_contrib_scr(acc, i, N, h, chain_weight, ety)
+                elif topology == "DLRB":
+                    acc = _res_contrib_dlrb(
+                        acc, i, N, h, chain_weight, chain_feedback, ety
+                    )
+                else:
+                    iN = arith.MuliOp(i, cN).result
+                    acc = _matvec_acc(Wres, iN, h, N, vlen, acc, ety)
                 memref.StoreOp.get(acc, pre, [i])
                 return []
 
@@ -492,9 +683,13 @@ def lower_fused_float(
             def act_body(i, _):
                 hv = memref.LoadOp.get(h, [i]).res
                 pv = memref.LoadOp.get(pre, [i]).res
+                # h <- (1-leak)*h + leak*act(pre)  (act applied to the
+                # pre-activation, then the leaky-integrator blend; matches
+                # reference._preprocess + _llvm_float._emit_activation).
+                av = _emit_activation(pv, activation, ety)
                 nh = arith.AddfOp(
                     arith.MulfOp(one_ml, hv).result,
-                    arith.MulfOp(leakc, pv).result,
+                    arith.MulfOp(leakc, av).result,
                 ).result
                 memref.StoreOp.get(nh, h, [i])
                 return []
@@ -537,7 +732,12 @@ def lower_fused_float(
     main = func.FuncOp(func_name, ([_I64, dyn, dyn], []), region)
     main.attributes["llvm.emit_c_interface"] = UnitAttr()
 
-    out = ModuleOp([*globals_, main])
+    # External libm scalar declarations for tanh/sigmoid (none for relu/identity).
+    externs = [
+        func.FuncOp.external(_libm_name(base, ety), [ety], [ety])
+        for base in _libm_for(activation)
+    ]
+    out = ModuleOp([*externs, *globals_, main])
     out.verify()
     buf = io.StringIO()
     Printer(stream=buf).print_op(out)
