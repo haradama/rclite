@@ -208,6 +208,54 @@ def cross_compile_object(
         return out.read_bytes()
 
 
+def emit_c_header(
+    *,
+    K: int,
+    M: int,
+    storage_bits: int,
+    classify: bool = False,
+    func_name: str = "rc_predict",
+    guard: str = "RC_KERNEL_H",
+) -> str:
+    """C header that exposes a `cross_compile_object` kernel `.o` to C callers.
+
+    The MLIR/LLVM object carries the optimized (e.g. vectorized) kernel; this
+    header declares its unpacked-memref ABI and a clean `rc_run(T, X, Y)` inline
+    that hides the descriptor arguments. Pairing the `.o` with this header lets a
+    C/embedded toolchain LINK the LLVM-optimized kernel without its own compiler
+    having to reproduce the optimization — the kernel's SIMD/opt comes from the
+    `.o`, the C side only marshals pointers (compile the caller at any -O level).
+
+    `classify` selects the i32 class-id output ABI (one value per step) instead
+    of the M-wide storage-typed logits/proba output.
+    """
+    in_t = f"int{storage_bits}_t"
+    if classify:
+        out_t, out_n = "int32_t", "1"
+    else:
+        out_t, out_n = f"int{storage_bits}_t", "RC_M"
+    return f"""#ifndef {guard}
+#define {guard}
+#include <stdint.h>
+#define RC_K {K}
+#define RC_M {M}
+typedef {in_t} rc_in_t;
+typedef {out_t} rc_out_t;
+/* Optimized kernel object (built by rclite via MLIR/LLVM -- vectorized when the
+ * target has a SIMD ISA). Unpacked 1-D memref ABI; link the companion .o. */
+void {func_name}(int64_t T,
+  const rc_in_t*, const rc_in_t*, int64_t, int64_t, int64_t,
+  rc_out_t*, rc_out_t*, int64_t, int64_t, int64_t);
+/* Clean entry point: hides the memref descriptor args. X is T*RC_K inputs,
+ * Y is T*{out_n} outputs (both contiguous). */
+static inline void rc_run(int64_t T, const rc_in_t *X, rc_out_t *Y) {{
+  {func_name}(T, X, X, 0, (int64_t)T * RC_K, 1,
+              Y, Y, 0, (int64_t)T * {out_n}, 1);
+}}
+#endif /* {guard} */
+"""
+
+
 class CompiledMLIRJit:
     """JIT-compile an MLIR kernel via llvmlite MCJIT and run it through ctypes.
 

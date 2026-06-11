@@ -427,6 +427,203 @@ def test_wasm_quant_simd_execution():
     print(f"  wasm32+simd128 quantized i8 kernel bit-exact (max|diff|={d})")
 
 
+def test_optimized_object_c_header():
+    """The C-deliverable route: cross-compile the *vectorized* quant kernel to an
+    object via MLIR/LLVM, expose it with `emit_c_header`, and link it from a C
+    driver compiled at -O0. The output is bit-exact and the .o carries the SIMD
+    (the C compiler did no optimization) — so a C/embedded toolchain gets the
+    MLIR/LLVM optimization without reproducing it. Refutes 'the C route can't get
+    MLIR/LLVM optimizations'."""
+    import re
+    import pathlib
+    import subprocess
+    import tempfile
+
+    if not HAVE or shutil.which("gcc") is None:
+        print("  (skip: gcc / MLIR toolchain not available)")
+        return
+    from rclite.quant.affine import (
+        calibrate_from_data,
+        quantize_model_affine,
+        AffineQuantizedExecutor,
+    )
+    from rclite.codegen.mlir_affine_xdsl import emit_affine_mlir_xdsl
+
+    rc, exe, X = _model(units=128, M=8, seed=7)
+    qm = quantize_model_affine(
+        rc, exe, calibrate_from_data(rc, exe, X[:100], storage_bits=8)
+    )
+    Xt = X[100:122]
+    T, K, Mo = Xt.shape[0], qm.K, qm.M
+    Xq = np.ascontiguousarray(
+        qm.config.input.quantize_array(Xt), dtype=np.int8
+    )
+    qe = AffineQuantizedExecutor(qm)
+    qe.reset()
+    ref = np.zeros((T, Mo), dtype=np.int64)
+    for t in range(T):
+        xr = qe._quantize_raw_input(Xt[t])
+        qe.step_q(qe._quantize_u_pre(Xt[t]))
+        ref[t] = qe.predict_one_q(xr, qe.state_q)
+
+    obj = mlir_jit.cross_compile_object(
+        emit_affine_mlir_xdsl(qm, vlen=8),
+        triple="x86_64-unknown-linux-gnu",
+        features="+avx2",
+        extra_passes=["--convert-vector-to-llvm"],
+        filetype="obj",
+    )
+    hdr = mlir_jit.emit_c_header(K=K, M=Mo, storage_bits=8)
+    td = pathlib.Path(tempfile.mkdtemp())
+    (td / "rc_kernel.o").write_bytes(obj)
+    (td / "rc_kernel.h").write_text(hdr)
+    xcsv = ",".join(str(int(v)) for v in Xq.reshape(-1))
+    (td / "drv.c").write_text(
+        '#include <stdio.h>\n#include "rc_kernel.h"\n'
+        f"static const rc_in_t X[{T * K}]={{{xcsv}}};\n"
+        f"int main(void){{ rc_out_t Y[{T * Mo}]; rc_run({T},X,Y);"
+        f' for(int i=0;i<{T * Mo};i++) printf("%d\\n",(int)Y[i]); return 0; }}\n'
+    )
+    r = subprocess.run(
+        [
+            "gcc",
+            "-no-pie",
+            "-O0",
+            str(td / "drv.c"),
+            str(td / "rc_kernel.o"),
+            "-o",
+            str(td / "app"),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert r.returncode == 0, f"link failed:\n{r.stderr}"
+    out = subprocess.run(
+        [str(td / "app")], capture_output=True, text=True
+    ).stdout
+    got = np.array([int(x) for x in out.split()], dtype=np.int64).reshape(
+        T, Mo
+    )
+    d = int(np.max(np.abs(ref - got)))
+    assert d == 0, f"object+header kernel vs executor max|diff|={d}"
+    asm = subprocess.run(
+        ["objdump", "-d", str(td / "rc_kernel.o")],
+        capture_output=True,
+        text=True,
+    ).stdout
+    simd = sum(
+        1
+        for ln in asm.splitlines()
+        if re.search(r"\b(vpmaddwd|vpmulld|vpaddd|vpaddq)\b", ln)
+    )
+    assert simd > 0, "the .o should carry SIMD from MLIR/LLVM"
+    print(
+        f"  MLIR/LLVM .o + C header, linked from -O0 C driver: bit-exact "
+        f"(max|diff|={d}), SIMD in .o ({simd} instrs)"
+    )
+
+
+def test_export_optimized_object_api():
+    """`export_optimized_object(qmodel, target=...)` bundles the .o + .h route as
+    a formal export API: it writes `rc_kernel.{o,h}` + README for the chosen SIMD
+    target, the object is bit-exact with the executor when linked from a -O0 C
+    driver, and carries the SIMD. Also checks target resolution (named key,
+    vlen override -> scalar) and that cross targets emit distinct objects."""
+    import pathlib
+    import subprocess
+    import tempfile
+
+    if not HAVE or shutil.which("gcc") is None:
+        print("  (skip: gcc / MLIR toolchain not available)")
+        return
+    from rclite.quant.affine import (
+        calibrate_from_data,
+        quantize_model_affine,
+        AffineQuantizedExecutor,
+    )
+    from rclite.export import (
+        export_optimized_object,
+        OptimizedObjectBundle,
+        SIMD_TARGETS,
+    )
+
+    rc, exe, X = _model(units=96, M=6, seed=5)
+    qm = quantize_model_affine(
+        rc, exe, calibrate_from_data(rc, exe, X[:100], storage_bits=8)
+    )
+    Xt = X[100:122]
+    T, K, Mo = Xt.shape[0], qm.K, qm.M
+    Xq = np.ascontiguousarray(
+        qm.config.input.quantize_array(Xt), dtype=np.int8
+    )
+    qe = AffineQuantizedExecutor(qm)
+    qe.reset()
+    ref = np.zeros((T, Mo), dtype=np.int64)
+    for t in range(T):
+        xr = qe._quantize_raw_input(Xt[t])
+        qe.step_q(qe._quantize_u_pre(Xt[t]))
+        ref[t] = qe.predict_one_q(xr, qe.state_q)
+
+    td = pathlib.Path(tempfile.mkdtemp())
+    bundle = export_optimized_object(
+        qm, target="x86_64-avx2", out_dir=td, name="rc_kernel"
+    )
+    assert isinstance(bundle, OptimizedObjectBundle)
+    assert bundle.target.vlen == 8
+    for fn in ("rc_kernel.o", "rc_kernel.h", "README.md"):
+        assert (td / fn).exists(), f"bundle missing {fn}"
+
+    xcsv = ",".join(str(int(v)) for v in Xq.reshape(-1))
+    (td / "drv.c").write_text(
+        '#include <stdio.h>\n#include "rc_kernel.h"\n'
+        f"static const rc_in_t X[{T * K}]={{{xcsv}}};\n"
+        f"int main(void){{ rc_out_t Y[{T * Mo}]; rc_run({T},X,Y);"
+        f' for(int i=0;i<{T * Mo};i++) printf("%d\\n",(int)Y[i]); return 0; }}\n'
+    )
+    r = subprocess.run(
+        [
+            "gcc",
+            "-no-pie",
+            "-O0",
+            str(td / "drv.c"),
+            str(td / "rc_kernel.o"),
+            "-o",
+            str(td / "app"),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert r.returncode == 0, f"link failed:\n{r.stderr}"
+    out = subprocess.run(
+        [str(td / "app")], capture_output=True, text=True
+    ).stdout
+    got = np.array([int(x) for x in out.split()], dtype=np.int64).reshape(
+        T, Mo
+    )
+    d = int(np.max(np.abs(ref - got)))
+    assert d == 0, f"export_optimized_object kernel vs executor max|diff|={d}"
+    asm = subprocess.run(
+        ["objdump", "-d", str(td / "rc_kernel.o")],
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert "vpmulld" in asm or "vpaddd" in asm, "the .o should carry SIMD"
+
+    # Return-only mode (no out_dir) + per-target distinct codegen.
+    avx2 = export_optimized_object(qm, target="x86_64-avx2")
+    neon = export_optimized_object(qm, target="aarch64-neon")
+    assert avx2.object_code and neon.object_code
+    assert avx2.object_code != neon.object_code, "targets should differ"
+    # vlen override -> scalar object (smaller / no vector passes), still builds.
+    scalar = export_optimized_object(qm, target="x86_64-avx2", vlen=1)
+    assert scalar.target.vlen == 1 and scalar.object_code
+    assert "x86_64-avx2" in SIMD_TARGETS
+    print(
+        f"  export_optimized_object: bundle written, -O0 C link bit-exact "
+        f"(max|diff|={d}), SIMD in .o; {len(SIMD_TARGETS)} curated targets"
+    )
+
+
 TESTS = [
     test_dialect_build_and_verify,
     test_fuse_pattern,
@@ -436,6 +633,8 @@ TESTS = [
     test_f32_armv7_neon_simd,
     test_wasm_simd_execution,
     test_wasm_quant_simd_execution,
+    test_optimized_object_c_header,
+    test_export_optimized_object_api,
 ]
 
 
