@@ -40,6 +40,13 @@ from ..target import (
     affine_reference_outputs,
     symmetric_reference_outputs,
 )
+from .._arm_gcc import (
+    cross_object,
+    read_size,
+    require_tool,
+    run_tool,
+    storage_types,
+)
 
 
 _SUPPORT_DIR = pathlib.Path(__file__).parent / "support"
@@ -75,34 +82,11 @@ class GbaTarget(Target):
     # -- internal helpers --------------------------------------------------
 
     def _require_cc(self):
-        if shutil.which(self.cc) is None:
-            raise RuntimeError(
-                f"{self.cc} not found on PATH — install gcc-arm-none-eabi"
-            )
+        require_tool(self.cc)
 
     def _cross_object(self, ll_mod, out: pathlib.Path) -> pathlib.Path:
         """Optimize a quantized LLVM module for thumbv4t and emit rc_predict.o."""
-        import llvmlite.binding as llvm
-        from rclite.codegen.llvm import _ensure_all_targets
-
-        ll_mod.triple = self.triple
-        _ensure_all_targets()
-        mod = llvm.parse_assembly(str(ll_mod))
-        mod.verify()
-        target = llvm.Target.from_triple(self.triple)
-        tm = target.create_target_machine(cpu=self.cpu, opt=2, reloc="static")
-        pto = llvm.create_pipeline_tuning_options()
-        pto.speed_level = 2
-        pto.loop_vectorization = False  # ARMv4T has no SIMD
-        pto.slp_vectorization = False
-        pb = llvm.create_pass_builder(tm, pto)
-        pb.getModulePassManager().run(mod, pb)
-        rc_o = out / "rc_predict.o"
-        with open(rc_o, "wb") as f:
-            f.write(tm.emit_object(mod))
-        with open(out / "rc_predict.s", "w") as f:
-            f.write(tm.emit_assembly(mod))
-        return rc_o
+        return cross_object(ll_mod, triple=self.triple, cpu=self.cpu, out=out)
 
     def _build_rom(
         self,
@@ -134,7 +118,7 @@ class GbaTarget(Target):
 
         # crt0 is ARM; main is Thumb.
         crt0_o = out / "crt0.o"
-        cp = subprocess.run(
+        run_tool(
             [
                 self.cc,
                 "-c",
@@ -145,14 +129,11 @@ class GbaTarget(Target):
                 "-o",
                 str(crt0_o),
             ],
-            capture_output=True,
-            text=True,
+            error="assemble failed for crt0.s",
         )
-        if cp.returncode != 0:
-            raise RuntimeError(f"assemble failed for crt0.s: {cp.stderr}")
 
         main_o = out / "main.o"
-        cp = subprocess.run(
+        run_tool(
             [
                 self.cc,
                 "-c",
@@ -162,11 +143,8 @@ class GbaTarget(Target):
                 "-o",
                 str(main_o),
             ],
-            capture_output=True,
-            text=True,
+            error="compile failed for main.c",
         )
-        if cp.returncode != 0:
-            raise RuntimeError(f"compile failed for main.c: {cp.stderr}")
 
         elf = out / "rc.elf"
         link_cmd = [
@@ -189,35 +167,18 @@ class GbaTarget(Target):
             if with_float
             else ["-lgcc", "-lc", "-lnosys"]
         )
-        cp = subprocess.run(link_cmd, capture_output=True, text=True)
-        if cp.returncode != 0:
-            raise RuntimeError(f"link failed: {cp.stderr}")
+        run_tool(link_cmd, error="link failed")
 
         rom = out / "rc.gba"
-        if shutil.which(self.objcopy) is None:
-            raise RuntimeError(
-                f"{self.objcopy} not found on PATH — install gcc-arm-none-eabi"
-            )
-        cp = subprocess.run(
+        require_tool(self.objcopy)
+        run_tool(
             [self.objcopy, "-O", "binary", str(elf), str(rom)],
-            capture_output=True,
-            text=True,
+            error="objcopy failed",
         )
-        if cp.returncode != 0:
-            raise RuntimeError(f"objcopy failed: {cp.stderr}")
         return rom
 
     def _size(self, elf: pathlib.Path) -> Optional[str]:
-        try:
-            sz = subprocess.run(
-                [self.cc.replace("gcc", "size"), str(elf)],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            return sz.stdout.strip()
-        except Exception:
-            return None
+        return read_size(self.cc, elf)
 
     # -- compile entry points ----------------------------------------------
 
@@ -333,16 +294,7 @@ class GbaTarget(Target):
         out = pathlib.Path(output_dir)
         out.mkdir(parents=True, exist_ok=True)
         cfg = qmodel.config
-        if sw == 32:
-            storage_t, np_storage = "int32_t", np.int32
-        elif sw == 16:
-            storage_t, np_storage = "int16_t", np.int16
-        elif sw == 8:
-            storage_t, np_storage = "int8_t", np.int8
-        else:
-            raise NotImplementedError(
-                f"compile_quantized: storage_bits={sw} not supported"
-            )
+        storage_t, np_storage = storage_types(sw, context="compile_quantized")
 
         rc_o = self._cross_object(
             emit_quantized_module(
@@ -416,14 +368,9 @@ class GbaTarget(Target):
         out.mkdir(parents=True, exist_ok=True)
 
         sw = qmodel.storage_bits
-        if sw == 8:
-            storage_t, np_storage = "int8_t", np.int8
-        elif sw == 16:
-            storage_t, np_storage = "int16_t", np.int16
-        else:
-            raise NotImplementedError(
-                f"compile_affine_quantized: storage_bits={sw} not supported"
-            )
+        storage_t, np_storage = storage_types(
+            sw, allowed=(8, 16), context="compile_affine_quantized"
+        )
 
         rc_o = self._cross_object(
             emit_quantized_affine_module(

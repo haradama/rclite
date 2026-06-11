@@ -33,6 +33,13 @@ from ..target import (
     affine_reference_outputs,
     symmetric_reference_outputs,
 )
+from .._arm_gcc import (
+    cross_object,
+    read_size,
+    require_tool,
+    run_tool,
+    storage_types,
+)
 from .boards import CortexM0Board
 
 
@@ -69,6 +76,75 @@ class CortexM0Target(Target):
         self.cc = cc
         self.name = f"cortex-m0/{board.name}"
 
+    # -- shared build mechanics --------------------------------------------
+
+    def _cflags(self, out) -> list:
+        return [
+            f"-mcpu={self.cpu}",
+            "-mthumb",
+            "-O2",
+            "-g",
+            "-ffunction-sections",
+            "-fdata-sections",
+            "-Wall",
+            f"-I{out}",
+        ]
+
+    def _stage_support(self, out):
+        """Copy startup.c + the board linker script next to the build."""
+        startup_path = out / "startup.c"
+        linker_path = out / self.board.linker_script
+        shutil.copy(_SUPPORT_DIR / "startup.c", startup_path)
+        shutil.copy(_SUPPORT_DIR / self.board.linker_script, linker_path)
+        return startup_path, linker_path
+
+    def _compile_sources(self, out, srcs) -> None:
+        """Compile each C source to a sibling .o with the standard cflags."""
+        cflags = self._cflags(out)
+        for src in srcs:
+            run_tool(
+                [
+                    self.cc,
+                    "-c",
+                    *cflags,
+                    str(src),
+                    "-o",
+                    str(src.with_suffix(".o")),
+                ],
+                error=f"compile failed for {src.name}",
+            )
+
+    def _link_elf(
+        self, out, rc_o, linker_path, *, with_float, extra_objects=()
+    ):
+        """Link startup.o + main.o + rc_predict.o into rc.elf; return its path."""
+        elf = out / "rc.elf"
+        link_cmd = [
+            self.cc,
+            f"-mcpu={self.cpu}",
+            "-mthumb",
+            "-T",
+            str(linker_path),
+            "-nostartfiles",
+            "-Wl,--gc-sections",
+            f"-Wl,-Map={out / 'rc.map'}",
+            "--specs=nosys.specs",
+            *_AEABI_ALIASES,
+            str(out / "startup.o"),
+            str(out / "main.o"),
+            str(rc_o),
+            *[str(o) for o in extra_objects],
+            "-o",
+            str(elf),
+        ]
+        link_cmd += (
+            ["-lm", "-lgcc", "-lc", "-lnosys"]
+            if with_float
+            else ["-lgcc", "-lc", "-lnosys"]
+        )
+        run_tool(link_cmd, error="link failed")
+        return elf
+
     def compile(
         self,
         rc,
@@ -84,10 +160,7 @@ class CortexM0Target(Target):
             raise ValueError(
                 "Cortex-M0 deployment needs `test_inputs` to embed in main.c"
             )
-        if shutil.which(self.cc) is None:
-            raise RuntimeError(
-                f"{self.cc} not found on PATH — install gcc-arm-none-eabi"
-            )
+        require_tool(self.cc)
 
         out = pathlib.Path(output_dir)
         out.mkdir(parents=True, exist_ok=True)
@@ -132,60 +205,10 @@ class CortexM0Target(Target):
             )
         )
 
-        # 5. Stage startup + linker script next to the sources.
-        startup_path = out / "startup.c"
-        linker_path = out / self.board.linker_script
-        shutil.copy(_SUPPORT_DIR / "startup.c", startup_path)
-        shutil.copy(_SUPPORT_DIR / self.board.linker_script, linker_path)
-
-        # 6. Assemble + link.
-        cflags = [
-            f"-mcpu={self.cpu}",
-            "-mthumb",
-            "-O2",
-            "-g",
-            "-ffunction-sections",
-            "-fdata-sections",
-            "-Wall",
-            f"-I{out}",
-        ]
-        for src in (startup_path, main_path):
-            obj = src.with_suffix(".o")
-            cp = subprocess.run(
-                [self.cc, "-c", *cflags, str(src), "-o", str(obj)],
-                capture_output=True,
-                text=True,
-            )
-            if cp.returncode != 0:
-                raise RuntimeError(
-                    f"compile failed for {src.name}: {cp.stderr}"
-                )
-
-        elf = out / "rc.elf"
-        link_cmd = [
-            self.cc,
-            f"-mcpu={self.cpu}",
-            "-mthumb",
-            "-T",
-            str(linker_path),
-            "-nostartfiles",
-            "-Wl,--gc-sections",
-            f"-Wl,-Map={out / 'rc.map'}",
-            "--specs=nosys.specs",
-            *_AEABI_ALIASES,
-            str(out / "startup.o"),
-            str(out / "main.o"),
-            str(rc_o),
-            "-o",
-            str(elf),
-            "-lm",
-            "-lgcc",
-            "-lc",
-            "-lnosys",
-        ]
-        cp = subprocess.run(link_cmd, capture_output=True, text=True)
-        if cp.returncode != 0:
-            raise RuntimeError(f"link failed: {cp.stderr}")
+        # 5. Stage startup + linker, then assemble + link.
+        startup_path, linker_path = self._stage_support(out)
+        self._compile_sources(out, (startup_path, main_path))
+        elf = self._link_elf(out, rc_o, linker_path, with_float=True)
 
         metadata = {
             "board": self.board,
@@ -193,16 +216,9 @@ class CortexM0Target(Target):
             "cpu": self.cpu,
             "dtype": self.dtype,
         }
-        try:
-            sz = subprocess.run(
-                [self.cc.replace("gcc", "size"), str(elf)],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            metadata["size"] = sz.stdout.strip()
-        except Exception:
-            pass
+        sz = read_size(self.cc, elf)
+        if sz is not None:
+            metadata["size"] = sz
 
         return CompiledArtifact(
             target_name=self.name,
@@ -221,51 +237,23 @@ class CortexM0Target(Target):
         storage_t-encoded input/reference arrays and uses pure integer
         arithmetic — no libm tanhf, no soft-float. The storage width is
         picked from `qmodel.target.storage_bits` (32 / 16 / 8)."""
-        import llvmlite.binding as llvm
-
-        if shutil.which(self.cc) is None:
-            raise RuntimeError(
-                f"{self.cc} not found on PATH — install gcc-arm-none-eabi"
-            )
+        require_tool(self.cc)
 
         out = pathlib.Path(output_dir)
         out.mkdir(parents=True, exist_ok=True)
         cfg = qmodel.config
         sw = qmodel.target.storage_bits
-        if sw == 32:
-            storage_t, np_storage = "int32_t", np.int32
-        elif sw == 16:
-            storage_t, np_storage = "int16_t", np.int16
-        elif sw == 8:
-            storage_t, np_storage = "int8_t", np.int8
-        else:
-            raise NotImplementedError(
-                f"compile_quantized: storage_bits={sw} not supported"
-            )
+        storage_t, np_storage = storage_types(sw, context="compile_quantized")
 
-        # Cross-compile the i32 kernel
-        ll_mod = emit_quantized_module(
-            qmodel, passes=sparse_passes(sparse, include_structural=False)
+        # Cross-compile the quantized kernel to rc_predict.o.
+        rc_o = cross_object(
+            emit_quantized_module(
+                qmodel, passes=sparse_passes(sparse, include_structural=False)
+            ),
+            triple=self.triple,
+            cpu=self.cpu,
+            out=out,
         )
-        ll_mod.triple = self.triple
-        from rclite.codegen.llvm import _ensure_all_targets
-
-        _ensure_all_targets()
-        mod = llvm.parse_assembly(str(ll_mod))
-        mod.verify()
-        target = llvm.Target.from_triple(self.triple)
-        tm = target.create_target_machine(cpu=self.cpu, opt=2, reloc="static")
-        pto = llvm.create_pipeline_tuning_options()
-        pto.speed_level = 2
-        pto.loop_vectorization = False
-        pto.slp_vectorization = False
-        pb = llvm.create_pass_builder(tm, pto)
-        pb.getModulePassManager().run(mod, pb)
-        rc_o = out / "rc_predict.o"
-        with open(rc_o, "wb") as f:
-            f.write(tm.emit_object(mod))
-        with open(out / "rc_predict.s", "w") as f:
-            f.write(tm.emit_assembly(mod))
 
         # Quantize test inputs + bit-exact references (Python QuantizedExecutor
         # reproduces the kernel's integer arithmetic exactly).
@@ -290,58 +278,10 @@ class CortexM0Target(Target):
         main_path = out / "main.c"
         main_path.write_text(main_c)
 
-        # Stage startup + linker
-        startup_path = out / "startup.c"
-        linker_path = out / self.board.linker_script
-        shutil.copy(_SUPPORT_DIR / "startup.c", startup_path)
-        shutil.copy(_SUPPORT_DIR / self.board.linker_script, linker_path)
-
-        cflags = [
-            f"-mcpu={self.cpu}",
-            "-mthumb",
-            "-O2",
-            "-g",
-            "-ffunction-sections",
-            "-fdata-sections",
-            "-Wall",
-            f"-I{out}",
-        ]
-        for src in (startup_path, main_path):
-            obj = src.with_suffix(".o")
-            cp = subprocess.run(
-                [self.cc, "-c", *cflags, str(src), "-o", str(obj)],
-                capture_output=True,
-                text=True,
-            )
-            if cp.returncode != 0:
-                raise RuntimeError(
-                    f"compile failed for {src.name}: {cp.stderr}"
-                )
-
-        elf = out / "rc.elf"
-        link_cmd = [
-            self.cc,
-            f"-mcpu={self.cpu}",
-            "-mthumb",
-            "-T",
-            str(linker_path),
-            "-nostartfiles",
-            "-Wl,--gc-sections",
-            f"-Wl,-Map={out / 'rc.map'}",
-            "--specs=nosys.specs",
-            *_AEABI_ALIASES,
-            str(out / "startup.o"),
-            str(out / "main.o"),
-            str(rc_o),
-            "-o",
-            str(elf),
-            "-lgcc",
-            "-lc",
-            "-lnosys",  # no -lm: integer path has no FP
-        ]
-        cp = subprocess.run(link_cmd, capture_output=True, text=True)
-        if cp.returncode != 0:
-            raise RuntimeError(f"link failed: {cp.stderr}")
+        # Stage startup + linker, then assemble + link.
+        startup_path, linker_path = self._stage_support(out)
+        self._compile_sources(out, (startup_path, main_path))
+        elf = self._link_elf(out, rc_o, linker_path, with_float=False)
 
         metadata = {
             "board": self.board,
@@ -351,16 +291,9 @@ class CortexM0Target(Target):
             "state_frac": cfg.state_frac,
             "quantized": True,
         }
-        try:
-            sz = subprocess.run(
-                [self.cc.replace("gcc", "size"), str(elf)],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            metadata["size"] = sz.stdout.strip()
-        except Exception:
-            pass
+        sz = read_size(self.cc, elf)
+        if sz is not None:
+            metadata["size"] = sz
 
         return CompiledArtifact(
             target_name=self.name + "/quantized",
@@ -390,25 +323,15 @@ class CortexM0Target(Target):
         all as quantized integers, so the on-device verification stays in
         pure integer arithmetic.
         """
-        import llvmlite.binding as llvm
-
-        if shutil.which(self.cc) is None:
-            raise RuntimeError(
-                f"{self.cc} not found on PATH — install gcc-arm-none-eabi"
-            )
+        require_tool(self.cc)
 
         out = pathlib.Path(output_dir)
         out.mkdir(parents=True, exist_ok=True)
 
         sw = qmodel.storage_bits
-        if sw == 8:
-            storage_t, np_storage = "int8_t", np.int8
-        elif sw == 16:
-            storage_t, np_storage = "int16_t", np.int16
-        else:
-            raise NotImplementedError(
-                f"compile_affine_quantized: storage_bits={sw} not supported"
-            )
+        storage_t, np_storage = storage_types(
+            sw, allowed=(8, 16), context="compile_affine_quantized"
+        )
 
         kernel_sources = []
         extra_link_objects = []
@@ -422,27 +345,9 @@ class CortexM0Target(Target):
             ll_mod.triple = self.triple
             (out / "rc_kernel.ll").write_text(str(ll_mod))
             kernel_sources.append(out / "rc_kernel.ll")
-
-            from rclite.codegen.llvm import _ensure_all_targets
-
-            _ensure_all_targets()
-            mod = llvm.parse_assembly(str(ll_mod))
-            mod.verify()
-            target = llvm.Target.from_triple(self.triple)
-            tm = target.create_target_machine(
-                cpu=self.cpu, opt=2, reloc="static"
+            rc_o = cross_object(
+                ll_mod, triple=self.triple, cpu=self.cpu, out=out
             )
-            pto = llvm.create_pipeline_tuning_options()
-            pto.speed_level = 2
-            pto.loop_vectorization = False
-            pto.slp_vectorization = False
-            pb = llvm.create_pass_builder(tm, pto)
-            pb.getModulePassManager().run(mod, pb)
-            rc_o = out / "rc_predict.o"
-            with open(rc_o, "wb") as f:
-                f.write(tm.emit_object(mod))
-            with open(out / "rc_predict.s", "w") as f:
-                f.write(tm.emit_assembly(mod))
             kernel_kind = "llvm_ir"
         elif kernel_backend == "c":
             # Portable-C kernel path for apples-to-apples product builds.
@@ -455,30 +360,18 @@ class CortexM0Target(Target):
             kernel_sources.append(kernel_c_path)
 
             rc_i32_o = out / "rc_predict_i32.o"
-            cp = subprocess.run(
+            run_tool(
                 [
                     self.cc,
                     "-c",
-                    f"-mcpu={self.cpu}",
-                    "-mthumb",
-                    "-O2",
-                    "-g",
-                    "-ffunction-sections",
-                    "-fdata-sections",
-                    "-Wall",
-                    f"-I{out}",
+                    *self._cflags(out),
                     "-Drc_predict=rc_predict_i32",
                     str(kernel_c_path),
                     "-o",
                     str(rc_i32_o),
                 ],
-                capture_output=True,
-                text=True,
+                error=f"compile failed for {kernel_c_path.name}",
             )
-            if cp.returncode != 0:
-                raise RuntimeError(
-                    f"compile failed for {kernel_c_path.name}: {cp.stderr}"
-                )
 
             wrapper_path = out / "rc_wrapper.c"
             wrapper_path.write_text(
@@ -490,29 +383,17 @@ class CortexM0Target(Target):
                 "}\n"
             )
             wrapper_o = out / "rc_wrapper.o"
-            cp = subprocess.run(
+            run_tool(
                 [
                     self.cc,
                     "-c",
-                    f"-mcpu={self.cpu}",
-                    "-mthumb",
-                    "-O2",
-                    "-g",
-                    "-ffunction-sections",
-                    "-fdata-sections",
-                    "-Wall",
-                    f"-I{out}",
+                    *self._cflags(out),
                     str(wrapper_path),
                     "-o",
                     str(wrapper_o),
                 ],
-                capture_output=True,
-                text=True,
+                error=f"compile failed for {wrapper_path.name}",
             )
-            if cp.returncode != 0:
-                raise RuntimeError(
-                    f"compile failed for {wrapper_path.name}: {cp.stderr}"
-                )
 
             rc_o = rc_i32_o
             extra_link_objects.append(str(wrapper_o))
@@ -546,59 +427,16 @@ class CortexM0Target(Target):
         main_path = out / "main.c"
         main_path.write_text(main_c)
 
-        # Stage startup + linker
-        startup_path = out / "startup.c"
-        linker_path = out / self.board.linker_script
-        shutil.copy(_SUPPORT_DIR / "startup.c", startup_path)
-        shutil.copy(_SUPPORT_DIR / self.board.linker_script, linker_path)
-
-        cflags = [
-            f"-mcpu={self.cpu}",
-            "-mthumb",
-            "-O2",
-            "-g",
-            "-ffunction-sections",
-            "-fdata-sections",
-            "-Wall",
-            f"-I{out}",
-        ]
-        for src in (startup_path, main_path):
-            obj = src.with_suffix(".o")
-            cp = subprocess.run(
-                [self.cc, "-c", *cflags, str(src), "-o", str(obj)],
-                capture_output=True,
-                text=True,
-            )
-            if cp.returncode != 0:
-                raise RuntimeError(
-                    f"compile failed for {src.name}: {cp.stderr}"
-                )
-
-        elf = out / "rc.elf"
-        link_cmd = [
-            self.cc,
-            f"-mcpu={self.cpu}",
-            "-mthumb",
-            "-T",
-            str(linker_path),
-            "-nostartfiles",
-            "-Wl,--gc-sections",
-            f"-Wl,-Map={out / 'rc.map'}",
-            "--specs=nosys.specs",
-            *_AEABI_ALIASES,
-            str(out / "startup.o"),
-            str(out / "main.o"),
-            str(rc_o),
-            *extra_link_objects,
-            "-o",
-            str(elf),
-            "-lgcc",
-            "-lc",
-            "-lnosys",  # no -lm: integer affine kernel
-        ]
-        cp = subprocess.run(link_cmd, capture_output=True, text=True)
-        if cp.returncode != 0:
-            raise RuntimeError(f"link failed: {cp.stderr}")
+        # Stage startup + linker, then assemble + link.
+        startup_path, linker_path = self._stage_support(out)
+        self._compile_sources(out, (startup_path, main_path))
+        elf = self._link_elf(
+            out,
+            rc_o,
+            linker_path,
+            with_float=False,
+            extra_objects=extra_link_objects,
+        )
 
         metadata = {
             "board": self.board,
@@ -610,16 +448,9 @@ class CortexM0Target(Target):
             "lut_kind": qmodel.lut_strategy.kind.value,
             "kernel_backend": kernel_kind,
         }
-        try:
-            sz = subprocess.run(
-                [self.cc.replace("gcc", "size"), str(elf)],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            metadata["size"] = sz.stdout.strip()
-        except Exception:
-            pass
+        sz = read_size(self.cc, elf)
+        if sz is not None:
+            metadata["size"] = sz
 
         objects = [rc_o, out / "startup.o", out / "main.o"]
         for obj in extra_link_objects:
